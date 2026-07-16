@@ -38,8 +38,12 @@ import subprocess
 import pyodbc
 import pandas as pd
 import threading
-from filelock import FileLock 
+from filelock import FileLock
 from dotenv import load_dotenv
+
+# Shared, reusable DB layer (see db.py). All DB access goes through this now
+# instead of a per-file get_db_connection() + raw pyodbc cursors.
+from db import Database, build_in_clause
 
 
 
@@ -65,56 +69,12 @@ from playwright.sync_api import (
 # =========================================================
 # DB CONNECTION
 # =========================================================
- 
-def get_db_connection():
-    """
-    Create a pyodbc connection using credentials from .env file.
- 
-    .env must contain:
-        DB_DRIVER=ODBC Driver 17 for SQL Server
-        DB_SERVER=
-        DB_DATABASE=DIP
-        DB_USERNAME=rsa
-        DB_PASSWORD=your_password
-        DB_TRUSTED_CONNECTION=no
-    """
-    load_dotenv()
- 
-    driver   = os.getenv("DB_DRIVER", "ODBC Driver 17 for SQL Server")
-    server   = os.getenv("DB_SERVER")
-    database = os.getenv("DB_DATABASE")
-    username = os.getenv("DB_USERNAME")
-    password = os.getenv("DB_PASSWORD")
-    trusted  = os.getenv("DB_TRUSTED_CONNECTION", "no").strip().lower()
- 
-    if not server or not database:
-        raise RuntimeError(
-            "DB_SERVER and DB_DATABASE must be set in .env file.\n"
-            "Copy .env.example to .env and fill in your credentials."
-        )
- 
-    if trusted in ("yes", "true", "1"):
-        conn_str = (
-            f"DRIVER={{{driver}}};"
-            f"SERVER={server};"
-            f"DATABASE={database};"
-            f"Trusted_Connection=yes;"
-            f"TrustServerCertificate=yes;"
-        )
-    else:
-        if not username or not password:
-            raise RuntimeError("DB_USERNAME and DB_PASSWORD must be set in .env (or use DB_TRUSTED_CONNECTION=yes).")
-        conn_str = (
-            f"DRIVER={{{driver}}};"
-            f"SERVER={server};"
-            f"DATABASE={database};"
-            f"UID={username};"
-            f"PWD={password};"
-            f"TrustServerCertificate=yes;"
-        )
- 
-    return pyodbc.connect(conn_str)
-
+# Connection handling now lives in db.py (get_db_connection() + Database).
+# Import `Database` at the top of this file and use it as a context manager:
+#     with Database() as db:
+#         res = db.fetch_all(sql, params)
+#         db.update(sql, params)
+# The old per-file get_db_connection() has been removed in favour of that layer.
 
 
 # =========================================================
@@ -151,7 +111,8 @@ def _ensure_log_file():
 
     Columns:
       ProcessingLogId  → processing_code  (string)
-      ProcessingId     → processing_id    (int)
+      Id               → row_id           (int)  physical TProcessStatus.Id (unique per row)
+      ProcessingId     → processing_id    (int)  deliverable grouping key (non-unique)
       Stage            → s / p / sv / pv  (string)
       Remarks          → log message text (string)
       Time             → datetime of insert (datetime)
@@ -161,13 +122,15 @@ def _ensure_log_file():
     if not LOG_PARQUET_PATH.exists():
         empty_df = pd.DataFrame(columns=[
             "ProcessingLogId",   # processing_code
-            "ProcessingId",      # processing_id (int)
+            "Id",                # row_id (physical TProcessStatus.Id)
+            "ProcessingId",      # processing_id (deliverable grouping)
             "Stage",             # s / p / sv / pv
             "Remarks",           # log message text
             "Time",              # datetime
         ])
         empty_df = empty_df.astype({
             "ProcessingLogId": "object",
+            "Id":              "Int64",    # nullable int
             "ProcessingId":    "Int64",    # nullable int
             "Stage":           "object",
             "Remarks":         "object",
@@ -177,10 +140,13 @@ def _ensure_log_file():
         # print(f"[LOG] Created new parquet log file at: {LOG_PARQUET_PATH}")
 
 
-def write_log(processing_code: str, processing_id: int, stage: str, remarks: str):
+def write_log(processing_code: str, row_id: int, processing_id: int, stage: str, remarks: str):
     """
     Append one row to the parquet log file.
     Thread-safe AND process-safe.
+
+    row_id       = physical TProcessStatus.Id (unique per row) — the row identity.
+    processing_id = deliverable grouping key (non-unique) — kept for readability.
  
     Concurrency strategy:
       1. Acquire in-process THREAD lock first  (fast - blocks sibling threads)
@@ -195,6 +161,7 @@ def write_log(processing_code: str, processing_id: int, stage: str, remarks: str
     """
     new_row = pd.DataFrame([{
         "ProcessingLogId": str(processing_code or ""),
+        "Id":              int(row_id) if row_id else pd.NA,
         "ProcessingId":    int(processing_id) if processing_id else pd.NA,
         "Stage":           str(stage or ""),
         "Remarks":         str(remarks or ""),
@@ -1021,7 +988,8 @@ def iter_master_rows(ws_master, year_col: int, uei_col: int, state_col: int, sec
 #!!!Done
 def process_downloaded_excel_and_update_master(
     downloaded_xlsx: Path,
-    conn,
+    db,
+    row_id: int,
     processing_id: int,
     processing_code: str,
     criteria: Dict[str, str],
@@ -1047,8 +1015,8 @@ def process_downloaded_excel_and_update_master(
     g = extract_general_fields(ws_general, gen_cols, reliant_row)
     pdf_url = build_pdf_url(g.get("report_id"))
 
-    # Update TProcessStatus & TProcessingAdditionalInfo using the fac excel 
-    update_master_from_general(conn, processing_id, g, pdf_url) #!!!done
+    # Update TProcessStatus & TProcessingAdditionalInfo using the fac excel
+    update_master_from_general(db, row_id, processing_id, g, pdf_url) #!!!done
 
     # entity name for better file name
     # entity_name_col = find_col(ws_general, ["Auditee Name", "AUDITEE NAME", "Entity Name", "ENTITY NAME", "Name"], 1)
@@ -1074,7 +1042,7 @@ def process_downloaded_excel_and_update_master(
     # EXISTING HANDLING: PDF NOT FOUND
     # -----------------------------
     if not pdf_url:
-        mark_master_row_pdf_not_found(conn, processing_id)
+        mark_master_row_pdf_not_found(db, row_id, processing_id)
         return PDF_NOT_FOUND_TEXT, None, None
 
     # pdf_saved_path = PDF_DIR / f"{download_key}.pdf"
@@ -1084,7 +1052,7 @@ def process_downloaded_excel_and_update_master(
         download_pdf_via_browser_with_retry(playwright_context, pdf_url, pdf_saved_path)
 
         if not pdf_saved_path.exists() or pdf_saved_path.stat().st_size == 0:
-            mark_master_row_pdf_not_found(conn, processing_id)
+            mark_master_row_pdf_not_found(db, row_id, processing_id)
             return PDF_NOT_FOUND_TEXT, None, None
 
         return pdf_url, pdf_saved_path, g.get("fy_end_date")
@@ -1092,13 +1060,13 @@ def process_downloaded_excel_and_update_master(
     except RuntimeError as e:
         cause = getattr(e, "__cause__", None)
         if isinstance(cause, PlaywrightTimeoutError) or ("timeout" in str(cause).lower()):
-            mark_master_row_pdf_not_found(conn, processing_id)
+            mark_master_row_pdf_not_found(db, row_id, processing_id)
             return PDF_NOT_FOUND_TEXT, None, None
 
         raise
 
     except PlaywrightTimeoutError:
-        mark_master_row_pdf_not_found(conn, processing_id)
+        mark_master_row_pdf_not_found(db, row_id, processing_id)
         return PDF_NOT_FOUND_TEXT, None, None
     
 # =========================================================
@@ -3811,14 +3779,15 @@ def extract_general_fields(ws_general, gen_cols: Dict[str, int], row_index: int)
 
 # If no PDF button is found
 # !!! Done Update DB using conn instead of passing ws_master 
-def mark_master_row_pdf_not_found(conn, processing_id: int):
+def mark_master_row_pdf_not_found(db, row_id: int, processing_id: int):
     """
     Set all output columns to 'PDF Not Found' for this row.
     Replaces: writing PDF_NOT_FOUND_TEXT to all master_cols in MASTER LIST.
-    """
-    cursor = conn.cursor()
 
-    cursor.execute("""
+    row_id        -> keys the single physical TProcessStatus row (new PK).
+    processing_id -> keys TProcessingAdditionalInfo (kept on ProcessingId).
+    """
+    db.update("""
         UPDATE TProcessStatus
         SET
             SourcingStatus          = 0,
@@ -3835,10 +3804,10 @@ def mark_master_row_pdf_not_found(conn, processing_id: int):
             ReleaseDate             = NULL,
             DownloadDate            = NULL,
             ModifiedOn              = GETDATE()
-        WHERE ProcessingId = ?
-    """, processing_id)
+        WHERE Id = ?
+    """, row_id, commit=False)
 
-    cursor.execute("""
+    db.update("""
         UPDATE TProcessingAdditionalInfo
         SET
             AuditorsSignatureDate = NULL,
@@ -3854,9 +3823,9 @@ def mark_master_row_pdf_not_found(conn, processing_id: int):
             AuditorContactEmail = NULL,
             ModifiedOn          = GETDATE()
         WHERE ProcessingId = ?
-    """, processing_id)
+    """, processing_id, commit=False)
 
-    conn.commit()
+    db.commit()
 
 
 
@@ -3921,15 +3890,15 @@ def set_state(page, state_val: str):
 
 # VALIDATION: Write extracted values from FAC Excel into the MASTER LIST row and set download dates.
 # !!! Done instead of writing in the ws_master, pass the db connection and update the values from g
-def update_master_from_general(conn, processing_id: int, g: Dict[str, Any], pdf_url: Optional[str]):
+def update_master_from_general(db, row_id: int, processing_id: int, g: Dict[str, Any], pdf_url: Optional[str]):
     today = date.today()
-    cursor = conn.cursor()
 
     # --------------------------------------------------
     # UPDATE TProcessStatus
     # Columns: FyeDate, ReleaseDate, DownloadDate, pdf_download_link
+    # Keyed on the physical row PK (Id).
     # --------------------------------------------------
-    cursor.execute("""
+    db.update("""
         UPDATE TProcessStatus
         SET
             FyeDate          = ?,
@@ -3937,20 +3906,21 @@ def update_master_from_general(conn, processing_id: int, g: Dict[str, Any], pdf_
             DownloadDate     = ?,
             pdf_download_link= ?,
             ModifiedOn       = GETDATE()
-        WHERE ProcessingId = ?
-    """,
+        WHERE Id = ?
+    """, [
         g.get("fy_end_date"),
         g.get("submitted_date"),
         today,
         pdf_url if pdf_url else None,
-        processing_id
-    )
+        row_id,
+    ], commit=False)
 
     # --------------------------------------------------
     # UPDATE TProcessingAdditionalInfo
     # Columns: AuditorsSignatureDate, EntityContact*, Auditor*
+    # Kept keyed on ProcessingId (this table is not part of the Id re-key).
     # --------------------------------------------------
-    cursor.execute("""
+    db.update("""
         UPDATE TProcessingAdditionalInfo
         SET
             AuditorsSignatureDate = ?,
@@ -3966,7 +3936,7 @@ def update_master_from_general(conn, processing_id: int, g: Dict[str, Any], pdf_
             AuditorContactEmail   = ?,
             ModifiedOn            = GETDATE()
         WHERE ProcessingId = ?
-    """,
+    """, [
         g.get("auditee_certified_date"),
         g.get("auditee_city"),
         g.get("auditee_state"),
@@ -3978,10 +3948,10 @@ def update_master_from_general(conn, processing_id: int, g: Dict[str, Any], pdf_
         g.get("auditor_contact_name"),
         g.get("auditor_phone"),
         g.get("auditor_email"),
-        processing_id
-    )
+        processing_id,
+    ], commit=False)
 
-    conn.commit()
+    db.commit()
 
 
 # =========================================================
@@ -4029,7 +3999,7 @@ FAILED_TO_DOWNLOAD_TEXT = "Failed to Download"
 
 
 # !!! (DONE)Update DB and set failed to download for the requierd columns
-def mark_master_list_ix_failed_to_download(conn, processing_id: int):
+def mark_master_list_ix_failed_to_download(db, row_id: int, processing_id: int):
     """
     Mark a row as 'Failed to Download' in the DB.
     Replaces: writing 'Failed to Download' to MASTER LIST columns I..X (9..24)
@@ -4037,10 +4007,11 @@ def mark_master_list_ix_failed_to_download(conn, processing_id: int):
     Updates:
       - TProcessStatus           → sets all status/flag/path columns + CompletionStatus=1
       - TProcessingAdditionalInfo → clears all contact/auditor fields
-    """
-    cursor = conn.cursor()
 
-    cursor.execute("""
+    row_id        -> keys the single physical TProcessStatus row (new PK).
+    processing_id -> keys TProcessingAdditionalInfo (kept on ProcessingId).
+    """
+    db.update("""
         UPDATE TProcessStatus
         SET
             SourcingStatus          = 0,
@@ -4057,10 +4028,10 @@ def mark_master_list_ix_failed_to_download(conn, processing_id: int):
             ReleaseDate             = NULL,
             DownloadDate            = NULL,
             ModifiedOn              = GETDATE()
-        WHERE ProcessingId = ?
-    """, processing_id)
+        WHERE Id = ?
+    """, row_id, commit=False)
 
-    cursor.execute("""
+    db.update("""
         UPDATE TProcessingAdditionalInfo
         SET
             AuditorsSignatureDate = NULL,
@@ -4076,9 +4047,9 @@ def mark_master_list_ix_failed_to_download(conn, processing_id: int):
             AuditorContactEmail = NULL,
             ModifiedOn          = GETDATE()
         WHERE ProcessingId = ?
-    """, processing_id)
+    """, processing_id, commit=False)
 
-    conn.commit()
+    db.commit()
 
 
 # !!! Need to convert it indo Parquet, all the rows from the Detailed Validation Check sheet
@@ -4102,28 +4073,27 @@ def mark_validation_failed_to_download(ws_validation, row_index: int, issuer_nam
 # =========================================================
 # DB Status & Flag update
 # =========================================================
-def update_sourcing_status(conn, processing_id, status, flag, pdf_path=None):
+def update_sourcing_status(db, row_id, status, flag, pdf_path=None):
     """
     status: None=pending, 0=fail, 1=success
     flag:   None=not started, s=stared, p=processing, c=competed
+
+    Keyed on the physical TProcessStatus.Id (row_id).
     """
-    try:
-        cursor = conn.cursor()
-        if pdf_path is not None:
-            cursor.execute("""
-                UPDATE TProcessStatus
-                SET SourcingStatus = ?, SourcingFlag = ?, PdfFilePath = ?, ModifiedOn = GETDATE()
-                WHERE ProcessingId = ?
-            """, status, flag,  str(pdf_path), processing_id)
-        else:
-            cursor.execute("""
-                UPDATE TProcessStatus
-                SET SourcingStatus = ?, SourcingFlag = ?, ModifiedOn = GETDATE()
-                WHERE ProcessingId = ?
-            """, status, flag, processing_id)
-        conn.commit()
-    except Exception as e:
-        print(f"[FAILED] processing_id {processing_id}: {e}")
+    if pdf_path is not None:
+        res = db.update("""
+            UPDATE TProcessStatus
+            SET SourcingStatus = ?, SourcingFlag = ?, PdfFilePath = ?, ModifiedOn = GETDATE()
+            WHERE Id = ?
+        """, [status, flag, str(pdf_path), row_id])
+    else:
+        res = db.update("""
+            UPDATE TProcessStatus
+            SET SourcingStatus = ?, SourcingFlag = ?, ModifiedOn = GETDATE()
+            WHERE Id = ?
+        """, [status, flag, row_id])
+    if not res.success:
+        print(f"[FAILED] row_id {row_id}: {res.error}")
 
 # =========================================================
 # ENTRYPOINT
@@ -4131,7 +4101,7 @@ def update_sourcing_status(conn, processing_id, status, flag, pdf_path=None):
 
 # ENTRYPOINT: Run the full program: load workbook, perform sourcing + validation, save, and open the output.
 
-def run_fac_for_rows_source_only(rows: List[dict], conn):
+def run_fac_for_rows_source_only(rows: List[dict], db):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -4155,14 +4125,15 @@ def run_fac_for_rows_source_only(rows: List[dict], conn):
         maximize_playwright_page(page)
 
         for item in rows:
-            r = item["processing_id"] 
+            r = item["processing_id"]
             year = item["year"]
             uei = item["uei"]
             state = item["state"]
             sector = item["sector"]
             # company_id = item["company_id"]
             processing_code = item["processing_code"]
-            processing_id = item["processing_id"] 
+            processing_id = item["processing_id"]
+            row_id = item["row_id"]            # physical TProcessStatus.Id — DB row key
             # issuer_name = item["issuer_name"]
             # sub_sector = item["sub_sector"]
             # ein = item["ein"]
@@ -4170,7 +4141,7 @@ def run_fac_for_rows_source_only(rows: List[dict], conn):
             print(f"\n--- Processing id: {processing_id} | Year={year} UEI={uei} State={state} Sector={sector} ---")
 
             # SOURCING START → in progress, result pending (signal for the frontend)
-            update_sourcing_status(conn, processing_id, status=None, flag='p')  
+            update_sourcing_status(db, row_id, status=None, flag='p')
 
             try:
                 safe_goto(page, ADV_URL)
@@ -4187,7 +4158,7 @@ def run_fac_for_rows_source_only(rows: List[dict], conn):
                     # If Excel download fails even after all retries (default: 5 attempts),
                     # mark MASTER LIST I..X and validation C..M as 'Failed to Download' (yellow), then move to next row.
                     if "Excel download failed after" in str(e):
-                        mark_master_list_ix_failed_to_download(conn, processing_id)#!!!done
+                        mark_master_list_ix_failed_to_download(db, row_id, processing_id)#!!!done
                         print(f"[FAILED] processing_id {r}: Excel download failed after retries => Marked as '{FAILED_TO_DOWNLOAD_TEXT}'")
                         continue
                     raise
@@ -4196,7 +4167,7 @@ def run_fac_for_rows_source_only(rows: List[dict], conn):
                 criteria = {"year": year, "uei": uei, "state": state, "sector": sector}
 
                 pdf_url, pdf_saved, fy_end_val = process_downloaded_excel_and_update_master(
-                    downloaded_xlsx, conn, processing_id, processing_code, criteria, context
+                    downloaded_xlsx, db, row_id, processing_id, processing_code, criteria, context
                 )
 
                 # -----------------------------
@@ -4207,10 +4178,10 @@ def run_fac_for_rows_source_only(rows: List[dict], conn):
                         and pdf_saved and Path(pdf_saved).exists())
 
                 if pdf_ok:
-                    update_sourcing_status(conn, processing_id, status=1, flag='c', pdf_path=pdf_saved)  # success
+                    update_sourcing_status(db, row_id, status=1, flag='c', pdf_path=pdf_saved)  # success
                     print(f"[SUCCESS] PDF saved: {pdf_saved}")
                 else:
-                    update_sourcing_status(conn, processing_id, status=0, flag='c')   # done + fail
+                    update_sourcing_status(db, row_id, status=0, flag='c')   # done + fail
                     print(f"[INFO] {processing_id}: PDF not found/saved => marked FAIL.")
 
                 # -----------------------------
@@ -4220,10 +4191,10 @@ def run_fac_for_rows_source_only(rows: List[dict], conn):
 
             except PlaywrightTimeoutError as te:
                 print(f"[TIMEOUT] processing_id {r}: {te}")
-                update_sourcing_status(conn, processing_id, status=0, flag='c')   # done + fail
+                update_sourcing_status(db, row_id, status=0, flag='c')   # done + fail
             except Exception as e:
                 print(f"[FAILED] processing_id {r}: {e}")
-                update_sourcing_status(conn, processing_id, status=0, flag='c')   # done + fail
+                update_sourcing_status(db, row_id, status=0, flag='c')   # done + fail
 
         try:
             context.close()
@@ -4245,132 +4216,127 @@ def run_fac_for_rows_source_only(rows: List[dict], conn):
 
 def main_source():
     """Run ONLY sourcing: download Excel+PDF and update DB. No PDF validations."""
- 
+
     # --------------------------------------------------
     # 1. CONNECT TO DATABASE (replaces load_workbook)
+    #    Uses the shared db.py layer as a context manager: commits on clean
+    #    exit, rolls back on exception, and closes the connection.
     # --------------------------------------------------
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    print("[DB] Connected to database successfully.")
- 
-    # --------------------------------------------------
-    # 2. FETCH MASTER ROWS (replaces ws_master = wb[SHEET_MASTER])
-    #
-    #    This JOIN gives us every row that still needs sourcing.
-    #    SourcingStatus = 0  → only pending/un-sourced rows
-    #    cm.ModuleId = 1     → Public Finance module
-    # --------------------------------------------------
-    cursor.execute("""
-        SELECT
-            cm.CompanyId,
-            ps.ProcessingId,
-            ps.ProcessingCode,
-            cm.IssuerName,
-            cm.State,
-            cm.Sector,
-            cm.SubSector,
-            cm.UEI,
-            cm.EIN,
-            ps.ProcessYear
-        FROM TCompanyMaster cm
-        JOIN TProcessStatus ps
-            ON ps.CompanyId = cm.CompanyId
-        WHERE cm.IsActive   = 1
-          AND ps.IsActive    = 1
-          AND (ps.SourcingFlag = 'c' or ps.SourcingFlag is NULL)
-          AND (ps.SourcingStatus = 0 OR ps.SourcingStatus is NULL)
-          AND (ps.CompletionStatus=0 OR ps.CompletionStatus is NULL)
-          AND cm.ModuleId    = 1
-    """)
-    master_rows = cursor.fetchall()
- 
-    if not master_rows:
-        print("[INFO] No pending rows to process. Exiting.")
-        conn.close()
-        return
+    with Database() as db:
+        print("[DB] Connected to database successfully.")
 
-    if master_rows:
-        processing_ids = [row.ProcessingId for row in master_rows]
-        placeholders = ",".join(["?"] * len(processing_ids))
-        cursor.execute(f"""
+        # --------------------------------------------------
+        # 2. FETCH MASTER ROWS (replaces ws_master = wb[SHEET_MASTER])
+        #
+        #    This JOIN gives us every row that still needs sourcing.
+        #    SourcingStatus = 0  → only pending/un-sourced rows
+        #    cm.ModuleId = 1     → Public Finance module
+        #    ps.Id AS RowId      → the physical-row PK (unique) used for writes
+        # --------------------------------------------------
+        res = db.fetch_all("""
+            SELECT
+                cm.CompanyId,
+                ps.Id AS RowId,
+                ps.ProcessingId,
+                ps.ProcessingCode,
+                cm.IssuerName,
+                cm.State,
+                cm.Sector,
+                cm.SubSector,
+                cm.UEI,
+                cm.EIN,
+                ps.ProcessYear
+            FROM TCompanyMaster cm
+            JOIN TProcessStatus ps
+                ON ps.CompanyId = cm.CompanyId
+            WHERE cm.IsActive   = 1
+              AND ps.IsActive    = 1
+              AND (ps.SourcingFlag = 'c' or ps.SourcingFlag is NULL)
+              AND (ps.SourcingStatus = 0 OR ps.SourcingStatus is NULL)
+              AND (ps.CompletionStatus=0 OR ps.CompletionStatus is NULL)
+              AND ps.COAID IN (1, 2)
+        """)
+        if not res.success:
+            print(f"[DB-ERROR] Failed to fetch master rows: {res.error}")
+            return
+        master_rows = res.data
+
+        if not master_rows:
+            print("[INFO] No pending rows to process. Exiting.")
+            return
+
+        # Claim the fetched physical rows by their PK (Id), not ProcessingId —
+        # ProcessingId is non-unique so an IN(ProcessingId) list would also flip
+        # sibling rows that share a deliverable.
+        row_ids = [row.RowId for row in master_rows]
+        clause, params = build_in_clause("Id", row_ids)
+        claim = db.update(f"""
             UPDATE TProcessStatus
             SET SourcingFlag = 's'
             WHERE IsActive = 1
-              AND ProcessingId IN ({placeholders})
-        """, processing_ids)
-        conn.commit()
-        print(f"[DB] Updated SourcingFlag to 's' for {cursor.rowcount} rows.")
- 
-    # print(f"[DB] Found {len(master_rows)} pending rows in TCompanyMaster ⟕ TProcessStatus.")
- 
+              AND {clause}
+        """, params)
+        print(f"[DB] Updated SourcingFlag to 's' for {claim.rowcount} rows.")
 
-    # --------------------------------------------------
-    # 4. PRE-RUN CLEANUP  (directory clearing stays the same)
-    #
-    #    NOTE: clear_sheet_columns(ws_master, 9, 24) is NO LONGER NEEDED
-    #    because the DB query already filters SourcingStatus = 0,
-    #    so we only get un-sourced rows. Output columns start as NULL.
-    # --------------------------------------------------
-    print("[PRE-RUN] Clearing download folders...")
-    clear_directory_contents(DOWNLOAD_DIR)
-    clear_directory_contents(PDF_DIR)
- 
-    # --------------------------------------------------
-    # 5. BUILD ROWS LIST FROM DB
-    #    (replaces: find_col + for r in range(2, max_row) + get_cell)
-    #
-    #    Every field the FAC search needs is already in the DB row.
-    #    No header discovery or column-index guessing required.
-    # --------------------------------------------------
-    rows = []
-    for db_row in master_rows:
-        year   = normalize(str(db_row.ProcessYear or ""))
-        uei    = normalize(str(db_row.UEI or ""))
-        state  = normalize(str(db_row.State or ""))
-        sector = normalize(str(db_row.Sector or ""))
- 
-        if not year and not uei:
-            continue
-        
-        rows.append({
-            # --- DB identifiers (NEW — used for DB writes later) ---
-            "processing_id":   db_row.ProcessingId,
-            "company_id":      db_row.CompanyId,
-            "processing_code": db_row.ProcessingCode,
- 
-            # --- row_index: used by proof-file naming (Row{N}_...) ---
-            #     ProcessingId is unique per row, safe to use here
-            # "row_index": db_row.ProcessingId,
- 
-            # --- FAC search inputs (same keys as before) ---
-            "year":   year,
-            "uei":    uei,
-            "state":  state,
-            "sector": sector,
- 
-            # --- Extra fields available from DB (no extra query needed) ---
-            "sub_sector":   normalize(str(db_row.SubSector or "")),
-            "issuer_name":  normalize(str(db_row.IssuerName or "")),
-            "ein":          normalize(str(db_row.EIN or "")),
-        })
- 
-    print(f"[INFO] {len(rows)} rows ready for FAC sourcing.")
+        # print(f"[DB] Found {len(master_rows)} pending rows in TCompanyMaster ⟕ TProcessStatus.")
 
-    
+        # --------------------------------------------------
+        # 4. PRE-RUN CLEANUP  (directory clearing stays the same)
+        #
+        #    NOTE: clear_sheet_columns(ws_master, 9, 24) is NO LONGER NEEDED
+        #    because the DB query already filters SourcingStatus = 0,
+        #    so we only get un-sourced rows. Output columns start as NULL.
+        # --------------------------------------------------
+        print("[PRE-RUN] Clearing download folders...")
+        clear_directory_contents(DOWNLOAD_DIR)
+        clear_directory_contents(PDF_DIR)
 
-    # master_output_cols = master sheet output columns -> DB TProcessingAdditionalInfo
-    # run_fac_for_rows_source_only(rows, ws_master, ws_validation, issuer_name_col, master_output_cols, wb, xlsm_path)
-    run_fac_for_rows_source_only(rows, conn)
- 
+        # --------------------------------------------------
+        # 5. BUILD ROWS LIST FROM DB
+        #    (replaces: find_col + for r in range(2, max_row) + get_cell)
+        #
+        #    Every field the FAC search needs is already in the DB row.
+        #    No header discovery or column-index guessing required.
+        # --------------------------------------------------
+        rows = []
+        for db_row in master_rows:
+            year   = normalize(str(db_row.ProcessYear or ""))
+            uei    = normalize(str(db_row.UEI or ""))
+            state  = normalize(str(db_row.State or ""))
+            sector = normalize(str(db_row.Sector or ""))
+
+            if not year and not uei:
+                continue
+
+            rows.append({
+                # --- DB identifiers (NEW — used for DB writes later) ---
+                "row_id":          db_row.RowId,          # physical TProcessStatus.Id (unique) — DB row key
+                "processing_id":   db_row.ProcessingId,   # deliverable grouping (non-unique) — display/label
+                "company_id":      db_row.CompanyId,
+                "processing_code": db_row.ProcessingCode,
+
+                # --- FAC search inputs (same keys as before) ---
+                "year":   year,
+                "uei":    uei,
+                "state":  state,
+                "sector": sector,
+
+                # --- Extra fields available from DB (no extra query needed) ---
+                "sub_sector":   normalize(str(db_row.SubSector or "")),
+                "issuer_name":  normalize(str(db_row.IssuerName or "")),
+                "ein":          normalize(str(db_row.EIN or "")),
+            })
+
+        print(f"[INFO] {len(rows)} rows ready for FAC sourcing.")
+
+        # master_output_cols = master sheet output columns -> DB TProcessingAdditionalInfo
+        # run_fac_for_rows_source_only(rows, ws_master, ws_validation, issuer_name_col, master_output_cols, wb, xlsm_path)
+        run_fac_for_rows_source_only(rows, db)
+
     # --------------------------------------------------
     # 7. FINALIZE
-    #
-    #    OLD:  finalize_master_list_format(ws_master)  → REMOVED (Excel formatting)
-    #          wb.save(xlsm_path)                      → conn.commit()
-    #          wb.close()                               → conn.close()
+    #    The `with Database()` block above committed and closed the connection.
     # --------------------------------------------------
-    # conn.commit()
-    conn.close()
     print("[DONE] Sourcing completed.")
  
  
