@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"/c/S2/Test/DST 2.0_2026/10.PFG_Final/venv/Scripts/python.exe\" -m pip freeze)",
+      "Bash(\"/c/S2/Test/DST 2.0_2026/10.PFG_Final/venv/Scripts/python.exe\" --version)"
+    ]
+  }
+}

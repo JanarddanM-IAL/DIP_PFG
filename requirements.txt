@@ -1,0 +1,35 @@
+# Requirements for PFG_Sourcing.py
+# Python 3.14 (project venv). Versions left unpinned so pip resolves
+# releases compatible with the interpreter.
+#
+# Install:
+#   pip install -r requirements.txt
+#   playwright install chrome   # download the browser Playwright drives
+
+# --- PDF parsing ---
+pdfplumber            # PDF text/word extraction (import: pdfplumber)
+
+# --- Excel I/O ---
+openpyxl              # read/write .xlsm / .xlsx workbooks (import: openpyxl)
+
+# --- Data / logging (parquet log tracker) ---
+pandas                # DataFrames, read_parquet / to_parquet (import: pandas)
+pyarrow               # parquet engine required by pandas .to_parquet()/.read_parquet()
+
+# --- Database ---
+pyodbc                # SQL Server connection via ODBC (import: pyodbc)
+
+# --- Environment config ---
+python-dotenv         # load DB credentials from .env (import: dotenv)
+
+# --- Concurrency / cross-process file locking ---
+filelock              # cross-process lock around the parquet log (import: filelock)
+
+# --- Browser automation (FAC search + downloads) ---
+playwright            # headless Chrome automation (import: playwright)
+
+# --- Imaging (validation proof popups/screenshots) ---
+Pillow                # image handling for Tk proof popups (import: PIL)
+
+# NOTE: tkinter is used but ships with the standard CPython installer on
+# Windows; it is not installable via pip.
