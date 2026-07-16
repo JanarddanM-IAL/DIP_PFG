@@ -1,0 +1,136 @@
+H. COA DATAPOINT MAPPING (AUTHORITATIVE)
+===============================================================================
+Every row must have "COA Datapoint". Map using PROP_CFS Items (post hierarchy
+flattening), COA Flag, current Section, Standard COA Master.
+
+COA MASTER FILTERING (STRICT):
+FLAG FILTER: Row maps ONLY to COA Master entries with identical COA Flag.
+STATEMENT FILTER: Only use COA Master rows where Statement contains "CFS".
+SECTION FILTER: Use the MAPPED master section (see mapping below).
+
+PROP_CFS PDF-TO-MASTER SECTION MAPPING:
+  PDF "Cash Flows from Operating Activities"                     = Master "Cash Flows from Operating Activities"
+  PDF "Cash Flows from Noncapital Financing Activities"          = Master "Cash Flows from Noncapital Financing Activities"
+  PDF "Cash Flows from Capital and Related Financing Activities" = Master "Cash Flows from Capital and Related Financing Activities"
+  PDF "Cash Flows from Investing Activities"                     = Master "Cash Flows from Investing Activities"
+  PDF "Net Change in Cash and Cash Equivalents"                  = Master "Net Change in Cash and Cash Equivalents"
+  PDF "Balance of Cash and Cash Equivalents"                     = Master "Cash and Cash Equivalents"
+
+MATCHING ORDER (within same flag):
+1) Mandatory mappings below
+2) Full exact match (case-insensitive)
+3) No match -> apply fallback (H5)
+
+===============================================================================
+H1. MANDATORY COA MAPPINGS -- DPG
+===============================================================================
+PDF DPG "Cash Flows from Operating Activities"
+  -> find master: CFS + "Cash Flows from Operating Activities" + DPG
+  -> "Cash Flows from Operating Activities"
+
+PDF DPG "Cash Flows from Noncapital Financing Activities"
+  -> find master: CFS + "Cash Flows from Noncapital Financing Activities" + DPG
+  -> "Cash Flows from Noncapital Financing Activities"
+
+PDF DPG "Cash Flows from Capital and Related Financing Activities"
+  -> find master: CFS + "Cash Flows from Capital and Related Financing Activities" + DPG
+  -> "Cash Flows from Capital and Related Financing Activities"
+
+PDF DPG "Cash Flows from Investing Activities"
+  -> find master: CFS + "Cash Flows from Investing Activities" + DPG
+  -> "Cash Flows from Investing Activities"
+
+
+PDF DPG "Cash and Cash Equivalents"
+  -> find master: CFS + "Cash and Cash Equivalents" + DPG
+  -> "Cash and Cash Equivalents"
+
+===============================================================================
+H2. MANDATORY COA MAPPINGS -- CP
+===============================================================================
+Net cash provided (used) by operating activities | Net cash flows - operating activities
+  -> "Total Cash Flows from Operating Activities"
+
+Net cash provided (used) by noncapital financing activities | Net cash flows - noncapital financing activities
+  -> "Total Cash Flows from Noncapital Financing Activities"
+
+Net cash provided (used) by capital and related financing activities | Net cash flows - capital and related financing activities
+  -> "Total Cash Flows from Capital and Related Financing Activities"
+
+Net cash provided (used) by investing activities | Net cash flows - investing activities
+  -> "Total Cash Flows from Investing Activities"
+
+Net increase (decrease) in cash and cash equivalents | Net change in cash and cash equivalents
+  -> find master CPs -> if no match -> "Net Change in Cash and Cash Equivalents" 
+
+End of year | Cash and cash equivalents, June 30 | Ending balance
+  -> "Total Balance of Cash and Cash Equivalents"
+
+===============================================================================
+H3. MANDATORY COA MAPPINGS -- DP (CRITICAL RULE FOR SECTIONS 1-4)
+===============================================================================
+
+*** THIS IS THE KEY RULE FOR PROP_CFS ***
+
+For sections 1-4 (Operating, Noncapital, Capital, Investing):
+ALL DP rows get the SAME COA Datapoint as their parent DPG.
+There is NO individual DP mapping for cash flow line items.
+
+The COA Master has only ONE DP entry per activity section, and its COA Datapoint
+is identical to the DPG name. Therefore:
+
+EVERY DP in "Cash Flows from Operating Activities"
+  -> COA Datapoint = "Cash Flows from Operating Activities"
+
+EVERY DP in "Cash Flows from Noncapital Financing Activities"
+  -> COA Datapoint = "Cash Flows from Noncapital Financing Activities"
+
+EVERY DP in "Cash Flows from Capital and Related Financing Activities"
+  -> COA Datapoint = "Cash Flows from Capital and Related Financing Activities"
+
+EVERY DP in "Cash Flows from Investing Activities"
+  -> COA Datapoint = "Cash Flows from Investing Activities"
+
+This applies regardless of the line item label. Whether the DP is
+"Receipts from customers", "Payments to employees", "Acquisition of capital assets",
+"Interest paid", "Investment income" — they ALL get the same COA Datapoint
+as their parent section DPG.
+
+===============================================================================
+H4. MANDATORY COA MAPPINGS -- DP (BALANCE SECTION ONLY)
+===============================================================================
+
+The "Balance of Cash and Cash Equivalents" section has DISTINCT DP mapping:
+
+Beginning of year | Cash and cash equivalents, July 1 | Beginning balance
+  -> "Beginning Balance of Cash and Cash Equivalents"
+
+Ending of year | Cash and cash equivalents, June 30 | Ending balance
+  -> "Ending Balance of Cash and Cash Equivalents"
+  (NOTE: If "End of year" is classified as CP, it maps via H2 instead)
+
+===============================================================================
+H5. FALLBACK RULES (WHEN NO MATCH FOUND)
+===============================================================================
+
+DP ROWS -- no match:
+  COA Datapoint = "Other_<DPGName>"
+  <DPGName> = COA Datapoint of the nearest preceding DPG row.
+  Replace spaces with underscores.
+  DP must NEVER have blank "" COA Datapoint.
+
+  NOTE: For sections 1-4, this fallback should NEVER trigger because H3
+  assigns ALL DPs the same COA Datapoint as their DPG. The fallback exists
+  only as a safety net.
+
+CP ROWS -- no match:
+  COA Datapoint = "" (blank)
+  NEVER invent a CP COA Datapoint.
+
+DPG ROWS -- no match:
+  COA Datapoint = "Other_DPG"
+  DPG must NEVER have blank "" COA Datapoint.
+
+COA Datapoint must never be null; use "" only for unmatched CP rows.
+
+===============================================================================

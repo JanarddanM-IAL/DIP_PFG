@@ -1,0 +1,156 @@
+H. COA DATAPOINT MAPPING (AUTHORITATIVE)
+===============================================================================
+Every row must have "COA Datapoint". Map using GOV_IS Items (post hierarchy
+flattening), COA Flag, current Section, Standard COA Master.
+
+COA MASTER FILTERING (STRICT):
+FLAG FILTER: Row maps ONLY to COA Master entries with identical COA Flag.
+STATEMENT FILTER: Only use COA Master rows where Statement contains "GOV_IS".
+SECTION FILTER: Use the MAPPED master section (see mapping below).
+
+GOV_IS PDF-TO-MASTER SECTION MAPPING:
+  PDF "Revenues"                       = Master "Operating Revenues"
+  PDF "Expenditures"                   = Master "Operating Expenses"
+  PDF "Other Financing Sources (Uses)" = Master "Other Financing Sources"
+  PDF "Net Change in Fund Balances"    = Master "Net Change In Fund Balances"
+
+MATCHING ORDER (within same flag):
+1) Mandatory mappings below
+2) Full exact match (case-insensitive)
+3) Whitespace-normalized
+4) Punctuation-insensitive
+5) Prefix-aware (if ":" in label, match root prefix before first ":")
+6) Semantic closest (high confidence only)
+7) No match -> apply fallback (H5)
+
+===============================================================================
+H1. MANDATORY COA MAPPINGS -- DPG
+===============================================================================
+PDF DPG "Revenues"                       -> "Operating Revenues"
+PDF DPG "Expenditures"                   -> "Operating Expenses"
+PDF DPG "Other Financing Sources (Uses)" -> "Other Financing Sources"
+
+===============================================================================
+H2. MANDATORY COA MAPPINGS -- CP
+===============================================================================
+Total revenues | Total Revenues
+  -> "Total Operating Revenues"
+Total expenditures | Total Expenditures
+  -> "Total Operating Expenses"
+Excess (deficiency) of revenues over expenditures | Revenues over (under)
+expenditures | Excess of revenues over (under) expenditures
+  -> "Excess Of Revenues Over/Under Expenditures"
+Total other financing sources (uses) | Total Other Financing Sources (Uses)
+  -> "Total Other Financing Sources"
+Net change in fund balances | Net Change in Fund Balances
+  -> "Net Change In Fund Balances"
+Excess of revenues over (under) expenditures | Excess Of Revenues Over/Under Expenditures|Excess Of Revenue|Excess Of Expenditure
+  -> "Excess Of Revenues Over/Under Expenditures"
+===============================================================================
+H3. MANDATORY COA MAPPINGS -- DP (REVENUES SECTION)
+===============================================================================
+The PDF "Revenues" section maps to master section "Operating Revenues".
+Match DP labels against master DPs in "Operating Revenues":
+
+General property taxes | Ad valorem taxes | Property taxes 
+  (ONLY when label explicitly contains "property" or "ad valorem")
+  -> "Property Taxes"
+
+Taxes (bare, unqualified, no "property"/"ad valorem" modifier)
+  -> "Other Tax Revenues"
+Tax increment collections | Tax increment | TIF revenues
+  -> "Property Taxes"
+Sales taxes | Sales tax revenues
+  -> "Sales Taxes"
+Income taxes
+  -> "Income Taxes"
+Business taxes | Business license taxes
+  -> "Business Taxes"
+Other city taxes | Other taxes | Franchise taxes | Hotel taxes | Utility taxes
+  -> "Other Tax Revenues"
+Licenses and permits | Licenses, permits and fees
+  -> "Charges for Services"
+Charges for services | Charges for service
+  -> "Charges for Services"
+Fines and forfeitures | Fines and penalties
+  -> "Charges for Services"
+Intergovernmental | Intergovernmental revenues
+  -> "Intergovernmental Revenues"
+Use of money and property | Interest and investment earnings | Investment income
+  -> "Interest and Investment Earnings"
+Miscellaneous | Other revenues | Other
+  -> "Other Operating Revenues"
+
+Any other unmatched DP in Revenues section -> "Other_Operating_Revenues"
+
+===============================================================================
+H4. MANDATORY COA MAPPINGS -- DP (EXPENDITURES SECTION)
+===============================================================================
+The PDF "Expenditures" section maps to master section "Operating Expenses".
+
+"Current:" PREFIX RULE: Strip "Current: " before matching. It is a GAAP artifact.
+  "Current: General government" -> match "General government" -> "General Government"
+  "Current: Public safety"      -> match "Public safety"      -> "Public Safety"
+  "Current: Public works"       -> match "Public works"       -> "Public Works"
+  "Current: <anything else>"    -> if no match below          -> "Other_Operating_Expenses"
+
+ROOT PREFIX RULE: If label has ":" prefix, extract root and match:
+  Root "Debt service"   -> "Debt Service"   (all children get this)
+  Root "Capital outlay" -> "Capital Outlay"  (all children get this)
+
+General government -> "General Government"
+Public safety -> "Public Safety"
+Public works -> "Public Works"
+Education -> "Education"
+Social services | Health and social services -> "Social Services"
+Debt service: <any child> -> "Debt Service"
+Capital outlay: <any child> -> "Capital Outlay"
+Depreciation | Depreciation and maintenance -> "Depreciation and Maintenance"
+Operations and maintenance -> "Operations and Maintenances"
+
+Any other unmatched DP in Expenditures section -> "Other_Operating_Expenses"
+
+===============================================================================
+H4B. MANDATORY COA MAPPINGS -- DP (OTHER FINANCING SOURCES SECTION)
+===============================================================================
+The PDF "Other Financing Sources (Uses)" section maps to master
+section "Other Financing Sources".
+
+Transfers in -> "Transfer In"
+Transfers out -> "Transfer Out"
+Proceeds from sale of capital asset | Sale of capital assets -> "Other Financing Sources"
+Bonds issued | Issuance of debt | Issuance of bonds -> "Other Financing Sources"
+Premium on bonds issued | Bond premium -> "Other Financing Sources"
+Refunding bonds | Payment to refund bond escrow -> "Other Financing Sources"
+Initiation of SBITAs | Initiation of leases -> "Other Financing Sources"
+Insurance recoveries -> "Other Financing Sources"
+
+Any other unmatched DP in OFS section -> "Other_Other_Financing_Sources"
+
+===============================================================================
+H5. FALLBACK RULES (WHEN NO MATCH FOUND ABOVE)
+===============================================================================
+
+DP ROWS -- no match after all steps above:
+  COA Datapoint = "Other_<DPGName>"
+  <DPGName> = COA Datapoint of the nearest preceding DPG row.
+  Replace spaces with underscores.
+
+  Fallback values by section:
+    Revenues section (DPG = "Operating Revenues")     -> "Other_Operating_Revenues"
+    Expenditures section (DPG = "Operating Expenses")  -> "Other_Operating_Expenses"
+    OFS section (DPG = "Other Financing Sources")      -> "Other_Other_Financing_Sources"
+
+  DP must NEVER have blank "" COA Datapoint.
+
+CP ROWS -- no match:
+  COA Datapoint = "" (blank)
+  NEVER invent a CP COA Datapoint.
+
+DPG ROWS -- no match:
+  COA Datapoint = "Other_DPG"
+  DPG must NEVER have blank "" COA Datapoint.
+
+COA Datapoint must never be null; use "" only for unmatched CP rows.
+
+===============================================================================

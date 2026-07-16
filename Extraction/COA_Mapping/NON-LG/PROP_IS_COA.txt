@@ -1,0 +1,232 @@
+===============================================================================
+TODO -- NON-LG COA MAPPING FOR PROP_IS
+===============================================================================
+This file is seeded from the LG version below as a starting point ONLY.
+Replace/adjust the MANDATORY COA MAPPINGS lines to match NON-LG account
+naming conventions (e.g. standalone utility/authority terminology) before
+using this in production. Keep the same file format: one mapping rule
+per line, 'Raw label pattern -> "COA Datapoint"'.
+===============================================================================
+
+H. COA DATAPOINT MAPPING (AUTHORITATIVE — BASED ON COA MASTER)
+===============================================================================
+Every row must have "COA Datapoint". Map using PROP_IS Items (post hierarchy
+flattening), COA Flag, current Section, and the Standard COA Master provided.
+
+COA MASTER STRUCTURE for PROP_IS (columns: Statement | Section | COA Flag | COA Datapoint):
+  STATEMENT FILTER: Only use rows where Statement contains "PROP_IS"
+                    (matches both "PROP_IS" and "GOV_IS|PROP_IS").
+  FLAG FILTER: Row maps ONLY to COA Master entries with identical COA Flag.
+  SECTION FILTER: Use the master Section name per the mapping table below.
+
+PROP_IS PDF-SECTION → COA MASTER SECTION MAPPING:
+  PDF "Operating Revenues"             -> Master Section "Operating Revenues"
+  PDF "Operating Expenses"             -> Master Section "Operating Expenses"
+  PDF "Nonoperating Revenues (Expenses)" -> Master Section "Nonoperating Revenues/Expense"
+                                           (ALL items: both revenue-side AND expense-side)
+  PDF "Income (Loss) before Transfers" -> Master Section "Income (loss) before Transfers"
+  PDF "Contributions and Transfers"    -> Master Section "Contributions and Transfers"
+  PDF "Change in Net Position"         -> Master Section "Change In Net Position"
+
+MATCHING ORDER (within same flag + section):
+1) Mandatory mappings below (H1–H3D)
+2) Full exact match (case-insensitive)
+3) Whitespace-normalized match
+4) Punctuation-insensitive match
+5) Prefix-aware: if ":" in label, try matching root prefix OR suffix alone
+6) Semantic closest (high confidence only)
+7) No match -> apply fallback (H5)
+
+===============================================================================
+H1. MANDATORY COA MAPPINGS — DPG
+===============================================================================
+NOTE: Sections "Income (Loss) before Transfers" and "Change in Net Position"
+have NO DPG row in the COA Master. Do NOT emit a DPG row for those sections.
+NOTE: Emit a DPG row below ONLY for a section that actually has content in the PDF (see
+Section D.5 and Section F for the "Contributions and Transfers" absence rule).
+
+PDF DPG "Operating Revenues"              -> COA Datapoint: "Operating Revenues"
+PDF DPG "Operating Expenses"              -> COA Datapoint: "Operating Expenses"
+PDF DPG "Nonoperating Revenues (Expenses)"-> COA Datapoint: "Nonoperating Revenues/Expense"
+PDF DPG "Contributions and Transfers"     -> COA Datapoint: "Contributions and Transfers"
+                                              (only if the section has PDF content — otherwise
+                                               omit entirely; see Section D.5)
+
+===============================================================================
+H2. MANDATORY COA MAPPINGS — CP
+===============================================================================
+Total operating revenues (any variant)
+  -> COA Datapoint: "Total Operating Revenues"
+
+Total operating expenses (any variant)
+  -> COA Datapoint: "Total Operating Expenses"
+
+Operating income (loss) | Operating income | Operating loss | Operating income (expense)
+  -> COA Datapoint: "Operating Income (Loss)"
+
+Total nonoperating revenues (expenses) | Net nonoperating income (expense) |
+Total nonoperating income (expense) | Total nonoperating revenues and expenses
+  -> COA Datapoint: "Total Nonoperating Revenues/Expense"
+  *** NOTE: COA Master value is "Total Nonoperating Revenues/Expense" — use EXACTLY this string ***
+
+Income (loss) before transfers | Income before transfers |
+Income (loss) before contributions and transfers |
+Income before contributions and transfers
+  -> COA Datapoint: "Income (Loss) before Transfers"
+  *** APPLY ONLY when the D.4 PATCH section-presence test is satisfied — i.e., the PDF prints
+  a genuine distinct subtotal row after nonoperating items, separate from "Operating income
+  (loss)". Otherwise this mapping is not used at all for this PDF. ***
+
+Total contributions and transfers | Total capital contributions and transfers
+  -> COA Datapoint: ""  (blank — no matching CP in COA Master for this)
+
+Change in net position | Change in fund net position |
+Increase (decrease) in net position | Net increase (decrease)
+  -> COA Datapoint: "Change In Net Position"
+  *** NOTE: COA Master value is "Change In Net Position" — use EXACTLY this string ***
+
+===============================================================================
+H3. MANDATORY COA MAPPINGS — DP (OPERATING REVENUES SECTION)
+===============================================================================
+COA Master Section: "Operating Revenues"
+PREFIX STRIPPING: Strip any leading group header prefix before matching.
+  e.g. "Operating revenues: Charges for services: Unpledged" -> try "Unpledged", then
+       "Charges for services: Unpledged", then "Charges for services"
+
+Charges for services | User fees | Service charges | Water sales | Sewer charges |
+Refuse collection | Admission fees | Rate revenue | Fee revenue | Toll revenue |
+Unpledged | Pledged as security for revenue bonds | Licenses, permits, and fees |
+Sales | Fines and forfeitures | Rentals and leases | Any sub-item under "Charges for services:"
+  -> "Charges for Services"
+
+Donations and contributions | Contributions (operating)
+  -> "Other Operating Revenues"
+
+Intergovernmental | Intergovernmental revenues
+  -> "Intergovernmental Revenues"
+
+Interest and investment earnings | Investment income | Earnings on investments
+  -> "Interest and Investment Earnings"
+
+Other income | Other revenue | Miscellaneous | Other operating revenues
+  -> "Other Operating Revenues"
+
+Any other unmatched DP in Operating Revenues section -> "Other Operating Revenues"
+
+===============================================================================
+H3B. MANDATORY COA MAPPINGS — DP (OPERATING EXPENSES SECTION)
+===============================================================================
+COA Master Section: "Operating Expenses"
+PREFIX STRIPPING: Strip any leading "Operating expenses: " prefix before matching.
+
+Salaries | Salaries and fringe benefits | Personnel services | Benefits | Wages |
+Payroll | Commodities and services | Supplies | Materials | Professional services |
+Contractual services | Repairs and maintenance | Utilities | Insurance |
+Purchased services | Administrative | Other operating expenses | Lease amortization |
+Any labor, service, or supply expense item
+  -> "Operations and Maintenances"
+
+Depreciation | Amortization | Depreciation and amortization | Depreciation/amortization
+  -> "Depreciation and Maintenance"
+
+Any other unmatched DP in Operating Expenses section -> "Other Operating Expenses"
+
+===============================================================================
+H3C. MANDATORY COA MAPPINGS — DP (NONOPERATING SECTION)
+===============================================================================
+COA Master Section: "Nonoperating Revenues/Expense"
+ALL items (revenue AND expense) map to this single COA Master section.
+PREFIX STRIPPING: Strip any leading "Nonoperating revenues (expenses): " or
+"Nonoperating income (expenses): " or "Nonoperating revenues and expenses: " or
+any equivalent nonoperating group header prefix before matching.
+
+** PRIORITY RULE 1 — NUCLEAR DECOMMISSIONING TRUST FUND (CHECK FIRST):
+   If the label (after prefix stripping) contains
+     "nuclear decommissioning trust fund"  (case-insensitive)
+   -> COA Datapoint: "Other Nonoperating Expenses"
+   -> STOP. Do not evaluate any further H3C rule for this row.
+
+** PRIORITY RULE 2 — GRANTS IN NONOPERATING SECTION (CHECK SECOND):
+   If the label (after prefix stripping, including any remaining sub-group prefix)
+   contains the word "grant" or "grants" (case-insensitive, whole-word match)
+   -> COA Datapoint: "Nonoperating Grants and Contributions"
+   -> STOP. Do not evaluate any further H3C rule for this row.
+   Examples that trigger this rule:
+     "Grant income"  |  "Grant revenue"  |  "Grants"  |
+     "Other income, net: Grant income"  |  "Capital grants (nonoperating)"
+   Examples that do NOT trigger (no whole word "grant"):
+     "Intergovernmental revenues"  |  "Investment income"
+
+Investment and interest income | Investment income | Earnings on investments |
+Interest income | Interest and investment earnings | Dividend income |
+Investment and interest income (loss)
+  -> "Interest and Investment Earnings"
+
+State sources | Federal sources | Intergovernmental | Federal grants | State grants |
+Intergovernmental revenues
+  -> "Intergovernmental Revenues"
+
+Interest expense | Interest on debt | Interest and fiscal charges
+  -> "Interest Expenses"
+
+Gain (loss) on disposal of capital assets | Gain on disposal | Loss on disposal |
+Sale of capital assets | Gain (loss) on sale
+  -> "Other Nonoperating Revenues"
+
+Rent | Rental income | Refunds | Refunds and reimbursements | Insurance recovery |
+Other nonoperating revenue | Other nonoperating income | Miscellaneous nonoperating
+  -> "Other Nonoperating Revenues"
+
+Other nonoperating expense | Miscellaneous nonoperating expense
+  -> "Other Nonoperating Expenses"
+
+Any other unmatched DP in Nonoperating section -> "Other Nonoperating Revenues"
+
+===============================================================================
+H3D. MANDATORY COA MAPPINGS — DP (CONTRIBUTIONS AND TRANSFERS SECTION)
+===============================================================================
+COA Master Section: "Contributions and Transfers"
+This entire section (and the H3D mappings below) only ever applies when the section has
+content in the PDF. If the PDF has no such rows, see Section D.5 — output [] and skip H3D.
+
+Capital contributions | Capital grants | Connection fees | Tap fees |
+Developer contributions | Capital grants and contributions | Contributions (capital)
+  -> "Capital Grants and Contributions"
+
+Transfers in | Operating transfers in | Transfers from other funds
+  -> "Transfer In"
+
+Transfers out | Operating transfers out | Transfers to other funds
+  -> "Transfer Out"
+
+Any other unmatched DP in Contributions section -> "Other_Contributions and Transfers"
+Any other unmatched DP in Operating Expenses section -> "Other Operating Expenses"
+Any other unmatched DP in Nonoperating Revenues/Expense -> "Other Nonoperating Expenses"
+
+===============================================================================
+H5. FALLBACK RULES (WHEN NO MATCH FOUND ABOVE)
+===============================================================================
+
+DP ROWS — no match after all steps above:
+  COA Datapoint = "Other_<DPGName>"
+  <DPGName> = COA Datapoint of the nearest preceding DPG row in this section.
+
+  Fallback values by section:
+    Operating Revenues         -> "Other Operating Revenues"
+    Operating Expenses         -> "Other Operating Expenses"
+    Nonoperating section       -> "Other Nonoperating Revenues"
+    Contributions and Transfers-> "Other_Contributions and Transfers"
+
+  DP must NEVER have blank "" COA Datapoint.
+
+CP ROWS — no match:
+  COA Datapoint = "" (blank string)
+  NEVER invent a CP COA Datapoint not in the COA Master.
+
+DPG ROWS — no match:
+  COA Datapoint = "Other_DPG"
+  DPG must NEVER have blank "" COA Datapoint.
+
+COA Datapoint must never be null; use "" only for unmatched CP rows.
+
+===============================================================================

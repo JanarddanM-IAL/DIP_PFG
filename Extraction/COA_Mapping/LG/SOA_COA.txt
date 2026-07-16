@@ -1,0 +1,115 @@
+H. COA DATAPOINT MAPPING (AUTHORITATIVE)
+===============================================================================
+Every row must have "COA Datapoint". Never leave blank when reliable match exists.
+Map using: SOA Items (post hierarchy flattening), COA Flag, current Section, Standard COA Master.
+
+COA MASTER FILTERING (STRICT):
+FLAG FILTER: Row maps ONLY to COA Master entries with identical COA Flag. Never cross-map DPG<->DP<->CP.
+STATEMENT FILTER: Only use COA Master rows where Statement = "SOA". Prefer exact match.
+SECTION FILTER: Prefer matching section.
+
+MATCHING ORDER (within same flag):
+1) Mandatory mappings below  2) Full exact match  3) Case-insensitive  4) Whitespace-normalized
+5) Punctuation-insensitive  6) Prefix-aware (if ":" in SOA Items, match suffix after final ":")
+7) Semantic closest.  No match -> "Other_<SectionName>" (see Fallback Rule below).
+
+MANDATORY COA MAPPINGS — DPG:
+"General Revenues" -> COA Datapoint: "General Revenues"
+"Transfers" -> COA Datapoint: "Transfers"
+[label containing "Charges for Services" + "Governmental"] -> COA Datapoint: "Program Receipts - Charges for Services - Governmental Activities"
+[label containing "Charges for Services" + "Business"] -> COA Datapoint: "Program Receipts - Charges for Services - Business-type Activities"
+[label containing "Operating Grants" + "Governmental"] -> COA Datapoint: "Program Receipts - Operating Grants and Contributions - Governmental Activities"
+[label containing "Operating Grants" + "Business"] -> COA Datapoint: "Program Receipts - Operating Grants and Contributions - Business-type Activities"
+[label containing "Capital Grants" + "Governmental"] -> COA Datapoint: "Program Receipts - Capital Grants and Contributions - Governmental Activities"
+[label containing "Capital Grants" + "Business"] -> COA Datapoint: "Program Receipts - Capital Grants and Contributions - Business-type Activities"
+[label containing "Expenses" AND "Governmental" (e.g., "Expenses - Governmental Activities")] -> COA Datapoint: "Program Expenses - Governmental Activities"
+[label containing "Expenses" AND "Business" (e.g., "Program Expenses - Business-type Activities")] -> COA Datapoint: "Program Expenses - Business-type Activities"
+NOTE: The SOA Items value of these two DPG rows is ALWAYS the normalized fixed label ("Expenses - Governmental Activities" / "Expenses - Business-type Activities"), never the raw PDF text. The COA Datapoint is always the standardized master value.
+
+MANDATORY COA MAPPINGS — CP:
+"Total General Revenues" | "Total general revenues" -> "Total General Revenues"
+"Total General Revenues and Transfer" | "Total General Revenues and Transfers" | "Total general revenues and transfers" -> "Total General Revenues and Transfer"
+"Total Program Receipts - Charges for Services" | "Total Charges for Services" | "Total charges for services" -> "Total Program Receipts - Charges for Services"
+"Total Program Receipts - Operating Grants and Contributions" | "Total Operating Grants and Contributions" -> "Total Program Receipts - Operating Grants and Contributions"
+"Total Program Receipts - Capital Grants and Contributions" | "Total Capital Grants and Contributions" -> "Total Program Receipts - Capital Grants and Contributions"
+"Total Expenses" | "Total program expenses" | "Total primary government expenses" -> "Total Program Expenses"
+"Change in net position" | "Changes in net position" -> "Changes in Net Position"
+
+MANDATORY COA MAPPINGS — DP (General Revenues section):
+Property taxes levied for general purposes | Property taxes levied for debt service | Ad valorem taxes | Millage -> "Property Taxes"
+Tax increment financing | Tax increment | TIF revenues -> "Property Taxes"
+Sales taxes | Sales and use taxes -> "Sales Taxes"
+Income taxes -> "Income Taxes"
+Business taxes | Franchise taxes | Business license taxes -> "Business Taxes"
+Other taxes and payments in lieu of taxes | Hotel/motel taxes | Excise taxes | Fuel taxes | Other taxes -> "Other Tax Revenues"
+Unrestricted grants | Intergovernmental revenues (unrestricted) | State aid (unrestricted) -> "Intergovernmental Revenues"
+Unrestricted investment earnings | Investment income | Interest on investments | Interest income -> "Interest and Investment Earnings"
+Gain on sale of asset | Gain on sale | Sale of assets | Miscellaneous | Other revenues | Fines and forfeitures -> "Other General Revenues"
+Transfers | Transfers in | Transfers out -> "Transfers"
+
+MANDATORY COA MAPPINGS — DP (Program Revenue section):
+All DP rows under Charges for Services DPGs -> "Charges for Services"
+All DP rows under Operating Grants DPGs -> "Operating Grants and Contributions"
+All DP rows under Capital Grants DPGs -> "Capital Grants and Contributions"
+"Component Unit" row in Program Revenue sub-sections (when HAS_COMPONENT_UNITS = TRUE) -> same as the sub-section's datapoint ("Charges for Services" | "Operating Grants and Contributions" | "Capital Grants and Contributions")
+
+MANDATORY COA MAPPINGS — DP (Program Expenses section):
+General government | Administration | City manager | City clerk | Finance | Legal | Legislative | Executive -> "General Government"
+Public safety | Police | Fire | Emergency services | Sheriff | 911 | Corrections -> "Public Safety"
+Public works | Streets | Roads | Highways | Bridges | Transportation | Traffic engineering -> "Public Works"
+Health and social services | Health | Welfare | Human services | Social services | Children | Aging -> "Social Services"
+Education | Schools -> "Education"
+Capital outlay | Capital projects -> "Capital Outlay"
+Interest and fiscal charges | Interest on long-term debt | Debt service interest -> "Interest Expenses & Fiscal Charges"
+Culture and recreation | Parks | Libraries | Arts | Museums | Recreation | Convention -> "Other Program Expenses"
+Economic development | Planning | Community development | Housing | Redevelopment -> "Other Program Expenses"
+[Any business-type/enterprise function: Water | Sewer | Electric | Gas | Transit | Solid waste | Refuse | Golf | Airport | Marina | Parking | Stormwater | Event Center | Arena | Port | Utility | any named enterprise fund] -> "Other Program Expenses"
+"Component Unit" row in Program Expenses (when HAS_COMPONENT_UNITS = TRUE) -> "Other Program Expenses"
+[Any other function not matching above] -> "Other Program Expenses"
+
+===============================================================================
+H2. SEMANTIC FALLBACK RULES (ONLY IF NO MATCH FOUND ABOVE)
+===============================================================================
+Use label keywords + current Section. Evaluate in ORDER LISTED. First match wins.
+
+GENERAL REVENUES:
+GR1: (property tax|ad valorem|millage|levy|tax increment|TIF) -> "Property Taxes"
+GR2: (sales tax|sales and use) -> "Sales Taxes"
+GR3: (income tax) -> "Income Taxes"
+GR4: (business tax|franchise tax|license tax) -> "Business Taxes"
+GR5: (hotel|excise|fuel|other tax|payment in lieu) -> "Other Tax Revenues"
+GR6: (intergovernmental|state aid|federal aid|grant)+(unrestricted|general) -> "Intergovernmental Revenues"
+GR7: (investment|interest income|investment earnings) -> "Interest and Investment Earnings"
+GR8: (gain|sale of asset|miscellaneous|other|fine|forfeiture) -> "Other General Revenues"
+GR9: (transfer) -> "Transfers"
+
+PROGRAM REVENUE: All DP rows inherit the datapoint of their DPG sub-section. No separate semantic fallback needed.
+
+PROGRAM EXPENSES:
+PE1: (general government|administration|legislative|executive|judicial|city manager|city clerk|finance|legal) -> "General Government"
+PE2: (public safety|police|fire|sheriff|emergency|911|corrections|jail) -> "Public Safety"
+PE3: (public works|streets|roads|highway|bridges|transportation|traffic) -> "Public Works"
+PE4: (health|social service|welfare|human service|mental health|children|aging) -> "Social Services"
+PE5: (education|school|library) -> "Education"
+PE6: (capital outlay|capital project) -> "Capital Outlay"
+PE7: (interest|fiscal charge|debt service interest) -> "Interest Expenses & Fiscal Charges"
+PE8: (culture|recreation|park|arts|museum|zoo|convention|library) -> "Other Program Expenses"
+PE9: (economic development|planning|community development|housing|redevelopment) -> "Other Program Expenses"
+PE10: (water|sewer|electric|gas|transit|solid waste|refuse|golf|airport|marina|parking|stormwater|event center|arena|port|utility) -> "Other Program Expenses"
+PE11: [default — any unmatched function] -> "Other Program Expenses"
+
+===============================================================================
+COA DATAPOINT FALLBACK RULE — "Other_<SectionName>"
+===============================================================================
+After exhausting ALL matching steps:
+1. DP row with no match -> "COA Datapoint" = "Other_<SectionName>".
+   - Under General Revenues -> "Other_General_Revenues"
+   - Under Program Revenue -> "Other_Program_Revenue"
+   - Under Program Expenses -> "Other_Program_Expenses"
+2. NEVER leave DP COA Datapoint blank "".
+3. CP rows: use "" (blank) when no master match. NEVER invent a CP datapoint.
+4. DPG rows: use "Other_DPG" when no master match. NEVER blank.
+COA Datapoint must never be null for any row type.
+
+
+===============================================================================

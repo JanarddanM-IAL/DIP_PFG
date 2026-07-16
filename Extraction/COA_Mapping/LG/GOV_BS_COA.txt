@@ -1,0 +1,223 @@
+H. COA DATAPOINT MAPPING (AUTHORITATIVE)
+Every row must have "COA Datapoint". Never leave it blank when a reliable match exists.
+Map using GOV_BS Items (post hierarchy flattening), COA Flag, current Section, Standard COA Master.
+
+COA MASTER FILTERING (STRICT):
+FLAG FILTER: Row can only map to COA Master entries with identical COA Flag. Never cross-map DPG<->DP<->CP.
+STATEMENT FILTER: Only use COA Master rows where Statement contains "GOV_BS". Prefer exact.
+SECTION FILTER: Prefer matching section. Allow fallback only after mandatory examples and exact matches exhausted.
+
+MATCHING ORDER (within same flag):
+1) Mandatory examples below 2) Full exact match 3) Case-insensitive 4) Whitespace-normalized 5) Punctuation-insensitive 6) Prefix-aware (if ":" in GOV_BS Items, match suffix after final ":")
+7) Semantic closest. Longer full-label match always wins.
+ No match -> apply COA Datapoint Fallback Rule below.
+
+MANDATORY COA MAPPINGS -- DPG:
+Assets->"Assets" | Deferred Outflows of Resources->"Deferred Outflows of Resources" | Liabilities->"Liabilities" | Deferred Inflows of Resources->"Deferred Inflows of Resources" | Net Position->"Net Position"
+Fund Balances->"Fund Balances"
+
+
+MANDATORY COA MAPPINGS -- CP:
+Total assets->"Total Assets" | Total current assets->"Total current assets" | Total capital assets->"Total capital assets" | Total noncurrent assets->"Total noncurrent assets" | Total deferred outflows of resources->"Total Deferred Outflows of Resources" | Total assets and deferred outflows of resources->"Total Assets and Deferred Outflows of Resources" | Total current liabilities->"Total Current Liabilities" | Total noncurrent liabilities->"Total Noncurrent Liabilities" | Total liabilities->"Total Liabilities" | Total deferred inflows of resources->"Total Deferred Inflows of Resources" | Total liabilities and deferred inflows of resources->"Total Liabilities and Deferred Inflows of Resources" | Total restricted->"Total Restricted" | Total unrestricted->"Total Unrestricted" | Total net position / Total net position (deficit)->"Total Net Position" | Total liabilities, deferred inflows of resources, and net position->"Total Liabilities, Deferred inflows of resources, and Net position"
+Total fund balances / Total Fund Balances->"Total Fund Balances"|Total other assets->"Total Other Assets"
+|Capital assets - net->"Total Capital Assets"|
+Total liabilities, deferred inflows of resources and fund balances (any variant) / Total liabilities and fund balances->"Total Liabilities, Deferred Inflows of Resources, And Fund Balances"
+
+
+MANDATORY COA MAPPINGS -- DP:
+Other assets: + investments ->"Other Assets"
+Noncurrent assets: Loans and notes | Noncurrent assets: Lease Receivable | Other noncurrent receivables (not matching Accounts/Taxes/Interest Receivable patterns) -> "Other Noncurrent Assets"
+Cash and investments (including cash equivalents)->"Cash and Investments"
+Cash and investments|cash equivalents|Cash with Fiscal Agent | Cash held by fiscal agent | Cash held by trustee | in Segregated Accounts | with Fiscal Agent|In custody of the County Treasurer (if all including Restricted)->"Restricted Cash and Investments"
+Restricted cash | Cash with Fiscal Agent | Cash held by fiscal agent | Cash held by trustee | Cash and Cash Equivalents in Segregated Accounts | Cash and Cash Equivalents with Fiscal Agent|Cash and investments: In custody of the County Treasurer->"Restricted Cash and Investments"
+Receivables: Accounts receivable->"Accounts Receivable"
+Receivables: Interest receivable->"Interest Receivable"
+Receivables: Taxes receivable | Taxes receivable - succeeding year->"Taxes Receivable"
+Receivables: Lease receivable->"Other Receivable"
+Internal balances | Due from component unit->"Due from Other Funds"
+Due from other governments->"Due from Other Governments"
+Inventories->"Inventories" | Prepaid items->"Prepaid items"
+Capital assets not being depreciated | Capital assets, net of accumulated depreciation/amortization->"Capital Assets"
+Investment in associated companies | Investment in subsidiaries | Investment in joint ventures (Not contains Noncurrent assets)->"Cash and Investments"
+Investment in associated companies | Investment in subsidiaries | Investment in joint ventures (contains Noncurrent assets)->"Other Noncurrent Assets"
+Deferred outflows of resources related to pensions->"Deferred Outflows of Resources"
+Accounts and contracts payable->"Accounts Payable" | Interest payable->"Interest Payable"
+Salaries and benefits payable->"Payroll Liabilities - Current"
+Due to primary government->"Due from Other Funds" | Due to other governments->"Due to Other Governments"
+Deposits payable->"Other Liabilities - Current"
+MANDATORY COA MAPPINGS -- DP (LIABILITIES - NONCURRENT CONTEXT RULE):
+
+If GOV_BS Items prefix contains "Noncurrent liabilities:" (i.e., the row is 
+nested under a Noncurrent liabilities group header), then the "due within 
+one year" / "due after one year" sub-label does NOT drive current vs. 
+noncurrent classification. The group header takes precedence.
+
+BLOCKED FROM Long-term Debt routing:
+  - "Long-term liabilities payable" (any suffix)
+  - "Other long-term liabilities" (any suffix)
+  - "General long-term obligations" (any suffix)
+  - "Long-term obligations" (any suffix)
+
+Rule: If Row Items suffix (after final ":") matches any blocked pattern above:
+  → COA Datapoint = "Other Liabilities - Noncurrent"
+  → STOP. Do not evaluate noncurrent context rule or L3/L4.
+Noncurrent liabilities: (Long-term liabilities payable | Other long-term 
+  liabilities | Claims and judgments | Landfill closure | 
+  General long-term obligations) 
+  + (due within one year OR due after one year) -> "Other Liabilities - Noncurrent"
+  
+Noncurrent liabilities: (Bonds payable | Notes payable | Revenue bonds | 
+  Revenue notes | Certificates of obligation | Leases payable | 
+  Capital leases | Installment purchases) 
+  + (due within one year OR due after one year) -> "Long-term Debt - Noncurrent"
+
+Noncurrent liabilities: (Compensated absences | OPEB | Other post-employment 
+benefits | Net pension liability) + (due within one year OR due after one year)
+  -> "Payroll Liabilities - Noncurrent"
+
+SEPARATE SECTION RULE (no Noncurrent liabilities: prefix):
+If the row stands alone (NOT under a Noncurrent liabilities group header):
+  (Bonds/notes | Revenue notes | Leases) + due within one year 
+    -> "Long-term Debt - Current"
+  (Bonds/notes | Revenue notes | Leases) + due after one year  
+    -> "Long-term Debt - Noncurrent"
+  (Compensated absences | OPEB) + due within one year 
+    -> "Payroll Liabilities - Current"
+  (Compensated absences | OPEB) + due after one year  
+    -> "Payroll Liabilities - Noncurrent"
+Accrued landfill costs payable after one year | Net pension liability payable after one year->"Other Liabilities - Noncurrent"
+Deferred inflows of resources related to pensions | Deferred inflows of resources related to lease receivable | Taxes and assessments for subsequent years->"Deferred Inflows of Resources"
+Net investment in capital assets->"Net Investment in Capital Assets"
+Restricted for: Cemetery - nonexpendable | Restricted for: State road use tax | Restricted for: Local option sales tax | Restricted for: Employee benefits | Restricted for: Capital projects | Restricted for: Other nonmajor special revenue funds->"Restricted Net Assets"
+Unrestricted->"Unrestricted Net Assets"
+
+MANDATORY COA MAPPINGS -- DP (FUND BALANCES):
+Nonspendable (any variant)->"Nonspendable Fund Balances"
+Restricted (any variant, under Fund Balances section)->"Restricted Fund Balances"
+Committed (any variant)->"Committed Fund Balances"
+Assigned (any variant)->"Assigned Fund Balances"
+Unassigned (any variant)->"Unassigned Fund Balances"
+===============================================================================
+H2. DETERMINISTIC COA DATAPOINT RESOLUTION
+PAYROLL/PENSION ROUTING: In Liabilities section, any row containing "pension"|"opeb"|"retirement"|"post-employment"|"employee benefits" -> "Payroll Liabilities - Current" (if current/within one year) or "Payroll Liabilities - Noncurrent" (if noncurrent/after one year). Overrides "Other Liabilities" and "Long-term Debt".
+VALUE-DRIVEN MATCHING: Prioritize structural intent over surface text (e.g., "Net OPEB liability/asset" in Liabilities section -> liability datapoint).
+===============================================================================
+RESTRICTED ASSETS PREFIX RULE (RUNS FIRST — BEFORE ALL OTHER H RULES 
+INCLUDING MANDATORY MAPPINGS AND H3 FALLBACK — ASSETS SECTION):
+
+TRIGGER: If Row Items prefix contains "Restricted" or "Temporarily restricted"
+(i.e., the row is nested under a restricted assets group header per PREFIX STACK).
+
+When triggered, IGNORE ALL OTHER RULES. COA Datapoint MUST be exactly
+one of these three. Evaluate in order:
+
+  1. "Restricted Cash and Investments"
+     → if label contains (cash|investment|equity in central treasury|
+       deposit|treasury|pooled cash)
+
+  2. "Restricted Assets - Noncurrent"
+     → if label contains the word "noncurrent" (exact word, case-insensitive)
+
+  3. "Restricted Assets - Current"
+     → ALL other cases — this is the DEFAULT when neither 1 nor 2 match.
+       Applies to: receivables, lease receivable, lease assets, bond issuance
+       costs, intergovernmental, due from, prepaid, long-term, net of 
+       amortization, and anything else not matching rule 1 or 2.
+
+HARD STOP: Do NOT evaluate any mandatory DP mapping, H2, A1–A16, or any
+other rule for rows matching this trigger. The three options above are
+the ONLY permitted COA Datapoints for restricted-prefix rows.
+
+FORBIDDEN for restricted-prefix rows (override blocked):
+  ✗ Accounts Receivable
+  ✗ Due from Other Governments  
+  ✗ Other Receivable
+  ✗ Other Noncurrent Assets      ← blocks A11.5
+  ✗ Other Assets - Noncurrent    ← blocks A16
+  ✗ Interest Receivable
+  ✗ Any other COA Datapoint not in the three options above
+-----------------------------------------------------------------------------------
+H3. SEMANTIC FALLBACK RULES (ONLY IF NO MATCH FOUND ABOVE)
+Use label keywords + current Section. Evaluate in ORDER LISTED. First match wins.
+
+ASSETS (evaluate in order):
+A1: (cash|investment|deposit)+(fiscal agent|trustee|segregated)+(noncurrent|long-term)->"Restricted Assets - Noncurrent"
+A2: (cash|investment|deposit)+(fiscal agent|trustee|segregated)->"Restricted Cash and Investments"
+A3: (restricted|held with|set aside)+(cash|treasury|investment|deposit)->"Restricted Cash and Investments"
+A4: (restricted|held with)+(lease|bond|long-term|misc|other)+(noncurrent|long-term)->"Restricted Assets - Noncurrent"
+A5: (investment)+(associated|subsidiar|joint venture|equity method)->"Cash and Investments"
+A6: (cash|treasury|investment|deposit)->"Cash and Investments"
+A7: (accounts receivable|trade receivable)->"Accounts Receivable"
+A8: (tax receivable)->"Taxes Receivable"
+A9: (interest|fiscal|receivable)->"Interest Receivable"
+A10: (due from other government|due from other commonwealth|intergovernmental)->"Due from Other Governments"
+A11: (internal balances|inter fund|interfund|due from fund|due from component unit)->"Due from Other Funds"
+A11.5: (noncurrent|long-term)+(loan|note|lease receivable|other receivable)->"Other Noncurrent Assets"
+A12: (receivable|due from)->"Other Receivables"
+A13: (inventor|suppli|stock|material)->"Inventories"
+A14: (prepaid)->"Prepaid Items"
+A15: (capital assets|land|plant|equipment|infrastructure|construction in progress)->"Capital Assets"
+A16: (other assets|bond issuance|long-term|misc|other|for resale|pension|postemployment|post-employment|OPEB)->"Other Assets - Noncurrent"
+
+DEFERRED OUTFLOWS: D1: (deferred outflows)->"Deferred Outflows of Resources"
+
+LIABILITIES (evaluate in order):
+L1: (salary|payroll|compensated absences|vested leave|sick leave|pension|postemployment|post-employment|OPEB)+(within one year|current)->"Payroll Liabilities - Current"
+L2: (salary|payroll|compensated absences|vested leave|sick leave|pension|postemployment|post-employment|OPEB)+(after one year|more than one year|noncurrent)->"Payroll Liabilities - Noncurrent"
+L3: (bonds|loans|notes|leases)+(within one year|current) NOT(performance|mature)->"Long-term Debt - Current"
+L4: (bonds|loans|notes|leases)+(after one year|more than one year|noncurrent) NOT(performance|mature)->"Long-term Debt - Noncurrent"
+L5: (accounts payable|trade payable)->"Accounts Payable"
+L6: (accrued interest|interest payable|interest|fiscal charges)->"Interest Payable"
+L7: (contract|retainage)->"Contract Payable"
+L8: (deposit|refundable|customer deposit)->"Deposit Payable"
+L9: (due to other government|due to commonwealth|intergovernmental)->"Due to Other Governments"
+L10: (due to other fund|inter fund|interfund|due to component unit)->"Due to Other Funds"
+L11: (unearned|deferred revenue)->"Deferred Revenue"
+L12: (accrued liabilities|overdraft|shortage|other payable|other|misc)+(within one year|current)->"Other Liabilities - Current"
+L13: (accrued liabilities|other payable|other|misc)+(after one year|more than one year|noncurrent)->"Other Liabilities - Noncurrent"
+L14: (payable from restricted asset)+(within one year|current)->"Liabilities Payable from Restricted Assets - Current"
+L15: (payable from restricted asset)+(after one year|noncurrent)->"Liabilities Payable from Restricted Assets - Noncurrent"
+
+DEFERRED INFLOWS: DI1: (deferred inflows)->"Deferred Inflows of Resources"
+NET POSITION: N1: (net investment)->"Net Investment in Capital Assets" | N2: (restricted)->"Restricted Net Assets" | N3: (unrestricted)->"Unrestricted Net Assets"
+
+FUND BALANCES:
+FB1: (nonspendable)->"Nonspendable Fund Balances"
+FB2: (restricted)->"Restricted Fund Balances"
+FB3: (committed)->"Committed Fund Balances"
+FB4: (assigned)->"Assigned Fund Balances"
+FB5: (unassigned)->"Unassigned Fund Balances"
+
+COA Datapoint must never be null. Apply flag-specific fallback rules (see end of prompt).
+
+## COA Datapoint Fallback Rules (STRICTLY FOLLOW)
+
+You have the full COA Master list above. Apply these rules for EVERY row:
+
+1. The "COA Datapoint" value MUST exist exactly in the COA Master's "COA Datapoint" column.
+2. If a line item does NOT match any "COA Datapoint" from the COA Master list,
+   apply flag-specific fallback:
+
+   DP ROWS — no match:
+     Set "COA Datapoint" = "Other_<SectionName>"
+     Replace spaces in SectionName with underscores.
+     DP must NEVER have blank "" COA Datapoint.
+     Examples:
+       - Unmatched DP under Assets section       → "Other_Assets"
+       - Unmatched DP under Liabilities section   → "Other_Liabilities"
+       - Unmatched DP under Net Position section  → "Other_Net_Position"
+       - Unmatched DP under Deferred Outflows     → "Other_Deferred_Outflows_of_Resources"
+       - Unmatched DP under Deferred Inflows      → "Other_Deferred_Inflows_of_Resources"
+- Unmatched DP under Fund Balances section  → "Other_Fund_Balances"
+
+   CP ROWS — no match:
+     Set "COA Datapoint" = "" (blank)
+     NEVER invent a CP COA Datapoint.
+
+   DPG ROWS — no match:
+     Set "COA Datapoint" = "Other_DPG"
+     DPG must NEVER have blank "" COA Datapoint.
+
+3. NEVER invent, guess, or create a new COA Datapoint that is not in the master list.
+4. The <SectionName> is the DPG (Data Point Group / Section) that the line item belongs to.
+===============================================================================

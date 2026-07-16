@@ -1,0 +1,125 @@
+DSR_DEBT_PROMPT = """
+You are scanning a government financial report PDF for exactly TWO table types.
+Return ONLY physical page numbers (1-based position in the file).
+No markdown. No explanation. ONLY raw JSON.
+
+════════════════════════════════════════════════════════════════
+CRITICAL: Scan EVERY SINGLE PAGE of this PDF without exception.
+DSR and DEBT tables are frequently embedded inside the Notes to
+Financial Statements section, specifically in notes titled:
+  "(5) Long-Term Liabilities"
+  "(6) Long-Term Liabilities"
+  "(7) Long-Term Liabilities"
+  "(6) Long-Term Liabilities (continued)"
+Do NOT skip any page regardless of its title or section header.
+════════════════════════════════════════════════════════════════
+
+════════════════════════════════════════════════════════════════
+TABLE 1 — DSR: Debt Service Requirements to Maturity
+════════════════════════════════════════════════════════════════
+
+A page qualifies as DSR if ALL THREE conditions are true:
+
+CONDITION 1 — Row labels are FUTURE FISCAL YEARS with dollar amounts:
+  Each data row starts with a year (2025, 2026, 2027...) or year range
+  (2026-2030, 2031-2035), AND the next value on that same line is a
+  DOLLAR AMOUNT — not a date.
+
+  QUALIFIES as DSR row:
+    "2025   435,000   116,000   921,085"   ← year then dollar
+    "2026   450,000    98,600   918,285"   ← year then dollar
+    "2031-2035   3,320,000   183,580"      ← year range then dollar
+
+  DOES NOT QUALIFY (bond series rows — second value is a date):
+    "2020   05/04/20   06/30/40   2.00-4.00"  ← year then MM/DD/YY
+    "2017   06/13/17   07/01/37   3.50-5.00"  ← year then MM/DD/YY
+
+CONDITION 2 — The word "Principal" appears as a column header.
+
+CONDITION 3 — The word "Interest" appears as a column header.
+  NOTE: "Interest Rate" or "Interest Rates" does NOT qualify.
+  "Interest" alone or "Interest (1)" or "Interest (2)" DOES qualify.
+
+EXAMPLE of a DSR table embedded in Notes (INCLUDE this page):
+  Year Ending    GO Refunding         E911 Communication       Total
+  June 30,    Principal  Interest   Principal  Interest   Principal  Interest  Total
+  2025        435,000    116,000    285,000    85,085     720,000    201,085   921,085
+  2026        450,000     98,600    295,000    74,685     745,000    173,285   918,285
+  2027        470,000     80,600    305,000    63,885     775,000    144,485   919,485
+
+════════════════════════════════════════════════════════════════
+TABLE 2 — DEBT: Long-Term Debt Activity Schedule
+════════════════════════════════════════════════════════════════
+
+A page qualifies as DEBT if it matches EITHER Orientation A OR Orientation B:
+
+──────────────────────────────────────────────────────────────
+ORIENTATION A — Standard layout (liability names are ROW labels):
+──────────────────────────────────────────────────────────────
+ROW labels include liability names such as:
+  General Obligation Bonds, Revenue Bonds, Notes Payable,
+  Lease Agreements, Lease Liability, SBITA Liability,
+  Compensated Absences, Claims Payable, Net Pension Liability,
+  Total OPEB Liability, Plus Premiums, Less Discounts,
+  Workers Compensation, Special Assessment Bonds, Revenue Notes
+
+AND COLUMN headers show beginning balance + changes + ending balance:
+  "Balance July 1"  /  "Additions"  /  "Reductions"  /  "Balance June 30"
+  OR
+  "Beginning Balance"  /  "Issuances"  /  "Retirements"  /  "Ending Balance"
+  OR
+  "Balance at July 1"  /  "Increases"  /  "Decreases"  /  "Balance at June 30"
+
+EXAMPLE (Orientation A — INCLUDE this page):
+                          Balance                      Balance
+                          July 1    Additions  Reduct  June 30
+  General Oblig Bonds   7,900,000       -     690,000  7,210,000
+  Lease Agreements         98,841   29,670     28,529     99,982
+  Compensated Absences    428,720  138,352          -    567,072
+  Net Pension Liability  2,033,288  592,018         -  2,625,306
+
+──────────────────────────────────────────────────────────────
+ORIENTATION B — Transposed layout (liability names are COLUMN headers):
+──────────────────────────────────────────────────────────────
+COLUMN headers are liability names:
+  Lease Agreements | General Obligation Bonds | Compensated Absences |
+  Net Pension Liability | Total OPEB Liability | Total
+
+AND ROW labels show balance/change phrases:
+  "Balance beginning of year"  OR  "Balance at beginning of year"
+  "Increases"  OR  "Additions"  OR  "Issuances"
+  "Decreases"  OR  "Reductions"  OR  "Retirements"
+  "Balance end of year"  OR  "Balance at end of year"
+  "Due within one year"  OR  "Current portion"
+
+EXAMPLE (Orientation B — INCLUDE this page):
+                          Lease    General Oblig  Compensated   Net        Total
+                          Agree    Bonds          Absences      Pension    OPEB    Total
+  Balance beginning year  98,841   7,900,000      428,720       2,033,288  80,568  10,541,417
+  Increases               29,670           -      138,352         592,018  26,855     786,895
+  Decreases               28,529     690,000            -               -       -     718,529
+  Balance end of year     99,982   7,210,000      567,072       2,625,306 107,423  10,609,783
+  Due within one year     28,290     720,000      567,072               -       -   1,315,362
+
+════════════════════════════════════════════════════════════════
+DUAL-PAGE RULE
+════════════════════════════════════════════════════════════════
+
+A single page can appear in BOTH DSR and DEBT lists if it contains
+both table types. Read the ENTIRE page before deciding.
+
+════════════════════════════════════════════════════════════════
+RETURN FORMAT
+════════════════════════════════════════════════════════════════
+
+Return ONLY this JSON. No markdown. No explanation. No extra text.
+
+{
+  "DSR":  [...],
+  "DEBT": [...]
+}
+
+Use PHYSICAL PDF page numbers (1-based position in the file).
+Page 1 = the very first page of the PDF file.
+Do NOT use printed page numbers shown in footers or headers.
+"""

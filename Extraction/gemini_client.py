@@ -1,0 +1,465 @@
+import json
+import os
+import re
+from pathlib import Path
+
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
+
+# FIX: compact_schema.py exports build_short_key_instruction() and
+# expand_compact_json() — NOT "COMPACT_OVERRIDE" / "expand_compact". The
+# old import names here didn't exist in compact_schema.py at all, which
+# either crashes this module on import, or (if some other shadow copy of
+# compact_schema.py existed with those names) fed broken data through.
+from compact_schema import build_short_key_instruction, expand_compact_json
+
+# ── Cost table ($ per 1 M tokens) ───────────────────────────────────────────
+
+GEMINI_COST_TABLE: dict[str, tuple[float, float]] = {
+    "gemini-2.0-flash":                    (0.075,  0.30),
+    "gemini-2.0-flash-lite":               (0.075,  0.30),
+    "gemini-1.5-flash":                    (0.075,  0.30),
+    "gemini-1.5-pro":                      (1.25,   5.00),
+    "gemini-2.5-flash":                    (0.15,   0.60),
+    "gemini-2.5-pro":                      (1.25,  10.00),
+    "gemini-3.1-flash-lite-preview":       (0.25,   1.50),
+    "gemini-3.5-flash":                    (1.50,   9.00),
+}
+
+DEFAULT_COST = (0.075, 0.30)
+
+
+# Max output tokens per model family
+MODEL_MAX_OUTPUT: dict[str, int] = {
+    "gemini-3.5-flash":                  65536,
+    "gemini-3.1-flash-lite-preview":     65536,
+    "gemini-2.5-pro":                    65536,
+    "gemini-2.5-flash":                  65536,
+    "gemini-1.5-pro":                    8192,
+    "gemini-1.5-flash":                  8192,
+    "gemini-2.0-flash":                  8192,
+}
+
+
+def _model_max_tokens(model: str) -> int:
+    for prefix, limit in MODEL_MAX_OUTPUT.items():
+        if model.startswith(prefix):
+            return limit
+    if model.startswith("gemini-3."):
+        return 65536
+    return 8192
+
+
+def calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    input_rate, output_rate = GEMINI_COST_TABLE.get(model, DEFAULT_COST)
+    return (prompt_tokens / 1_000_000) * input_rate + \
+           (completion_tokens / 1_000_000) * output_rate
+
+
+# ── JSON parsing ─────────────────────────────────────────────────────────────
+
+def _parse_json(raw: str) -> dict:
+    """Robustly extract JSON from LLM response (fences, preamble, truncation)."""
+    text = raw.strip()
+
+    for attempt in [
+        lambda t: json.loads(t),
+        lambda t: json.loads(re.sub(r"^```(?:json)?\s*", "", re.sub(r"\s*```$", "", t.strip()))),
+        lambda t: json.loads(re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", t).group(1)),
+        lambda t: json.loads(t[t.index("{"):t.rindex("}") + 1]),
+    ]:
+        try:
+            return attempt(text)
+        except Exception:
+            pass
+                                 # ← nothing here inside the loop
+    raise ValueError(            # ← CORRECT: outside the loop, after all attempts
+        f"Cannot parse JSON from Gemini response.\n"
+        f"Length: {len(raw)} chars\n"
+        f"First 600 chars:\n{raw[:600]}\n"
+        f"Last  300 chars:\n{raw[-300:]}\n"
+        f"Raw response:\n{raw}"
+    )
+
+
+# ── Finish-reason diagnostics ────────────────────────────────────────────────
+
+def _check_finish_reason(response, model: str) -> str:
+    """
+    Extract text from response, printing a clear diagnosis if empty or cut off.
+    Returns the raw text string (may be empty).
+    """
+    raw = ""
+    finish_reason = "UNKNOWN"
+
+    try:
+        candidate = response.candidates[0]
+        finish_reason = str(candidate.finish_reason)
+
+        for part in candidate.content.parts:
+            if hasattr(part, "text") and part.text:
+                raw += part.text
+
+    except (IndexError, AttributeError):
+        try:
+            raw = response.text or ""
+        except Exception:
+            raw = ""
+
+    #print(f"  Finish reason : {finish_reason}")
+
+    if finish_reason in ("MAX_TOKENS", "2", "FinishReason.MAX_TOKENS"):
+        print(
+            f"    Output was TRUNCATED (hit max_output_tokens limit).\n"
+            f"     Model '{model}' max output = {_model_max_tokens(model)} tokens.\n"
+            f"     The JSON was cut off mid-way — switching to a larger model\n"
+            f"     (gemini-2.5-pro) or splitting the PDF into fewer pages will help.\n"
+            f"     Partial output length: {len(raw)} chars"
+        )
+    elif finish_reason in ("SAFETY", "3", "FinishReason.SAFETY"):
+        print(
+            "    Response blocked by Gemini SAFETY filter.\n"
+            "     The financial PDF may contain content that triggered a filter.\n"
+            "     Try gemini-2.5-pro or contact Google support."
+        )
+    elif finish_reason in ("RECITATION", "4", "FinishReason.RECITATION"):
+        print(
+            "    Response blocked by Gemini RECITATION filter.\n"
+            "     Gemini detected the output too closely matched training data.\n"
+            "     Try rephrasing the system prompt or use a different model."
+        )
+    elif not raw:
+        print(
+            "    Gemini returned an empty response with no clear reason.\n"
+            f"     Finish reason reported: {finish_reason}\n"
+            "     Check your API key quota at https://aistudio.google.com"
+        )
+
+    return raw
+
+
+# ── Page reference block builder (shared logic) ──────────────────────────────
+
+def _build_page_reference_block(page_info: dict | None) -> str | None:
+        """
+        Build the SOURCE PAGE REFERENCE text block from a page_info dict.
+ 
+        page_info is produced by pipeline.extract_page_info_from_filename() and
+        has keys: start, end, pages, label.
+ 
+        Always instructs the model to copy the filename-derived page string
+        verbatim into Metadata.Page No — never to infer it from PDF content,
+        and never references a per-row "Source Page"/"Page Reference" field
+        (no such field exists in the output schema).
+ 
+        Returns the block string, or None if page_info is falsy.
+        """
+        if not page_info:
+            return None
+ 
+        pages_str = ",".join(str(p) for p in page_info["pages"])
+ 
+        if page_info["start"] == page_info["end"]:
+            return (
+                "SOURCE PAGE REFERENCE:\n"
+                f"This extracted PDF corresponds to {page_info['label']} of the "
+                "original full financial report (1-based page numbering), as "
+                "determined from the source filename — NOT from any page "
+                "number printed inside the PDF.\n"
+                "Metadata.Page No MUST be set to exactly this string:\n"
+                f"  \"{pages_str}\"\n"
+                "Do NOT read, infer, or substitute any page number printed in "
+                "the PDF body, footer, or header. Use the value above "
+                "verbatim, regardless of what page number(s) appear in the "
+                "document text."
+            )
+ 
+        return (
+            "SOURCE PAGE REFERENCE:\n"
+            f"This extracted PDF corresponds to {page_info['label']} of the "
+            "original full financial report (1-based page numbering), as "
+            "determined from the source filename — NOT from any page "
+            "number(s) printed inside the PDF.\n"
+            f"The content spans these pages, in order: {pages_str}.\n"
+            "Metadata.Page No MUST be set to exactly this comma-joined "
+            "string (no spaces), covering the FULL extracted range:\n"
+            f"  \"{pages_str}\"\n"
+            "Do NOT read, infer, or substitute any page number printed in "
+            "the PDF body, footer, or header. Do NOT pick just one page "
+            "from the range. Do NOT determine page numbers per data "
+            "point/row — Metadata.Page No is a single value for the entire "
+            "statement. Use the value above verbatim, regardless of what "
+            "page number(s) appear in the document text."
+        )
+
+def normalize_one_gemini(
+    pdf_path: str,
+    prompt_path: str,
+    coa_text: str,
+    reporting_columns: list[str] | None,
+    model: str,
+    max_tokens: int,
+    page_info: dict | None = None,
+    stmt_type: str = "UNKNOWN",
+    coa_map_rules: str = "",           # ← ADD
+) -> dict:
+    """
+    Gemini equivalent of pipeline.normalize_one_openai().
+
+    Returns:
+        {
+            "data":  <parsed JSON dict>,
+            "usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+        }
+    """
+    import time
+
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable is not set.\n"
+            "Get a free key at https://aistudio.google.com/app/apikey"
+        )
+
+    # ── Create client ────────────────────────────────────────────────────────
+    client = genai.Client(api_key=api_key)
+
+    system_prompt = Path(prompt_path).read_text(encoding="utf-8", errors="replace")
+    system_prompt = system_prompt + "\n\n" + build_short_key_instruction(stmt_type)
+    if coa_map_rules:                  # ← ADD BLOCK
+        system_prompt = system_prompt + "\n\n" + coa_map_rules
+    pdf_bytes     = Path(pdf_path).read_bytes()
+
+    #print(f"  PDF size      : {len(pdf_bytes) / 1024:.1f} KB")
+
+    # ── Build user text ──────────────────────────────────────────────────────
+    instruction_lines = [
+        "Normalize the financial statement from the attached PDF.",
+        "Follow all steps in the system prompt exactly.",
+        "Use the COA Master table above for COA Datapoint mapping.",
+        "IMPORTANT: Return valid JSON ONLY. No markdown fences, no ```json, no extra text.",
+        "Start your response with { and end with }.",
+    ]
+    if reporting_columns:
+        instruction_lines += ["", "[[REPORTING COLUMNS]]"] + reporting_columns
+
+    # ── SOURCE PAGE REFERENCE block ──────────────────────────────────────────
+    page_ref_block = _build_page_reference_block(page_info)
+    # if page_ref_block:
+    #     print(f"  Source pages  : {page_info['label']}")
+    # else:
+    #     print(f"  Source pages  : [WARN] no page_info provided — Metadata.Page No may be inaccurate")
+
+    # Assemble user text: COA master → page reference → instructions
+    user_text_parts = [
+        "STANDARD COA MASTER (pipe-delimited):\n"
+        "Format: COA Flag | COA Datapoint | Statement | Section\n\n"
+        + coa_text,
+    ]
+    if page_ref_block:
+        user_text_parts.append(page_ref_block)
+    user_text_parts.append("\n".join(instruction_lines))
+
+    user_text = "\n\n".join(user_text_parts)
+
+    # ── Build PDF part using new SDK ─────────────────────────────────────────
+    pdf_part = types.Part.from_bytes(
+        data=pdf_bytes,
+        mime_type="application/pdf",
+    )
+
+    # ── Inner call function (allows model escalation retry) ──────────────────
+    def _call_gemini(use_model: str) -> dict:
+        import time
+
+        # Determine output token cap for this model
+        model_max     = _model_max_tokens(use_model)
+        effective_max = model_max
+        #print(f"  Model         : {use_model}")
+        #print(f"  Max output    : {effective_max:,} tokens  (model cap: {model_max:,})")
+
+        # Build config with correct cap for this model
+        call_config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            max_output_tokens=effective_max,
+            temperature=0.0,
+            response_mime_type="application/json",
+        )
+
+        MAX_RETRIES = 5
+        RETRY_DELAYS = [30, 60, 90, 120, 180]
+
+        response = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = client.models.generate_content(
+                    model=use_model,
+                    contents=[pdf_part, user_text],
+                    config=call_config,
+                )
+                break
+            except APIError as e:
+                error_code = getattr(e, "code", None) or getattr(e, "status", "")
+                error_msg  = str(e)
+
+                if "429" in str(error_code) or "RESOURCE_EXHAUSTED" in error_msg.upper():
+                    if attempt < MAX_RETRIES - 1:
+                        retry_after = None
+                        try:
+                            retry_after = int(
+                                getattr(e, "retry_after", None) or
+                                getattr(e, "headers", {}).get("Retry-After", None) or 0
+                            )
+                        except Exception:
+                            pass
+                        delay = retry_after if retry_after and retry_after > 0 else RETRY_DELAYS[attempt]
+                        print(f"  [WARN] Rate limit hit (attempt {attempt+1}/{MAX_RETRIES}). "
+                              f"Retrying in {delay}s ...")
+                        time.sleep(delay)
+                    else:
+                        raise RuntimeError(
+                            f"  Gemini quota exhausted after {MAX_RETRIES} attempts (429).\n"
+                            f"    Check your quota at https://aistudio.google.com\n"
+                        ) from e
+
+                elif any(kw in error_msg.upper() for kw in [
+                    "503", "UNAVAILABLE", "OVERLOADED", "HIGH DEMAND",
+                    "DEADLINE_EXCEEDED", "INTERNAL",
+                ]):
+                    if attempt < MAX_RETRIES - 1:
+                        delay = RETRY_DELAYS[attempt]
+                        print(f"  [WARN] Server error (attempt {attempt+1}/{MAX_RETRIES}). "
+                              f"Retrying in {delay}s ...")
+                        time.sleep(delay)
+                    else:
+                        raise RuntimeError(
+                            f"  Gemini server error after {MAX_RETRIES} attempts.\n"
+                            f"    Last error: {error_msg[:200]}\n"
+                        ) from e
+
+                elif "403" in str(error_code) or "PERMISSION_DENIED" in error_msg.upper():
+                    raise RuntimeError(
+                        "  Gemini API key rejected (PermissionDenied / 403).\n"
+                        "    Check GEMINI_API_KEY is correct and Gemini API is enabled.\n"
+                    ) from e
+
+                elif "401" in str(error_code) or "UNAUTHENTICATED" in error_msg.upper():
+                    raise RuntimeError(
+                        "  Gemini API key invalid or missing (Unauthenticated / 401).\n"
+                    ) from e
+
+                else:
+                    raise RuntimeError(
+                        f"  Gemini API call failed: {type(e).__name__}: {e}"
+                    ) from e
+
+            except Exception as e:
+                raise RuntimeError(
+                    f"  Gemini API call failed: {type(e).__name__}: {e}"
+                ) from e
+
+        # ── Token usage ──────────────────────────────────────────────────────
+        usage_meta        = response.usage_metadata
+        prompt_tokens     = getattr(usage_meta, "prompt_token_count",     0) or 0
+        completion_tokens = getattr(usage_meta, "candidates_token_count", 0) or 0
+        total_tokens      = getattr(usage_meta, "total_token_count",      0) or 0
+
+        in_rate, out_rate = GEMINI_COST_TABLE.get(use_model, DEFAULT_COST)
+        cost = calculate_cost(use_model, prompt_tokens, completion_tokens)
+
+        #print(f"  Tokens        : prompt={prompt_tokens:,}  completion={completion_tokens:,}  total={total_tokens:,}")
+        #print(f"  Cost          : ≈ ${cost:.4f}  (${prompt_tokens/1e6*in_rate:.4f} in + ${completion_tokens/1e6*out_rate:.4f} out)")
+
+        # ── Extract text with finish-reason diagnosis ────────────────────────
+        raw = _check_finish_reason(response, use_model)
+
+        if not raw:
+            raise RuntimeError(
+                "  Gemini returned an empty response body.\n"
+                "    Most likely causes:\n"
+                "      1. Output was cut off by token limit → use gemini-2.5-pro\n"
+                "      2. Safety/recitation filter blocked the response\n"
+                "      3. API quota exhausted silently\n"
+                "    Check https://aistudio.google.com for quota status."
+            )
+
+        # ── PROP_SNP multi-table split detection (BEFORE parse attempt) ──────
+        # Import here to avoid circular import at module level
+# ── Multi-table split detection (PROP_SNP/IS/CFS) BEFORE parse ──────
+        try:
+            from pipeline import get_table_break, split_multi_table_response
+        except ImportError:
+            get_table_break = None
+            split_multi_table_response = None
+
+        delimiter = get_table_break(stmt_type) if get_table_break else None
+
+        if (delimiter
+                and delimiter in raw
+                and split_multi_table_response is not None):
+            print(f"  [{stmt_type} SPLIT] Delimiter detected — splitting tables")
+            parts = split_multi_table_response(raw, stmt_type)
+            split_tables = []
+            for idx, part in enumerate(parts):
+                try:
+                    parsed   = _parse_json(part)
+                    expanded = expand_compact_json(parsed, stmt_type=stmt_type)
+                    split_tables.append(expanded)
+                    print(f"  [{stmt_type} SPLIT] Table {idx + 1} parsed OK "
+                          f"({len(expanded.get('Sections', {}))} sections)")
+                except Exception as e:
+                    print(f"  [{stmt_type} SPLIT] Parse error on table {idx + 1}: {e}")
+            return {
+                "data":           split_tables[0] if split_tables else None,
+                "prop_snp_split": split_tables,
+                "raw":            raw,
+                "usage": {
+                    "prompt_tokens":     prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens":      total_tokens,
+                },
+                "cost_usd": cost,
+                "model":    use_model,
+            }
+
+        # ── Normal single-table parse ─────────────────────────────────────
+        data = _parse_json(raw)
+        data = expand_compact_json(data, stmt_type=stmt_type)
+
+        return {
+            "data":           data,
+            "prop_snp_split": [],
+            "raw":            raw,
+            "usage": {
+                "prompt_tokens":     prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens":      total_tokens,
+            },
+            "cost_usd": cost,
+            "model":    use_model,
+        }
+
+
+    # ── Call with primary model; escalate to gemini-2.5-flash on failure ─────
+    FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"
+
+    try:
+        return _call_gemini(model)
+
+    except (ValueError, RuntimeError) as primary_err:
+        # Only escalate if the fallback is actually a different model
+        if model == FALLBACK_MODEL:
+            raise RuntimeError(f"  {primary_err}") from primary_err
+
+        print(f"\n  [ESCALATE] Primary model '{model}' failed: {str(primary_err)[:120]}")
+        print(f"  [ESCALATE] Retrying with fallback model '{FALLBACK_MODEL}' ...\n")
+
+        try:
+            return _call_gemini(FALLBACK_MODEL)
+        except (ValueError, RuntimeError) as fallback_err:
+            raise RuntimeError(
+                f"  Both primary model '{model}' and fallback '{FALLBACK_MODEL}' failed.\n"
+                f"  Primary error  : {str(primary_err)[:200]}\n"
+                f"  Fallback error : {str(fallback_err)[:200]}\n"
+            ) from fallback_err

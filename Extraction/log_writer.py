@@ -1,0 +1,254 @@
+"""
+log_writer.py
+─────────────
+Writes pipeline log lines to a persistent Parquet file using Polars.
+No DuckDB / pandas dependency — pure Polars read → concat → write pattern.
+
+Parquet schema (pipeline_logs.parquet):
+    ProcessingLogId  Int64     — auto-incremented internally per print() call
+    ProcessingId     Int64     — DB ID corresponding to the document being processed
+    Stage            Utf8      — s / p / sv / pv  (see STAGE_* constants)
+    Remarks          Utf8      — log message text
+    Time             Datetime  — auto-set to datetime.now() on insert
+
+Usage:
+    # Explicit insert (all fields supplied by caller):
+    lw.write_log(log_id, processing_id, STAGE_PROCESSING, "[INFO] ...")
+
+    # Print interceptor (auto-increments ProcessingLogId):
+    lw.set_context(processing_id, STAGE_PROCESSING)
+    print("[INFO] ...")   # captured automatically via _logging_print
+"""
+
+import atexit
+import signal
+from datetime import datetime
+from pathlib import Path
+
+import polars as pl
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+LOG_DIR     = Path(__file__).parent / "logs"
+LOG_PARQUET = LOG_DIR / "pipeline_logs.parquet"
+
+# ── Stage constants ───────────────────────────────────────────────────────────
+STAGE_SOURCING              = "s"
+STAGE_PROCESSING            = "p"
+STAGE_SOURCING_VALIDATION   = "sv"
+STAGE_PROCESSING_VALIDATION = "pv"
+
+# ── Polars schema (single source of truth) ────────────────────────────────────
+_SCHEMA: dict[str, pl.DataType] = {
+    "ProcessingLogId": pl.Int64,
+    "ProcessingId":    pl.Utf8,    # ← CHANGED from pl.Int64 to pl.Utf8
+    "Stage":           pl.Utf8,
+    "Remarks":         pl.Utf8,
+    "Time":            pl.Datetime("us"),
+}
+
+def _empty_df() -> pl.DataFrame:
+    return pl.DataFrame(
+        {col: pl.Series(col, [], dtype=dtype) for col, dtype in _SCHEMA.items()}
+    )
+
+
+def _read_existing() -> pl.DataFrame:
+    """
+    Read the existing Parquet file.
+    Returns an empty DataFrame (correct schema) if the file doesn't exist
+    or is unreadable.
+    """
+    if not LOG_PARQUET.exists():
+        return _empty_df()
+    try:
+        return pl.read_parquet(LOG_PARQUET)
+    except Exception:
+        return _empty_df()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LogWriter
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LogWriter:
+    """
+    Polars-backed log writer. Rows accumulate in an in-memory buffer;
+    on flush() they are appended to the Parquet file via:
+        read existing → pl.concat → write_parquet
+
+    Typical lifecycle in pipeline.py:
+
+        lw = LogWriter()
+
+        # Option A — explicit insert (you supply all fields):
+        lw.write_log(log_id, processing_id, STAGE_PROCESSING,
+                     "[INFO] Starting extraction ...")
+
+        # Option B — print interceptor (auto-increments ProcessingLogId):
+        lw.set_context(processing_id, STAGE_PROCESSING)
+        print("[INFO] ...")   # captured via _logging_print in pipeline.py
+
+        lw.close()
+    """
+
+    FLUSH_EVERY = 50  # rows buffered before auto-flush
+
+    def __init__(self):
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+        self._auto_log_id:    int        = 0
+        self._current_pid:    str | None = None   # ← NOW a string (filename)
+        self._current_stage:  str        = STAGE_PROCESSING
+        self._buffer: list[dict]         = []
+        self._closed                     = False
+
+        if not LOG_PARQUET.exists():
+            _empty_df().write_parquet(LOG_PARQUET)
+
+        atexit.register(self._atexit_handler)
+        self._register_signal_handlers()
+    # ── Print interceptor path ────────────────────────────────────────────────
+
+    def write(self, line: str) -> None:
+        """Called by _logging_print interceptor for every print() call."""
+        sub_lines = line.split("\n")
+        for sub in sub_lines:
+            sub = sub.rstrip("\r")
+            if not sub.strip():
+                continue
+            self._auto_log_id += 1
+            self._buffer.append({
+                "ProcessingLogId": self._auto_log_id,
+                "ProcessingId":    self._current_pid,   # filename string
+                "Stage":           self._current_stage,
+                "Remarks":         sub,
+                "Time":            datetime.now(),
+            })
+        if len(self._buffer) >= self.FLUSH_EVERY:
+            self.flush()
+
+    def set_context(self, processing_id: str, stage: str) -> None:  # ← str now
+        """
+        Call when starting a new file so subsequent write() calls
+        carry the correct ProcessingId (filename) and Stage.
+
+            lw.set_context("LG_CIT_WI_600005841_2024.pdf", "p")
+        """
+        self._current_pid   = processing_id
+        self._current_stage = stage
+
+    # ── Explicit insert ───────────────────────────────────────────────────────
+
+    def write_log(
+        self,
+        processing_log_id: int,
+        processing_id:     int,
+        stage:             str,
+        remarks:           str,
+    ) -> None:
+        """
+        Insert a log row. All fields are supplied by the caller;
+        Time is set automatically.
+
+        Usage:
+            lw.write_log(log_id, processing_id, STAGE_PROCESSING,
+                         "[INFO] Extracting page 12 ...")
+        """
+        self._buffer.append({
+            "ProcessingLogId": processing_log_id,
+            "ProcessingId":    processing_id,
+            "Stage":           stage,
+            "Remarks":         remarks,
+            "Time":            datetime.now(),
+        })
+        if len(self._buffer) >= self.FLUSH_EVERY:
+            self.flush()
+
+    # ── Flush buffer → Parquet ────────────────────────────────────────────────
+
+    def flush(self) -> None:
+        if not self._buffer:
+            return
+
+        new_df = pl.DataFrame(
+            {col: [row[col] for row in self._buffer] for col in _SCHEMA},
+            schema=_SCHEMA,
+        )
+
+        existing_df = _read_existing()
+        updated_df  = pl.concat([existing_df, new_df], how="diagonal_relaxed")
+        updated_df.write_parquet(LOG_PARQUET, compression="snappy")
+
+        self._buffer.clear()
+
+    # ── Clean shutdown ────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.flush()
+        except Exception:
+            pass
+
+    # ── Safety net: atexit + signal handlers ─────────────────────────────────
+
+    def _atexit_handler(self) -> None:
+        if not self._closed:
+            try:
+                self.close()
+            except Exception:
+                pass
+
+    def _register_signal_handlers(self) -> None:
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            return
+
+        def _handler(signum, frame):
+            if not self._closed:
+                try:
+                    self.close()
+                except Exception:
+                    pass
+            signal.signal(signum, signal.SIG_DFL)
+            signal.raise_signal(signum)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, _handler)
+            except (OSError, ValueError):
+                pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level write_log() — drop-in for direct import usage
+# ─────────────────────────────────────────────────────────────────────────────
+
+_default_writer: LogWriter | None = None
+
+
+def _get_default_writer() -> LogWriter:
+    global _default_writer
+    if _default_writer is None:
+        _default_writer = LogWriter()
+    return _default_writer
+
+
+def write_log(
+    processing_log_id: int,
+    processing_id:     int,
+    stage:             str,
+    remarks:           str,
+) -> None:
+    """
+    Module-level drop-in — works without instantiating LogWriter manually.
+
+    Usage:
+        from log_writer import write_log, STAGE_PROCESSING
+
+        write_log(log_id, processing_id, STAGE_PROCESSING,
+                  "[INFO] Starting extraction ...")
+    """
+    _get_default_writer().write_log(processing_log_id, processing_id, stage, remarks)
