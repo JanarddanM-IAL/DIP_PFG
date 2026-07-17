@@ -892,8 +892,9 @@ def mark_master_row_pdf_not_found(db, row_id: int, processing_id: int):
     Set all output columns to 'PDF Not Found' for this row.
     Replaces: writing PDF_NOT_FOUND_TEXT to all master_cols in MASTER LIST.
 
-    row_id        -> keys the single physical TProcessStatus row (new PK).
-    processing_id -> keys TProcessingAdditionalInfo (kept on ProcessingId).
+    row_id        -> keys the single physical TProcessStatus row (PK) AND
+                     TProcessingAdditionalInfo (its ID column FKs to TProcessStatus.Id).
+    processing_id -> retained for display/logging only; no longer a DB key.
     """
     db.update("""
         UPDATE TProcessStatus
@@ -930,8 +931,8 @@ def mark_master_row_pdf_not_found(db, row_id: int, processing_id: int):
             AuditorContactPhone = NULL,
             AuditorContactEmail = NULL,
             ModifiedOn          = GETDATE()
-        WHERE ProcessingId = ?
-    """, processing_id, commit=False)
+        WHERE ID = ?
+    """, row_id, commit=False)
 
     db.commit()
 
@@ -1011,7 +1012,7 @@ def update_master_from_general(db, row_id: int, processing_id: int, g: Dict[str,
     # --------------------------------------------------
     # UPDATE TProcessingAdditionalInfo
     # Columns: AuditorsSignatureDate, EntityContact*, Auditor*
-    # Kept keyed on ProcessingId (this table is not part of the Id re-key).
+    # Keyed on row_id via its ID column (FK -> TProcessStatus.Id).
     # --------------------------------------------------
     db.update("""
         UPDATE TProcessingAdditionalInfo
@@ -1028,7 +1029,7 @@ def update_master_from_general(db, row_id: int, processing_id: int, g: Dict[str,
             AuditorContactPhone   = ?,
             AuditorContactEmail   = ?,
             ModifiedOn            = GETDATE()
-        WHERE ProcessingId = ?
+        WHERE ID = ?
     """, [
         g.get("auditee_certified_date"),
         g.get("auditee_city"),
@@ -1041,7 +1042,7 @@ def update_master_from_general(db, row_id: int, processing_id: int, g: Dict[str,
         g.get("auditor_contact_name"),
         g.get("auditor_phone"),
         g.get("auditor_email"),
-        processing_id,
+        row_id,
     ], commit=False)
 
     db.commit()
@@ -1086,8 +1087,9 @@ def mark_master_list_ix_failed_to_download(db, row_id: int, processing_id: int):
       - TProcessStatus           → sets all status/flag/path columns + CompletionStatus=1
       - TProcessingAdditionalInfo → clears all contact/auditor fields
 
-    row_id        -> keys the single physical TProcessStatus row (new PK).
-    processing_id -> keys TProcessingAdditionalInfo (kept on ProcessingId).
+    row_id        -> keys the single physical TProcessStatus row (PK) AND
+                     TProcessingAdditionalInfo (its ID column FKs to TProcessStatus.Id).
+    processing_id -> retained for display/logging only; no longer a DB key.
     """
     db.update("""
         UPDATE TProcessStatus
@@ -1124,8 +1126,8 @@ def mark_master_list_ix_failed_to_download(db, row_id: int, processing_id: int):
             AuditorContactPhone = NULL,
             AuditorContactEmail = NULL,
             ModifiedOn          = GETDATE()
-        WHERE ProcessingId = ?
-    """, processing_id, commit=False)
+        WHERE ID = ?
+    """, row_id, commit=False)
 
     db.commit()
 
