@@ -37,6 +37,10 @@ import subprocess
 import pyodbc
 from dotenv import load_dotenv
 
+# Shared, reusable DB layer (see db.py). All DB access goes through this now
+# instead of a per-file get_db_connection() + raw pyodbc cursors.
+from db import Database, build_in_clause
+
 # For auto-closing proof popup
 try:
     import tkinter as tk
@@ -52,55 +56,12 @@ except Exception:
 # =========================================================
 # DB CONNECTION
 # =========================================================
- 
-def get_db_connection():
-    """
-    Create a pyodbc connection using credentials from .env file.
- 
-    .env must contain:
-        DB_DRIVER=ODBC Driver 17 for SQL Server
-        DB_SERVER=10.12.2.172
-        DB_DATABASE=DIP
-        DB_USERNAME=rsa
-        DB_PASSWORD=your_password
-        DB_TRUSTED_CONNECTION=no
-    """
-    load_dotenv()
- 
-    driver   = os.getenv("DB_DRIVER", "ODBC Driver 17 for SQL Server")
-    server   = os.getenv("DB_SERVER")
-    database = os.getenv("DB_DATABASE")
-    username = os.getenv("DB_USERNAME")
-    password = os.getenv("DB_PASSWORD")
-    trusted  = os.getenv("DB_TRUSTED_CONNECTION", "no").strip().lower()
- 
-    if not server or not database:
-        raise RuntimeError(
-            "DB_SERVER and DB_DATABASE must be set in .env file.\n"
-            "Copy .env.example to .env and fill in your credentials."
-        )
- 
-    if trusted in ("yes", "true", "1"):
-        conn_str = (
-            f"DRIVER={{{driver}}};"
-            f"SERVER={server};"
-            f"DATABASE={database};"
-            f"Trusted_Connection=yes;"
-            f"TrustServerCertificate=yes;"
-        )
-    else:
-        if not username or not password:
-            raise RuntimeError("DB_USERNAME and DB_PASSWORD must be set in .env (or use DB_TRUSTED_CONNECTION=yes).")
-        conn_str = (
-            f"DRIVER={{{driver}}};"
-            f"SERVER={server};"
-            f"DATABASE={database};"
-            f"UID={username};"
-            f"PWD={password};"
-            f"TrustServerCertificate=yes;"
-        )
- 
-    return pyodbc.connect(conn_str)
+# Connection handling now lives in db.py (get_db_connection() + Database).
+# Use the Database class (imported at the top) as a context manager:
+#     with Database() as db:
+#         res = db.fetch_all(sql, params)
+#         db.update(sql, params)
+# The old per-file get_db_connection() has been removed in favour of that layer.
 
 # =========================================================
 # ADD THESE IMPORTS TO THE TOP OF YOUR EXISTING SCRIPT
@@ -117,8 +78,10 @@ from filelock import FileLock     # pip install filelock
 VALIDATION_PARQUET_PATH = Path(r"C:\Test Code\Public Finance\999_Log_Trackers\validation_results.parquet")
 VALIDATION_LOCK_PATH    = VALIDATION_PARQUET_PATH.with_suffix(".parquet.lock")
 
-# --- All 17 columns as per the validation.xlsx template ---
+# --- All columns: "Id" (physical TProcessStatus.Id, unique key) first, then
+#     the 17 columns of the validation.xlsx template ---
 VALIDATION_COLUMNS = [
+    "Id",
     "ProcessingID",
     "ISSUER NAME",
     "UEI",
@@ -156,56 +119,52 @@ def _ensure_validation_file():
 
     if not VALIDATION_PARQUET_PATH.exists():
         empty_df = pd.DataFrame(columns=VALIDATION_COLUMNS)
-        # ProcessingID is int, all other columns are strings
+        # Id and ProcessingID are ints, all other columns are strings
         empty_df = empty_df.astype({col: "object" for col in VALIDATION_COLUMNS})
+        empty_df["Id"] = empty_df["Id"].astype("Int64")
         empty_df["ProcessingID"] = empty_df["ProcessingID"].astype("Int64")
         empty_df.to_parquet(VALIDATION_PARQUET_PATH, index=False)
 
 
-def write_validation_row(processing_id: int, validation_data: Dict[str, Any]):
+def write_validation_row(row_id: int, processing_id: int, validation_data: Dict[str, Any]):
     """
     Insert or update a validation row in the parquet file.
     Thread-safe AND process-safe.
 
     Parameters:
-      processing_id   → unique key (ProcessingID column)
+      row_id          → unique key (Id column) = physical TProcessStatus.Id.
+                        ProcessingId is NON-unique (merge-siblings share it), so the
+                        report is keyed by the physical row Id to avoid collisions.
+      processing_id   → deliverable grouping key, stored in ProcessingID for readability.
       validation_data → dict where keys are column names from VALIDATION_COLUMNS
                         (you can pass ANY subset — missing keys stay NULL/unchanged)
 
     Behavior:
-      - If ProcessingID does not exist  → INSERT new row
-      - If ProcessingID already exists  → UPDATE only the provided columns
-                                          (other column values are preserved)
+      - If Id does not exist  → INSERT new row
+      - If Id already exists  → UPDATE only the provided columns
+                                (other column values are preserved)
 
     Usage examples:
 
       # Initial write at start of validation (name + uei)
-      write_validation_row(processing_id, {
+      write_validation_row(row_id, processing_id, {
           "ISSUER NAME": "CITY OF MOUNTAIN VIEW",
           "UEI": "JJZLKAS3G111",
       })
 
       # After Name check passes
-      write_validation_row(processing_id, {"Name": "PASS"})
-
-      # After multiple checks
-      write_validation_row(processing_id, {
-          "FYE (mm/yy)": "PASS",
-          "State": "FAIL",
-          "Audit Opinion": "PASS - Unmodified",
-      })
+      write_validation_row(row_id, processing_id, {"Name": "PASS"})
 
       # Mark all validations as failed (e.g., PDF Not Found case)
-      write_validation_row(processing_id, {
+      write_validation_row(row_id, processing_id, {
           "Name": "Fail",
           "FYE (mm/yy)": "Fail",
-          "State": "Fail",
-          "Availability of Audit Report": "Fail",
           # ... etc for all 14 validation columns
       })
     """
     # Build the new row with only the provided columns (rest are None)
     new_row_dict = {col: None for col in VALIDATION_COLUMNS}
+    new_row_dict["Id"] = int(row_id)
     new_row_dict["ProcessingID"] = int(processing_id)
 
     for key, value in (validation_data or {}).items():
@@ -225,8 +184,8 @@ def write_validation_row(processing_id: int, validation_data: Dict[str, Any]):
                 except Exception:
                     existing_df = pd.DataFrame(columns=VALIDATION_COLUMNS)
 
-                # Check if a row for this ProcessingID already exists
-                mask = existing_df["ProcessingID"] == int(processing_id)
+                # Check if a row for this physical Id already exists
+                mask = existing_df["Id"] == int(row_id)
 
                 if mask.any():
                     # ---- UPDATE: only overwrite columns that the caller provided ----
@@ -244,7 +203,7 @@ def write_validation_row(processing_id: int, validation_data: Dict[str, Any]):
 
         except Exception as e:
             # Never crash the main workflow because of validation file write
-            print(f"[VALIDATION-LOG-ERROR] Failed to write validation row for ProcessingID={processing_id}: {e}")
+            print(f"[VALIDATION-LOG-ERROR] Failed to write validation row for Id={row_id}: {e}")
 
 
 # =========================================================
@@ -7626,8 +7585,12 @@ def apply_fye_fallback_using_audit_report(processing_id: int, fye_res: dict, aud
     return fye_res
 
 
-def run_validations_for_row(conn, processing_id: int, issuer_name: str, master_state_abbr: str, uei: str, fy_end_val, pdf_saved: Path):
-    """Run all validations for a row in one go (one PDF open + cached page extraction)."""
+def run_validations_for_row(db, row_id: int, processing_id: int, issuer_name: str, master_state_abbr: str, uei: str, fy_end_val, pdf_saved: Path):
+    """Run all validations for a row in one go (one PDF open + cached page extraction).
+
+    row_id        -> physical TProcessStatus.Id (unique) — parquet report key.
+    processing_id -> deliverable grouping (non-unique) — display + AdditionalInfo lookup.
+    """
     global _SHARED_PDF_PATH, _SHARED_PDF_HANDLE
 
     # Colors for proof bundles (moved in from old signature params)
@@ -7691,13 +7654,13 @@ def run_validations_for_row(conn, processing_id: int, issuer_name: str, master_s
             show_single_or_individual_popups(processing_id, pdf_saved, audit_res, opinion_res, audit_fye_res)
 
             # SIGNATURE — auditor firm name now comes from DB
-            cursor = conn.cursor()
-            cursor.execute("""
+            # TProcessingAdditionalInfo stays keyed on ProcessingId (not part of the Id re-key).
+            firm_res = db.fetch_one("""
                 SELECT AuditorFirmName
                 FROM TProcessingAdditionalInfo
                 WHERE ProcessingId = ?
             """, processing_id)
-            row = cursor.fetchone()
+            row = firm_res.data if firm_res.success else None
             auditor_firm_name = normalize(str(row.AuditorFirmName or "")) if row else ""
 
             sig_res = write_auditor_signature_validation(processing_id, pdf_saved, audit_res=audit_res, auditor_firm_name=auditor_firm_name)
@@ -7730,7 +7693,7 @@ def run_validations_for_row(conn, processing_id: int, issuer_name: str, master_s
         _SHARED_PDF_PATH = None
         clear_pdf_page_caches()
         # ---- SINGLE parquet write for the whole row (even on partial failure) ----
-        write_validation_row(processing_id, results)
+        write_validation_row(row_id, processing_id, results)
     return results
 
 
@@ -7744,15 +7707,15 @@ FAILED_TO_DOWNLOAD_TEXT = "Failed to Download"
 # =========================================================
 # DB Status & Flag update
 # =========================================================
-def update_sourcing_validation_status(conn, processing_id, status, flag, pdf_path=None, remarks=None):
+def update_sourcing_validation_status(db, row_id, status, flag, pdf_path=None, remarks=None):
     """
     status: None=pending, 0=fail, 1=pass
     flag:   None=not s=started, p=progress, c=complete
     pdf_path: if provided, updates PdfFilePath
     remarks:  if provided, updates Remarks
-    """
-    cursor = conn.cursor()
 
+    Keyed on the physical TProcessStatus.Id (row_id).
+    """
     sets = ["SourcingValidationStatus = ?", "SourcingValidationFlag = ?", "ModifiedOn = GETDATE()"]
     params = [status, flag]
 
@@ -7764,14 +7727,15 @@ def update_sourcing_validation_status(conn, processing_id, status, flag, pdf_pat
         sets.append("Remarks = ?")
         params.append(remarks)
 
-    params.append(processing_id)
+    params.append(row_id)
 
-    cursor.execute(f"""
+    res = db.update(f"""
         UPDATE TProcessStatus
         SET {", ".join(sets)}
-        WHERE ProcessingId = ?
-    """, *params)
-    conn.commit()
+        WHERE Id = ?
+    """, params)
+    if not res.success:
+        print(f"[FAILED] row_id {row_id}: {res.error}")
 
 def main_validate():
     """Run ONLY PDF validations using already-downloaded PDFs. Does NOT download anything."""
@@ -7779,171 +7743,178 @@ def main_validate():
 
     # --------------------------------------------------
     # 1. CONNECT TO DATABASE (replaces load_workbook)
+    #    Uses the shared db.py layer as a context manager: commits on clean
+    #    exit, rolls back on exception, and closes the connection.
     # --------------------------------------------------
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    print("[DB] Connected to database successfully.")
-    
-    # --------------------------------------------------
-    # 2. FETCH ROWS — ADD FyeDate + PdfFilePath to SELECT
-    # --------------------------------------------------
-    cursor.execute("""
-        SELECT
-            cm.CompanyId,
-            ps.ProcessingId,
-            ps.ProcessingCode,
-            cm.IssuerName,
-            cm.State,
-            cm.Sector,
-            cm.SubSector,
-            cm.UEI,
-            cm.EIN,
-            ps.ProcessYear,
-            ps.FyeDate,
-            ps.PdfFilePath
-        FROM TCompanyMaster cm
-        JOIN TProcessStatus ps
-            ON ps.CompanyId = cm.CompanyId
-        WHERE cm.IsActive  = 1
-          AND ps.IsActive   = 1
-          AND ps.SourcingStatus = 1
-          AND ps.SourcingFlag = 'c'
-          AND (ps.SourcingValidationFlag = 'c' OR ps.SourcingValidationFlag IS NULL)
-          AND (ps.SourcingValidationStatus = 0 OR ps.SourcingValidationStatus IS NULL)
-          AND (ps.CompletionStatus = 0      OR ps.CompletionStatus IS NULL)
-          AND cm.ModuleId   = 1
-    """)
-    master_rows = cursor.fetchall()
-    print(f"[DB] Found {len(master_rows)} rows pending validation.")
+    with Database() as db:
+        print("[DB] Connected to database successfully.")
 
-    if not master_rows:
-        print("[INFO] No rows pending validation. Exiting.")
-        conn.close()
-        return
+        # --------------------------------------------------
+        # 2. FETCH ROWS — ADD FyeDate + PdfFilePath to SELECT
+        #    ps.Id AS RowId → the physical-row PK (unique) used for writes
+        # --------------------------------------------------
+        res = db.fetch_all("""
+            SELECT
+                cm.CompanyId,
+                ps.Id AS RowId,
+                ps.ProcessingId,
+                ps.ProcessingCode,
+                cm.IssuerName,
+                cm.State,
+                cm.Sector,
+                cm.SubSector,
+                cm.UEI,
+                cm.EIN,
+                ps.ProcessYear,
+                ps.FyeDate,
+                ps.PdfFilePath
+            FROM TCompanyMaster cm
+            JOIN TProcessStatus ps
+                ON ps.CompanyId = cm.CompanyId
+            WHERE cm.IsActive  = 1
+              AND ps.IsActive   = 1
+              AND ps.SourcingStatus = 1
+              AND ps.SourcingFlag = 'c'
+              AND (ps.SourcingValidationFlag = 'c' OR ps.SourcingValidationFlag IS NULL)
+              AND (ps.SourcingValidationStatus = 0 OR ps.SourcingValidationStatus IS NULL)
+              AND (ps.CompletionStatus = 0      OR ps.CompletionStatus IS NULL)
+              AND ps.COAID IN (1, 2)
+        """)
+        if not res.success:
+            print(f"[DB-ERROR] Failed to fetch rows pending validation: {res.error}")
+            return
+        master_rows = res.data
+        print(f"[DB] Found {len(master_rows)} rows pending validation.")
 
-    
-    if master_rows:
-        processing_ids = [row.ProcessingId for row in master_rows]
-        placeholders = ",".join(["?"] * len(processing_ids))
-        cursor.execute(f"""
+        if not master_rows:
+            print("[INFO] No rows pending validation. Exiting.")
+            return
+
+        # Claim the fetched physical rows by their PK (Id), not ProcessingId —
+        # ProcessingId is non-unique so an IN(ProcessingId) list would also flip
+        # sibling rows that share a deliverable.
+        row_ids = [row.RowId for row in master_rows]
+        clause, params = build_in_clause("Id", row_ids)
+        claim = db.update(f"""
             UPDATE TProcessStatus
             SET SourcingValidationFlag = 's'
             WHERE IsActive = 1
-              AND ProcessingId IN ({placeholders})
-        """, processing_ids)
-        conn.commit()
-        print(f"[DB] Updated SourcingValidationFlag to 's' for {cursor.rowcount} rows.")
- 
-    # Clear proof folders only
-    clear_directory_contents(PROOF_DIR_NAME)
-    clear_directory_contents(PROOF_DIR_STATE)
-    clear_directory_contents(PROOF_DIR_FYE)
-    clear_directory_contents(PROOF_DIR_AUDIT)
-    clear_directory_contents(PROOF_DIR_OPINION)
-    clear_directory_contents(PROOF_DIR_AUDIT_FYE)
-    clear_directory_contents(PROOF_DIR_SIGNATURE)
-    clear_directory_contents(PROOF_DIR_NET_POSITION)
-    clear_directory_contents(PROOF_DIR_ACTIVITIES)
-    clear_directory_contents(PROOF_DIR_BALANCE_SHEET)
-    clear_directory_contents(PROOF_DIR_REV_EXP_FUND_BAL)
+              AND {clause}
+        """, params)
+        print(f"[DB] Updated SourcingValidationFlag to 's' for {claim.rowcount} rows.")
 
-    for db_row in master_rows:
-        processing_id   = db_row.ProcessingId
-        processing_code = db_row.ProcessingCode
-        uei             = normalize(str(db_row.UEI         or ""))
-        ein             = normalize(str(db_row.EIN         or ""))
-        issuer_name_val = normalize(str(db_row.IssuerName  or ""))
-        year            = normalize(str(db_row.ProcessYear or ""))
-        state           = normalize(str(db_row.State       or ""))
-        fy_end_val      = db_row.FyeDate        # date/None — same type as before
-        pdf_file_path   = db_row.PdfFilePath    # stored path from sourcing run
+        # Clear proof folders only
+        clear_directory_contents(PROOF_DIR_NAME)
+        clear_directory_contents(PROOF_DIR_STATE)
+        clear_directory_contents(PROOF_DIR_FYE)
+        clear_directory_contents(PROOF_DIR_AUDIT)
+        clear_directory_contents(PROOF_DIR_OPINION)
+        clear_directory_contents(PROOF_DIR_AUDIT_FYE)
+        clear_directory_contents(PROOF_DIR_SIGNATURE)
+        clear_directory_contents(PROOF_DIR_NET_POSITION)
+        clear_directory_contents(PROOF_DIR_ACTIVITIES)
+        clear_directory_contents(PROOF_DIR_BALANCE_SHEET)
+        clear_directory_contents(PROOF_DIR_REV_EXP_FUND_BAL)
 
-        update_sourcing_validation_status(conn,processing_id,None,'p')
+        for db_row in master_rows:
+            row_id          = db_row.RowId          # physical TProcessStatus.Id — DB row key
+            processing_id   = db_row.ProcessingId   # deliverable grouping (non-unique) — display/label
+            processing_code = db_row.ProcessingCode
+            uei             = normalize(str(db_row.UEI         or ""))
+            ein             = normalize(str(db_row.EIN         or ""))
+            issuer_name_val = normalize(str(db_row.IssuerName  or ""))
+            year            = normalize(str(db_row.ProcessYear or ""))
+            state           = normalize(str(db_row.State       or ""))
+            fy_end_val      = db_row.FyeDate        # date/None — same type as before
+            pdf_file_path   = db_row.PdfFilePath    # stored path from sourcing run
 
-        print(f"\n--- Validating ProcessingId: {processing_id} | {issuer_name_val} ---")
+            update_sourcing_validation_status(db, row_id, None, 'p')
 
-        # --------------------------------------------------
-        # 4a. LOCATE PDF
-        # --------------------------------------------------
-        pdf_path = Path(pdf_file_path)
-        # pdf_path = _find_matching_pdf(PDF_DIR, year, uei, ein)
+            print(f"\n--- Validating ProcessingId: {processing_id} (row Id {row_id}) | {issuer_name_val} ---")
 
-        # --------------------------------------------------
-        # 4b. PDF NOT FOUND → mark all validations failed
-        # --------------------------------------------------
-        if not pdf_path or not pdf_path.exists():
-            write_validation_row(processing_id, {
-                "ISSUER NAME": issuer_name_val,
-                "UEI":         uei,
-                "Name":                                                          "Fail",
-                "FYE (mm/yy)":                                                   "Fail",
-                "State":                                                         "Fail",
-                "Availability of Audit Report":                                  "Fail",
-                "Audit Opinion":                                                 "Fail",
-                "Audit Report FYE with Report FYE":                              "Fail",
-                "Auditor's Signature":                                           "Fail",
-                "Statement of Net Position with FYE":                            "Fail",
-                "Statement of Activities with FYE":                              "Fail",
-                "Balance Sheet with FYE":                                        "Fail",
-                "Statement of Revenues, Expenditures and changes in Fund Balances with FYE": "Fail",
-                "Statement of Net Position of Proprietary Funds with FYE":       "Fail",
-                "Statements of Revenues, Expenses And Changes In Net Position with FYE":     "Fail",
-                "Statement of Cash Receipts and Disbursements with FYE":         "Fail",
-            })
-            update_sourcing_validation_status(
-                conn, processing_id, status=0, flag='c',
-                remarks="PDF not found for validation"
+            # --------------------------------------------------
+            # 4a. LOCATE PDF
+            # --------------------------------------------------
+            pdf_path = Path(pdf_file_path)
+            # pdf_path = _find_matching_pdf(PDF_DIR, year, uei, ein)
+
+            # --------------------------------------------------
+            # 4b. PDF NOT FOUND → mark all validations failed
+            # --------------------------------------------------
+            if not pdf_path or not pdf_path.exists():
+                write_validation_row(row_id, processing_id, {
+                    "ISSUER NAME": issuer_name_val,
+                    "UEI":         uei,
+                    "Name":                                                          "Fail",
+                    "FYE (mm/yy)":                                                   "Fail",
+                    "State":                                                         "Fail",
+                    "Availability of Audit Report":                                  "Fail",
+                    "Audit Opinion":                                                 "Fail",
+                    "Audit Report FYE with Report FYE":                              "Fail",
+                    "Auditor's Signature":                                           "Fail",
+                    "Statement of Net Position with FYE":                            "Fail",
+                    "Statement of Activities with FYE":                              "Fail",
+                    "Balance Sheet with FYE":                                        "Fail",
+                    "Statement of Revenues, Expenditures and changes in Fund Balances with FYE": "Fail",
+                    "Statement of Net Position of Proprietary Funds with FYE":       "Fail",
+                    "Statements of Revenues, Expenses And Changes In Net Position with FYE":     "Fail",
+                    "Statement of Cash Receipts and Disbursements with FYE":         "Fail",
+                })
+                update_sourcing_validation_status(
+                    db, row_id, status=0, flag='c',
+                    remarks="PDF not found for validation"
+                )
+                print(f"[WARN] ProcessingId {processing_id} (row Id {row_id}): PDF not found for validation.")
+                continue
+
+
+            # --------------------------------------------------
+            # RUN ALL VALIDATIONS (returns results dict)
+            # --------------------------------------------------
+            results = run_validations_for_row(
+                db=db,
+                row_id=row_id,
+                processing_id=processing_id,
+                issuer_name=issuer_name_val,
+                master_state_abbr=state,
+                uei=uei,
+                fy_end_val=fy_end_val,
+                pdf_saved=pdf_path
             )
-            print(f"[WARN] ProcessingId {processing_id}: PDF not found for validation.")
-            continue
-            
 
-        # --------------------------------------------------
-        # RUN ALL VALIDATIONS (returns results dict)
-        # --------------------------------------------------
-        results = run_validations_for_row(
-            conn=conn,
-            processing_id=processing_id,
-            issuer_name=issuer_name_val,
-            master_state_abbr=state,
-            uei=uei,
-            fy_end_val=fy_end_val,
-            pdf_saved=pdf_path
-        )
+            print(f"[INFO] ProcessingId {processing_id} (row Id {row_id}): validations completed.")
 
-        print(f"[INFO] ProcessingId {processing_id}: validations completed.")
+            # --------------------------------------------------
+            # COMPUTE VERDICT + MOVE PDF + UPDATE DB
+            # --------------------------------------------------
+            final_pass, reason = final_compute_status_from_results(results)
 
-        # --------------------------------------------------
-        # COMPUTE VERDICT + MOVE PDF + UPDATE DB
-        # --------------------------------------------------
-        final_pass, reason = final_compute_status_from_results(results)
+            dest_dir = VALIDATED_PDF_DIR if final_pass else FAILED_VALIDATION_PDF_DIR
+            new_path, move_err = move_pdf(pdf_path, dest_dir)
 
-        dest_dir = VALIDATED_PDF_DIR if final_pass else FAILED_VALIDATION_PDF_DIR
-        new_path, move_err = move_pdf(pdf_path, dest_dir)
+            verdict_status = 1 if final_pass else 0
 
-        verdict_status = 1 if final_pass else 0
-
-        if move_err:
-            # Validation verdict stands; only the move failed → keep original path, note remarks
-            update_sourcing_validation_status(
-                conn, processing_id,
-                status=verdict_status, flag='c',
-                remarks=f"{reason} | PDF move failed: {move_err}"
-            )
-            print(f"[WARN] ProcessingId {processing_id}: {reason} | move failed: {move_err}")
-        else:
-            # Move succeeded → update PdfFilePath to new location
-            update_sourcing_validation_status(
-                conn, processing_id,
-                status=verdict_status, flag='c',
-                pdf_path=new_path
-            )
-            print(f"[INFO] ProcessingId {processing_id}: {reason} | moved -> {new_path}")
+            if move_err:
+                # Validation verdict stands; only the move failed → keep original path, note remarks
+                update_sourcing_validation_status(
+                    db, row_id,
+                    status=verdict_status, flag='c',
+                    remarks=f"{reason} | PDF move failed: {move_err}"
+                )
+                print(f"[WARN] ProcessingId {processing_id} (row Id {row_id}): {reason} | move failed: {move_err}")
+            else:
+                # Move succeeded → update PdfFilePath to new location
+                update_sourcing_validation_status(
+                    db, row_id,
+                    status=verdict_status, flag='c',
+                    pdf_path=new_path
+                )
+                print(f"[INFO] ProcessingId {processing_id} (row Id {row_id}): {reason} | moved -> {new_path}")
 
     # --------------------------------------------------
-    # FINALIZE — everything below the old loop is deleted
+    # FINALIZE
+    #    The `with Database()` block above committed and closed the connection.
     # --------------------------------------------------
-    conn.close()
     print("[DONE] Validation completed.")
 
 
