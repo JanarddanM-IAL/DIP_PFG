@@ -7,7 +7,14 @@
 #   playwright install chrome   # download the browser Playwright drives
 
 # --- PDF parsing ---
-pdfplumber            # PDF text/word extraction (import: pdfplumber)
+pdfplumber            # PDF text/word extraction — PFG_Sourcing.py (import: pdfplumber)
+pymupdf               # PDF engine for PFG_Validation.py gate checks (import: fitz)
+
+# --- Fuzzy matching (validation gates) ---
+rapidfuzz             # fuzzy title/name matching in PFG_Validation.py (import: rapidfuzz)
+
+# --- Date parsing (validation FYE checks) ---
+python-dateutil       # flexible date parsing (import: dateutil); also a pandas dep
 
 # --- Excel I/O ---
 openpyxl              # read/write .xlsm / .xlsx workbooks (import: openpyxl)
