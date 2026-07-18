@@ -4,9 +4,10 @@ PFG_Extraction.py — DB-integrated financial-statement extraction runner.
 
 Third stage of the pipeline, after PFG_Sourcing.py (sourcing) and
 PFG_Validation.py (sourcing validation). Polls TProcessStatus for rows whose
-validation is complete, opens each already-validated PDF (path stored in
-TProcessStatus.PdfFilePath, left in 03_Validated_Report by validation), and runs
-the *new* extraction engine that lives in the Extraction/ package
+validation is complete, opens each source PDF from the ABSOLUTE path stored in
+TProcessStatus.PdfFilePath (whatever it points to — the extraction never assumes
+a fixed input folder), and runs the *new* extraction engine that lives in the
+Extraction/ package
 (Extraction/pipeline.py): page slicing (optionally LLM-guided), per-statement LLM
 normalization with COA-mapping + compact-schema, multi-table split, JSON→CSV
 Total Check, and a merged per-deal .xlsx.
@@ -40,13 +41,16 @@ from pathlib import Path
 
 # ---------- make the Extraction/ engine importable ----------
 # PFG_Extraction.py lives at the project root; the extraction engine and its
-# helper modules (page_extractor, jsonToCsv, compact_schema, ...) live in
-# Extraction/. Put that folder first on sys.path so `import pipeline` resolves to
-# the engine while `import db` still resolves to the project-root db.py.
-_ENGINE_DIR = Path(__file__).resolve().parent / "Extraction"
-sys.path.insert(0, str(_ENGINE_DIR))
+# helper modules (pipeline, page_extractor, jsonToCsv, parquet_ingest, ...) live in
+# Extraction/. Put BOTH the project root and Extraction/ on sys.path, with
+# Extraction/ on top: `import pipeline` / `import parquet_ingest` resolve to the
+# engine folder, while the SHARED `db.py` stays at the project root (not copied).
+_ROOT       = Path(__file__).resolve().parent
+_ENGINE_DIR = _ROOT / "Extraction"
+sys.path.insert(0, str(_ROOT))          # shared root layer (db.py)
+sys.path.insert(0, str(_ENGINE_DIR))    # engine + parquet_ingest (takes precedence)
 
-# ---------- project DB layer (db.py, project root) ----------
+# ---------- project DB layer (shared db.py at the project root) ----------
 from db import Database, build_in_clause
 
 # ---------- extraction engine (Extraction/pipeline.py) ----------
@@ -65,6 +69,27 @@ except Exception as e:  # ImportError, or SystemExit from a missing engine modul
         f"[ERROR] Could not import the extraction engine from {_ENGINE_DIR}: "
         f"{type(e).__name__}: {e}"
     )
+
+# ---------- normalized parquet store (project root) ----------
+# Optional: if the parquet reference layer isn't built yet, ingestion is skipped
+# and extraction (JSON + Excel) still runs unchanged.
+try:
+    from parquet_ingest import ParquetStore
+except Exception as e:
+    ParquetStore = None
+    print(f"[WARN] parquet_ingest unavailable — RawData ingestion disabled: {e}")
+
+
+def _make_parquet_store():
+    """Open the RawData parquet store, or return None (ingestion then skipped)."""
+    if ParquetStore is None:
+        return None
+    try:
+        return ParquetStore()
+    except Exception as e:
+        print(f"[WARN] parquet store could not be opened — RawData ingestion "
+              f"disabled (run build_coa_reference.py first): {type(e).__name__}: {e}")
+        return None
 
 # The engine prints emoji/box-drawing diagnostics; reconfigure the console to UTF-8
 # with replacement so a non-UTF-8 pipe can never crash a run.
@@ -92,12 +117,14 @@ PROMPTS_FOLDER     = _ENGINE_DIR / "prompts"
 XLSX_PATH          = _ENGINE_DIR / "Master" / "standard_coa_master.xlsx"
 COA_MAPPING_FOLDER = _ENGINE_DIR / "COA_Mapping"
 
-# --- extraction output roots (same base as the validation stage; adjust if needed) ---
-# Inputs come from TProcessStatus.PdfFilePath (validation leaves them in
-# 03_Validated_Report), NOT from a scanned folder.
-_DATA_ROOT    = Path(r"C:\Test Code\Public Finance")
+# --- extraction OUTPUT roots (where JSON/Excel/parquet are written; adjust if needed) ---
+# The INPUT PDF is read from each row's TProcessStatus.PdfFilePath (an absolute path,
+# used verbatim); these constants only control where OUTPUT is written.
+_DATA_ROOT    = Path(r"C:\S2\Public Finance")
 OUTPUT_BASE   = _DATA_ROOT / "04_Validated_output"            # all-pass deals
 MANUAL_OUTPUT = _DATA_ROOT / "05_Manual_Validation_Required"  # any-fail / total-check-fail deals
+# The shared parquet store lives under OUTPUT_BASE/"Parquet" for both pass and fail
+# (see parquet_ingest.PARQUET_DIR, which ParquetStore() uses by default).
 
 
 # =========================================================
@@ -217,12 +244,16 @@ _EXTRACTION_SELECT = """
 # =========================================================
 # PER-ROW PROCESSOR
 # =========================================================
-def process_one_row(db, db_row, coa_text):
+def process_one_row(db, db_row, coa_text, store=None):
     """
     Extract ONE work-list row end to end. Wrapped in try/except so a single bad row
     records its own Remarks and the batch keeps going (Database autocommits each
     write; an *uncaught* exception would roll back every prior row's committed
     status inside the `with Database()` block).
+
+    If a parquet `store` is supplied, the produced per-statement JSON is ALSO
+    ingested into parquet/RawData.parquet (keyed on ProcessingId), in addition to
+    the JSON + Excel output which is left unchanged.
 
     One DB row == one source PDF == one "deal". The row's PDF is copied into an
     isolated temp dir so the engine's folder-based slicer touches only it; the
@@ -253,8 +284,9 @@ def process_one_row(db, db_row, coa_text):
     tmp_dir = Path(tempfile.mkdtemp(prefix=f"pfg_ext_{row_id}_"))
 
     try:
-        # Copy the source PDF into an isolated working dir so run_extraction slices
-        # ONLY this row's PDF (03_Validated_Report holds many other rows' PDFs).
+        # Copy the source PDF (from its PdfFilePath location) into an isolated working
+        # dir so run_extraction slices ONLY this row's PDF, even if other PDFs share
+        # the same source folder.
         shutil.copy2(str(src_pdf), str(tmp_dir / src_pdf.name))
 
         extracted = run_extraction(
@@ -315,6 +347,17 @@ def process_one_row(db, db_row, coa_text):
               f"data_validation={data_validation_status} completion={completion_status} "
               f"-> {outcome.get('output_folder')}")
 
+        # ---- RawData parquet ingestion (in addition to JSON + Excel) ----
+        if store is not None and outcome.get("json_files"):
+            try:
+                st = store.ingest_deal(processing_id, outcome["json_files"])
+                store.flush()
+                print(f"[PARQUET] Id={row_id} pid={processing_id}: {st['rows']} RawData row(s) "
+                      f"({st['mapped_items']} items mapped, {st['skipped_items']} skipped)")
+            except Exception as e:
+                print(f"[PARQUET] Id={row_id}: ingestion failed (non-fatal): "
+                      f"{type(e).__name__}: {e}")
+
     except Exception as e:
         msg = f"Extraction exception: {type(e).__name__}: {e}"[:500]
         print(f"[ERROR] Id={row_id}: {msg}")
@@ -370,8 +413,9 @@ def main_extract():
             print(f"[ERROR] Could not claim rows: {claim.error}")
             return
 
+        store = _make_parquet_store()
         for db_row in master_rows:
-            process_one_row(db, db_row, coa_text)
+            process_one_row(db, db_row, coa_text, store)
 
     print("[DONE] Batch extraction complete.")
 
@@ -379,7 +423,7 @@ def main_extract():
 # =========================================================
 # SINGLE-ID MODE  (python PFG_Extraction.py <id>)
 # =========================================================
-def extract_one_id(db, row_id, coa_text):
+def extract_one_id(db, row_id, coa_text, store=None):
     """
     Extract a SINGLE TProcessStatus row by its physical Id, using an already-open db
     handle. Filters ONLY on IsActive (not the extraction flags): an explicit Id is
@@ -393,7 +437,7 @@ def extract_one_id(db, row_id, coa_text):
         print(f"[INFO] No active TProcessStatus row for Id={row_id}.")
         return False
     db.update("UPDATE TProcessStatus SET ExtractionFlag='s' WHERE IsActive=1 AND Id=?", [row_id])
-    process_one_row(db, res.data, coa_text)   # SAME per-row path as batch
+    process_one_row(db, res.data, coa_text, store)   # SAME per-row path as batch
     return True
 
 
@@ -402,7 +446,8 @@ def main_extract_by_id(row_id):
     print(f"[COA] Loaded {len(coa_text.splitlines())} rows from {XLSX_PATH}")
     with Database() as db:
         print(f"[DB] Connected. Extracting single row_id={row_id}.")
-        extract_one_id(db, row_id, coa_text)
+        store = _make_parquet_store()
+        extract_one_id(db, row_id, coa_text, store)
     print(f"[DONE] Extraction completed for row_id={row_id}.")
 
 
