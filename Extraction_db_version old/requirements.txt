@@ -1,0 +1,12 @@
+# --- Core (always required) ---
+openai>=1.40.0          # GPT calls; needs max_completion_tokens + file content blocks
+openpyxl>=3.1.0         # read the COA master .xlsx + write merged output .xlsx
+pdfplumber>=0.11.0      # page text extraction + indentation reconstruction
+pypdf>=4.0.0            # split / write extracted PDF pages
+
+# --- Database + config (NEW: required for DB-driven pipeline) ---
+pyodbc>=5.0.0           # SQL Server connection (TProcessStatus / TCompanyMaster)
+python-dotenv>=1.0.0    # load GEMINI_API_KEY / DB creds from .env
+
+# --- Optional: only needed if you run with --provider gemini ---
+google-generativeai>=0.8.0   # also pulls in google-api-core (google.api_core.exceptions)

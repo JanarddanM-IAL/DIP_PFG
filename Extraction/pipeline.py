@@ -1612,10 +1612,11 @@ def build_page_note(page_info: dict) -> str:
 # SYNC NORMALIZATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_normalization(
-    extracted_pdfs: list[str],
+def process_one_deal(
+    deal_name: str,
+    deal_pdfs: list[str],
     prompts_folder: str,
-    xlsx_path: str,
+    coa_text: str,
     output_folder: str,
     manual_output: str,
     raw_folder: str,
@@ -1625,44 +1626,62 @@ def run_normalization(
     reporting_columns,
     tier: str = "free",
     coa_mapping_folder: str = "",
-) -> None:
-    os.makedirs(output_folder, exist_ok=True)
-    os.makedirs(manual_output, exist_ok=True)
+    client=None,
+    sector: str | None = None,
+    deal_idx: int | None = None,
+    total_deals: int | None = None,
+) -> dict:
+    """
+    Process ONE deal (the set of extracted table-PDFs belonging to a single source
+    PDF) end to end: normalize each table via the LLM, save the per-statement JSON,
+    route the deal to ``output_folder`` (all pass) or ``manual_output`` (any fail /
+    Total-Check fail), convert JSON→CSV (Total Check), merge the CSVs into one
+    ``.xlsx``, and copy the raw source PDF into the deal folder.
 
-    coa_text = load_xlsx_as_pipe_text(xlsx_path)
-    print(f"\n[COA] Loaded {len(coa_text.splitlines())} rows from {xlsx_path}")
+    The extracted JSON files are PERSISTED in the returned ``output_folder`` (never
+    deleted) so a downstream DB/parquet step can consume them.
 
-    client = None
-    if provider == "openai":
-        client = OpenAI()
+    Returns an outcome dict — no pass/fail counters, no console summary::
 
-    deal_groups: dict[str, list[str]] = {}
-    for pdf_path in extracted_pdfs:
-        stem = Path(pdf_path).stem
-        base = get_base_pdf_name(stem)
-        deal_groups.setdefault(base, []).append(pdf_path)
+        {
+          "deal_name":          str,
+          "skipped":            bool,        # no tables valid for this sector
+          "passed":             bool,        # final verdict (after total-check re-route)
+          "output_folder":      str | None,  # folder the JSON/CSV/xlsx live in
+          "json_files":         list[str],   # persisted .json paths in output_folder
+          "total_check_failed": bool,
+          "error":              str | None,  # set on unexpected failure
+        }
 
-    total_deals = len(deal_groups)
-    total_cost  = 0.0
-    pass_count  = 0
-    fail_count  = 0
+    Behaviour is identical to the per-deal iteration that ``run_normalization`` used
+    to inline; ``run_normalization`` now just calls this and tallies the counts. It
+    is also called directly by the DB-driven runner (PFG_Extraction.py), one deal
+    per TProcessStatus row, with ``sector`` supplied from ``TCOAMaster.SegmentId``.
+    """
+    outcome = {
+        "deal_name":          deal_name,
+        "skipped":            False,
+        "passed":             False,
+        "output_folder":      None,
+        "json_files":         [],
+        "total_check_failed": False,
+        "error":              None,
+    }
 
-    #print(f"\n{'='*70}")
-    #print(f"  NORMALIZATION: {total_deals} deal(s) to process")
+    try:
+        _next_log_pid(deal_name)
 
-    for deal_idx, (deal_name, deal_pdfs) in enumerate(deal_groups.items(), 1):
-      try:
-        sector   = detect_sector(deal_name + ".pdf")
-        expected = SECTOR_TABLE_SUFFIXES.get(sector, SECTOR_TABLE_SUFFIXES["LG"])  # ← RESTORE
+        if sector is None:
+            sector = detect_sector(deal_name + ".pdf")
+        expected = SECTOR_TABLE_SUFFIXES.get(sector, SECTOR_TABLE_SUFFIXES["LG"])
 
-        _next_log_pid(deal_name)                          # ← only this line needed
-
+        prefix = f"[{deal_idx}/{total_deals}] " if deal_idx else ""
         print(f"\n{'─'*70}")
-        print(f"  [{deal_idx}/{total_deals}] Deal : {deal_name} || Sector: {sector}")
+        print(f"  {prefix}Deal : {deal_name} || Sector: {sector}")
 
         sector_allowed_pdfs = [
             p for p in deal_pdfs
-            if detect_type(p) in expected        # ← now works
+            if detect_type(p) in expected
         ]
         sector_skipped = len(deal_pdfs) - len(sector_allowed_pdfs)
         if sector_skipped > 0:
@@ -1671,7 +1690,8 @@ def run_normalization(
 
         if not sector_allowed_pdfs:
             print(f"    [SKIP] No valid tables for sector={sector} — skipping deal")
-            continue
+            outcome["skipped"] = True
+            return outcome
 
         deal_results = process_deal_tables_parallel(
             deal_pdfs          = sector_allowed_pdfs,
@@ -1754,15 +1774,11 @@ def run_normalization(
                 print(f"    ✘ FAIL  : {fname}")
                 print(f"              Reason: No data in response")
 
-        total_cost += deal_cost
-
         if deal_passed:
             parent_folder = output_folder
-            pass_count   += 1
             tag           = "✅ ALL PASS"
         else:
             parent_folder = manual_output
-            fail_count   += 1
             tag           = "❌ FAIL → Manual"
 
         dest_folder = os.path.join(parent_folder, deal_name)
@@ -1821,8 +1837,6 @@ def run_normalization(
                 shutil.rmtree(new_dest)
             shutil.move(dest_folder, new_dest)
             dest_folder = new_dest
-            pass_count -= 1
-            fail_count += 1
             deal_passed = False
 
         try:
@@ -1847,11 +1861,85 @@ def run_normalization(
             if not os.path.exists(dest):
                 shutil.copy2(raw_pdf, dest)
 
-      except Exception as e:
+        outcome["passed"]             = deal_passed
+        outcome["output_folder"]      = dest_folder
+        outcome["total_check_failed"] = total_check_failed
+        outcome["json_files"]         = [
+            os.path.join(dest_folder, f)
+            for f in os.listdir(dest_folder)
+            if f.endswith(".json") and deal_name in f
+        ]
+        return outcome
+
+    except Exception as e:
+        outcome["error"] = f"{type(e).__name__}: {e}"
         print(f"\n    ❌ UNEXPECTED ERROR processing deal '{deal_name}' — "
-              f"skipping to next deal. Reason: {type(e).__name__}: {e}")
-        fail_count += 1
-        continue
+              f"Reason: {outcome['error']}")
+        return outcome
+
+
+def run_normalization(
+    extracted_pdfs: list[str],
+    prompts_folder: str,
+    xlsx_path: str,
+    output_folder: str,
+    manual_output: str,
+    raw_folder: str,
+    provider: str,
+    model: str,
+    max_tokens: int,
+    reporting_columns,
+    tier: str = "free",
+    coa_mapping_folder: str = "",
+) -> None:
+    os.makedirs(output_folder, exist_ok=True)
+    os.makedirs(manual_output, exist_ok=True)
+
+    coa_text = load_xlsx_as_pipe_text(xlsx_path)
+    print(f"\n[COA] Loaded {len(coa_text.splitlines())} rows from {xlsx_path}")
+
+    client = None
+    if provider == "openai":
+        client = OpenAI()
+
+    deal_groups: dict[str, list[str]] = {}
+    for pdf_path in extracted_pdfs:
+        stem = Path(pdf_path).stem
+        base = get_base_pdf_name(stem)
+        deal_groups.setdefault(base, []).append(pdf_path)
+
+    total_deals = len(deal_groups)
+    pass_count  = 0
+    fail_count  = 0
+
+    #print(f"\n{'='*70}")
+    #print(f"  NORMALIZATION: {total_deals} deal(s) to process")
+
+    for deal_idx, (deal_name, deal_pdfs) in enumerate(deal_groups.items(), 1):
+        outcome = process_one_deal(
+            deal_name          = deal_name,
+            deal_pdfs          = deal_pdfs,
+            prompts_folder     = prompts_folder,
+            coa_text           = coa_text,
+            output_folder      = output_folder,
+            manual_output      = manual_output,
+            raw_folder         = raw_folder,
+            provider           = provider,
+            model              = model,
+            max_tokens         = max_tokens,
+            reporting_columns  = reporting_columns,
+            tier               = tier,
+            coa_mapping_folder = coa_mapping_folder,
+            client             = client,
+            deal_idx           = deal_idx,
+            total_deals        = total_deals,
+        )
+        if outcome.get("skipped"):
+            continue
+        if outcome.get("passed"):
+            pass_count += 1
+        else:
+            fail_count += 1
 
     # ── Provider-specific cleanup ─────────────────────────────────────────────
     if tier == "paid":

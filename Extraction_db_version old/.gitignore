@@ -1,0 +1,23 @@
+# Virtual environment
+venv/
+
+# Environment variables (contains API keys & DB credentials)
+.env
+
+# Prompts folder
+prompts/
+
+# Binary/executable folder
+bin/
+
+# Excel master file
+standard_coa_master.xlsx
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/

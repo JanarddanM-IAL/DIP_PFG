@@ -40,3 +40,14 @@ Pillow                # image handling for Tk proof popups (import: PIL)
 
 # NOTE: tkinter is used but ships with the standard CPython installer on
 # Windows; it is not installable via pip.
+
+# --- LLM providers (extraction engine: Extraction/pipeline.py via PFG_Extraction.py) ---
+openai                # OpenAI SDK (import: openai) — hard top-level import in Extraction/pipeline.py
+google-genai          # Gemini SDK (import: google.genai) — default extraction provider
+anthropic             # Claude SDK (import: anthropic) — used when provider=claude
+
+# --- Extraction engine extras ---
+pypdf                 # PDF page slicing in Extraction/page_extractor.py (import: pypdf)
+polars                # parquet log writer for the extraction pipeline (import: polars)
+# NOTE: pdfplumber / pdfminer.six / pypdfium2 / numpy are already pulled in above
+# (pdfplumber is listed under PDF parsing; the rest arrive transitively).

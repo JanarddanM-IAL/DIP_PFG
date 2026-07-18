@@ -22,6 +22,7 @@ import json
 import os
 import re
 from pathlib import Path
+import time as _time
 
 import google.api_core.exceptions as _gex
 
@@ -295,34 +296,32 @@ def normalize_one_gemini(
     )
 
     # ── Call Gemini ──────────────────────────────────────────────────────────
+    _t0 = _time.time()
     try:
         response = gemini_model.generate_content(
             [pdf_part, user_text],
             request_options={"timeout": 300},
         )
     except _gex.ResourceExhausted as e:
-        raise RuntimeError(
-            "  Gemini quota exhausted (ResourceExhausted / 429).\n"
-            "    Free-tier limit reached. Wait ~1 minute or upgrade your plan.\n"
-        ) from e
+        raise RuntimeError(f"  Gemini quota exhausted (429): {e}") from e
     except _gex.PermissionDenied as e:
-        raise RuntimeError(
-            "  Gemini API key rejected (PermissionDenied / 403).\n"
-            "    Check GEMINI_API_KEY is correct and Gemini API is enabled.\n"
-        ) from e
+        raise RuntimeError(f"  Gemini API key rejected (403): {e}") from e
     except _gex.Unauthenticated as e:
-        raise RuntimeError(
-            "  Gemini API key invalid or missing (Unauthenticated / 401).\n"
-        ) from e
+        raise RuntimeError(f"  Gemini API key invalid (401): {e}") from e
     except _gex.DeadlineExceeded as e:
+        elapsed = _time.time() - _t0
+        # DIAGNOSTIC: show how long it actually ran + the underlying detail
+        print(f"  [DIAG] DeadlineExceeded after {elapsed:.1f}s")
+        print(f"  [DIAG] Underlying: {type(e).__name__}: {e}")
         raise RuntimeError(
-            "  Gemini request timed out (DeadlineExceeded).\n"
-            "    The PDF may be too large. Try splitting it or using gemini-2.5-pro.\n"
+            f"  Gemini request timed out (DeadlineExceeded) after {elapsed:.1f}s.\n"
+            f"    Underlying error: {e}\n"
         ) from e
     except Exception as e:
-        raise RuntimeError(
-            f"  Gemini API call failed: {type(e).__name__}: {e}"
-        ) from e
+        elapsed = _time.time() - _t0
+        print(f"  [DIAG] Unexpected {type(e).__name__} after {elapsed:.1f}s: {e}")
+        raise RuntimeError(f"  Gemini API call failed: {type(e).__name__}: {e}") from e
+    
 
     # ── Token usage ──────────────────────────────────────────────────────────
     usage_meta        = response.usage_metadata
@@ -359,3 +358,8 @@ def normalize_one_gemini(
             "total_tokens":      total_tokens,
         },
     }
+
+
+
+
+
