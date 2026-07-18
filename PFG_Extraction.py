@@ -58,7 +58,7 @@ from db import Database, build_in_clause
 # module-level side effect. It is harmless here — with no LogWriter attached it
 # just forwards to the real print() with flush=True.
 try:
-    from pipeline import (
+    from pipeline import (  # type: ignore  # resolved at runtime via sys.path -> Extraction/
         run_extraction,
         process_one_deal,
         load_xlsx_as_pipe_text,
@@ -74,7 +74,7 @@ except Exception as e:  # ImportError, or SystemExit from a missing engine modul
 # Optional: if the parquet reference layer isn't built yet, ingestion is skipped
 # and extraction (JSON + Excel) still runs unchanged.
 try:
-    from parquet_ingest import ParquetStore
+    from parquet_ingest import ParquetStore  # type: ignore  # resolved at runtime via sys.path -> Extraction/
 except Exception as e:
     ParquetStore = None
     print(f"[WARN] parquet_ingest unavailable — RawData ingestion disabled: {e}")
@@ -95,7 +95,7 @@ def _make_parquet_store():
 # with replacement so a non-UTF-8 pipe can never crash a run.
 for _stream in (sys.stdout, sys.stderr):
     try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore  # TextIOWrapper at runtime
     except Exception:
         pass
 
