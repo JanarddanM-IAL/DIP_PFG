@@ -21,18 +21,34 @@ Usage:
 """
 
 import atexit
+import os
 import signal
+import threading
 from datetime import datetime
 from pathlib import Path
 
 import polars as pl
+from filelock import FileLock
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-# Single source of truth for the processing-log parquet. Kept under the shared
-# C:\S2\Public Finance root (mirrors parquet_ingest.PARQUET_DIR / PFG_Extraction._DATA_ROOT),
-# but in its own 999_Log_Trackers folder — an operational log, separate from the data parquets.
+# STANDALONE-run default only. The DB/Dagster workflow injects the real location via
+# LogWriter(log_dir=PFG_Extraction.LOG_DIR) (see pipeline.start_pipeline_logging), which
+# derives from the single control point PFG_Extraction._DATA_ROOT. An operational log,
+# kept in its own 999_Log_Trackers folder — separate from the data parquets.
 LOG_DIR     = Path(r"C:\S2\Public Finance") / "999_Log_Trackers"
 LOG_PARQUET = LOG_DIR / "pipeline_logs.parquet"
+
+# ── Concurrency (parallel jobs append to the SAME log parquet) ───────────────
+# Thread lock (in-process) + a per-instance cross-process FileLock (see __init__),
+# mirroring PFG_Sourcing/PFG_Validation. Held around the whole read→concat→write.
+_LOG_THREAD_LOCK = threading.Lock()
+
+
+def _atomic_write_parquet(df: "pl.DataFrame", path: Path) -> None:
+    """Write to a sibling .tmp then os.replace() so a reader never sees a partial file."""
+    tmp = path.with_suffix(".parquet.tmp")
+    df.write_parquet(tmp, compression="snappy")
+    os.replace(tmp, path)
 
 # ── Stage constants ───────────────────────────────────────────────────────────
 STAGE_SOURCING              = "s"
@@ -55,16 +71,16 @@ def _empty_df() -> pl.DataFrame:
     )
 
 
-def _read_existing() -> pl.DataFrame:
+def _read_existing(path: Path) -> pl.DataFrame:
     """
-    Read the existing Parquet file.
+    Read the existing Parquet file at `path`.
     Returns an empty DataFrame (correct schema) if the file doesn't exist
     or is unreadable.
     """
-    if not LOG_PARQUET.exists():
+    if not Path(path).exists():
         return _empty_df()
     try:
-        return pl.read_parquet(LOG_PARQUET)
+        return pl.read_parquet(path)
     except Exception:
         return _empty_df()
 
@@ -96,8 +112,16 @@ class LogWriter:
 
     FLUSH_EVERY = 50  # rows buffered before auto-flush
 
-    def __init__(self):
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    def __init__(self, log_dir=None):
+        # log_dir lets the DB/Dagster workflow inject its centralized path
+        # (PFG_Extraction.LOG_DIR); standalone runs fall back to module LOG_DIR.
+        self.log_dir     = Path(log_dir) if log_dir else LOG_DIR
+        self.log_parquet = self.log_dir / "pipeline_logs.parquet"
+        # Cross-process lock for THIS log file (per-instance so it follows log_dir;
+        # all processes on the same file share the one lock file).
+        self._file_lock  = FileLock(str(self.log_parquet.with_suffix(".parquet.lock")), timeout=60)
+
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self._auto_log_id:    int        = 0
         self._current_pid:    str | None = None   # ← NOW a string (filename)
@@ -105,8 +129,12 @@ class LogWriter:
         self._buffer: list[dict]         = []
         self._closed                     = False
 
-        if not LOG_PARQUET.exists():
-            _empty_df().write_parquet(LOG_PARQUET)
+        # Create the empty-schema file if missing (guarded so parallel processes
+        # don't race to create it).
+        if not self.log_parquet.exists():
+            with self._file_lock:
+                if not self.log_parquet.exists():
+                    _atomic_write_parquet(_empty_df(), self.log_parquet)
 
         atexit.register(self._atexit_handler)
         self._register_signal_handlers()
@@ -178,9 +206,13 @@ class LogWriter:
             schema=_SCHEMA,
         )
 
-        existing_df = _read_existing()
-        updated_df  = pl.concat([existing_df, new_df], how="diagonal_relaxed")
-        updated_df.write_parquet(LOG_PARQUET, compression="snappy")
+        # Read→concat→write inside BOTH locks so parallel jobs never lose appends and
+        # never see a torn file. Append-only ⇒ reading the latest under the lock is enough.
+        with _LOG_THREAD_LOCK:
+            with self._file_lock:
+                existing_df = _read_existing(self.log_parquet)
+                updated_df  = pl.concat([existing_df, new_df], how="diagonal_relaxed")
+                _atomic_write_parquet(updated_df, self.log_parquet)
 
         self._buffer.clear()
 

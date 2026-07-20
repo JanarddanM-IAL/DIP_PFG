@@ -34,13 +34,34 @@ Rules:
 """
 
 import json
+import os
 import re
+import threading
 from pathlib import Path
 
 import polars as pl
+from filelock import FileLock
 
 # Single shared normalized parquet store for ALL deals (pass or fail).
+# NOTE: this is the STANDALONE-run default only. The DB/Dagster workflow injects
+# the real location via ParquetStore(parquet_dir=PFG_Extraction.PARQUET_DIR), which
+# is derived from the single control point PFG_Extraction._DATA_ROOT.
 PARQUET_DIR = Path(r"C:\S2\Public Finance") / "04_Validated_output" / "Parquet"
+
+# ── Concurrency (parallel Dagster jobs write the SAME parquet files) ─────────
+# Mirror PFG_Sourcing/PFG_Validation: a thread lock (in-process threads) + a
+# cross-process FileLock, both held around the whole read-modify-write. The
+# FileLock is created per-instance from the store dir (see ParquetStore.__init__)
+# so it follows the injected path and every process on that dir shares one lock.
+_STORE_THREAD_LOCK = threading.Lock()
+
+
+def _atomic_write_parquet(df: "pl.DataFrame", path: Path) -> None:
+    """Write to a sibling .tmp then os.replace() so a concurrent reader never sees
+    a half-written file (os.replace is atomic on Windows within one directory)."""
+    tmp = path.with_suffix(".parquet.tmp")
+    df.write_parquet(tmp)
+    os.replace(tmp, path)
 
 SKIP_EMPTY_VALUES = True
 _EMPTY_TOKENS = {"", "-", "–", "—"}
@@ -83,13 +104,31 @@ def _norm(s) -> str:
 
 
 class ParquetStore:
-    """Loads the reference + mutable parquet tables once; ingest_deal() accumulates
-    RawData rows in memory; flush() writes RawData + the upserted reference tables."""
+    """Loads the read-only reference tables (CoaDetails / TemplateType) once;
+    ingest_deal() accumulates NAME-KEYED pending records in memory; flush() does the
+    whole read-modify-write of the 4 mutable tables (RawData / Category / UnitMaster /
+    MetaData) atomically under a cross-process lock — so parallel jobs writing the same
+    store never lose rows or collide on surrogate keys.
+
+    Surrogate-key assignment (DataId / CategoryID / UnitId / MetaDataID) is DEFERRED to
+    flush and done against a FRESH on-disk read inside the lock; that is what keeps
+    parallel processes from minting the same ids off a stale snapshot."""
 
     def __init__(self, parquet_dir: Path = PARQUET_DIR):
         self.dir = Path(parquet_dir)
         self._load_refs()
-        self._load_mutable()
+        # Cross-process lock for this store dir (all processes on the same dir share
+        # one lock file); paired with the module-level in-process thread lock.
+        self._file_lock = FileLock(str(self.dir / "_store.parquet.lock"), timeout=120)
+        # Name-keyed pending rows (final ids resolved at flush).
+        self._pending: list = []
+        # Every ProcessingId handed to ingest_deal this run (even if it mapped 0 rows),
+        # so a re-run replaces the pid's old rows even when the new extraction is empty.
+        self._ingested_pids: set = set()
+        # ProcessingId is NON-unique (merge-siblings share it). A pid's stale on-disk
+        # rows are dropped only on its FIRST flush this session (see flush), so sibling
+        # deals ACCUMULATE within a run while a full re-run still replaces cleanly.
+        self._cleared_pids: set = set()
 
     # ---- reference tables (read-only) ----
     def _load_refs(self):
@@ -120,45 +159,15 @@ class ParquetStore:
             self.by_pair.setdefault((tid, dn), []).append(cid)
             self.by_pair_n.setdefault((tid, _norm(dn)), []).append(cid)
 
-    # ---- mutable tables (upserted) ----
-    def _load_mutable(self):
-        cat = pl.read_parquet(self.dir / "Category.parquet")
-        unit = pl.read_parquet(self.dir / "UnitMaster.parquet")
-        meta = pl.read_parquet(self.dir / "MetaData.parquet")
-        raw = pl.read_parquet(self.dir / "RawData.parquet")
-        self._cat = {r["CategoryName"]: r["CategoryID"] for r in cat.iter_rows(named=True)}
-        self._unit = {r["Name"]: r["UnitID"] for r in unit.iter_rows(named=True)}
-        self._meta = {(r["MetadataName"], r["Value"]): r["MetaDataID"]
-                      for r in meta.iter_rows(named=True)}
-        self._next_cat = (max(self._cat.values()) + 1) if self._cat else 1
-        self._next_unit = (max(self._unit.values()) + 1) if self._unit else 1
-        self._next_meta = (max(self._meta.values()) + 1) if self._meta else 1
-        self.raw_rows = raw.to_dicts()
-        ids = [d["DataId"] for d in self.raw_rows if d.get("DataId") is not None]
-        self._next_data = (max(ids) + 1) if ids else 1
-        # ProcessingId is NON-unique (merge-siblings share it). Clear a ProcessingId's
-        # stale rows only on its FIRST ingest this session, so several sibling deals
-        # ACCUMULATE within one run, while a full re-run still replaces cleanly.
-        self._cleared_pids: set = set()
-
-    def _cat_id(self, name: str) -> int:
-        if name not in self._cat:
-            self._cat[name] = self._next_cat
-            self._next_cat += 1
-        return self._cat[name]
-
-    def _unit_id(self, name: str) -> int:
-        if name not in self._unit:
-            self._unit[name] = self._next_unit
-            self._next_unit += 1
-        return self._unit[name]
-
-    def _meta_id(self, mname: str, value) -> int:
-        key = (mname, value)
-        if key not in self._meta:
-            self._meta[key] = self._next_meta
-            self._next_meta += 1
-        return self._meta[key]
+    @staticmethod
+    def _read_table(path: Path) -> "pl.DataFrame | None":
+        """Read a mutable table, tolerating a missing/unreadable file (-> None)."""
+        try:
+            if path.exists():
+                return pl.read_parquet(path)
+        except Exception:
+            pass
+        return None
 
     def _resolve(self, tid, datapoint, parent_dpg):
         """Match a JSON datapoint to a CoaDetails COAHeaderID. Tries, in order:
@@ -181,11 +190,11 @@ class ParquetStore:
 
     # ---- main entry ----
     def ingest_deal(self, processing_id, json_files) -> dict:
+        """Parse one deal's JSON into NAME-KEYED pending records (category/unit/meta by
+        name, COAHeaderID from the read-only reference). Surrogate ids are minted later
+        in flush(), under the lock, against the fresh on-disk tables. No disk writes here."""
         processing_id = int(processing_id)
-        # idempotency: drop this pid's prior rows once per session (see _cleared_pids)
-        if processing_id not in self._cleared_pids:
-            self.raw_rows = [d for d in self.raw_rows if d.get("ProcessingId") != processing_id]
-            self._cleared_pids.add(processing_id)
+        self._ingested_pids.add(processing_id)
 
         order = {c: i for i, c in enumerate(_STMT_ORDER)}
         files = sorted((Path(f) for f in json_files),
@@ -210,8 +219,8 @@ class ParquetStore:
             page_no = meta.get("Page No")
             fye = meta.get("FYE")
             currency = meta.get("Currency reported")
-            meta_id = self._meta_id("FYE", fye) if fye not in (None, "") else None
-            unit_id = self._unit_id(currency) if currency not in (None, "") else None
+            fye_val = fye if fye not in (None, "") else None
+            unit_name = currency if currency not in (None, "") else None
             excl = set(rc) | {"COA Flag", "COA Datapoint", "Total Check Status"}
 
             cur_dpg = None
@@ -237,60 +246,143 @@ class ParquetStore:
 
                     # Build this datapoint's Reporting-Column rows first so an
                     # all-blank row does not consume a DataDisplaySequence.
-                    pending = []
+                    cols = []
                     for col in rc:
                         val = it.get(col)
                         if SKIP_EMPTY_VALUES and _is_empty(val):
                             continue
-                        pending.append((col, val))
-                    if not pending:
+                        cols.append((col, val))
+                    if not cols:
                         continue
 
                     disp_seq += 1
                     stats["mapped_items"] += 1
-                    for col, val in pending:
-                        self.raw_rows.append({
-                            "DataId": self._next_data,
-                            "CategoryID": self._cat_id(col),
-                            "COAHeaderID": coa_id,
-                            "MetaDataID": meta_id,
-                            "ProcessingId": processing_id,
-                            "Quardinate": None,
-                            "PageNo": (str(page_no) if page_no is not None else None),
-                            "PdfDataPpointName": (str(pdf_name) if pdf_name is not None else None),
-                            "Value": str(val).strip(),
-                            "UnitId": unit_id,
-                            "DataDisplaySequence": disp_seq,
-                            "InsertedOn": None, "InsertedBy": None,
-                            "ModifiedBy": None, "ModifiedOn": None, "IsActive": 1,
+                    for col, val in cols:
+                        # NAME-keyed pending record; ids resolved in flush().
+                        self._pending.append({
+                            "processing_id": processing_id,
+                            "category_name": col,
+                            "coa_id": coa_id,
+                            "fye_value": fye_val,
+                            "unit_name": unit_name,
+                            "page_no": (str(page_no) if page_no is not None else None),
+                            "pdf_name": (str(pdf_name) if pdf_name is not None else None),
+                            "value": str(val).strip(),
+                            "disp_seq": disp_seq,
                         })
-                        self._next_data += 1
                         stats["rows"] += 1
         return stats
 
-    # ---- persist ----
+    # ---- persist (concurrency-safe: whole read-modify-write under one lock) ----
     def flush(self):
-        raw_cols = {k: [d.get(k) for d in self.raw_rows] for k in RAWDATA_SCHEMA}
-        pl.DataFrame(raw_cols, schema=RAWDATA_SCHEMA).write_parquet(self.dir / "RawData.parquet")
+        """Commit this run's pending rows. The FULL read-modify-write of all 4 mutable
+        tables runs inside a thread lock + cross-process FileLock, and every surrogate id
+        is minted from a FRESH on-disk read taken INSIDE the lock — so N parallel jobs
+        writing the same store never lose each other's rows nor collide on ids.
+        Writes are atomic (temp + os.replace) so readers never see a partial file."""
+        to_clear = self._ingested_pids - self._cleared_pids
+        if not self._pending and not to_clear:
+            return
 
-        pl.DataFrame(
-            {"CategoryID": list(self._cat.values()), "CategoryName": list(self._cat.keys())},
-            schema={"CategoryID": pl.Int64, "CategoryName": pl.Utf8},
-        ).write_parquet(self.dir / "Category.parquet")
+        with _STORE_THREAD_LOCK:                 # serialize sibling threads (fast)
+            with self._file_lock:                # serialize other processes (slow)
+                # 1. FRESH read of the mutable tables (sees peers' committed rows).
+                cat_df = self._read_table(self.dir / "Category.parquet")
+                unit_df = self._read_table(self.dir / "UnitMaster.parquet")
+                meta_df = self._read_table(self.dir / "MetaData.parquet")
+                raw_df = self._read_table(self.dir / "RawData.parquet")
 
-        pl.DataFrame(
-            {"UnitID": list(self._unit.values()), "Name": list(self._unit.keys()),
-             "IsActive": [1] * len(self._unit)},
-            schema={"UnitID": pl.Int64, "Name": pl.Utf8, "IsActive": pl.Int64},
-        ).write_parquet(self.dir / "UnitMaster.parquet")
+                cat = ({r["CategoryName"]: r["CategoryID"] for r in cat_df.iter_rows(named=True)}
+                       if cat_df is not None else {})
+                unit = ({r["Name"]: r["UnitID"] for r in unit_df.iter_rows(named=True)}
+                        if unit_df is not None else {})
+                metam = ({(r["MetadataName"], r["Value"]): r["MetaDataID"]
+                          for r in meta_df.iter_rows(named=True)} if meta_df is not None else {})
+                raw_rows = raw_df.to_dicts() if raw_df is not None else []
 
-        meta_items = list(self._meta.items())   # ((name, value) -> id)
-        pl.DataFrame(
-            {"MetaDataID": [i for _k, i in meta_items],
-             "MetadataName": [k[0] for k, _i in meta_items],
-             "Value": [k[1] for k, _i in meta_items]},
-            schema={"MetaDataID": pl.Int64, "MetadataName": pl.Utf8, "Value": pl.Utf8},
-        ).write_parquet(self.dir / "MetaData.parquet")
+                next_cat = (max(cat.values()) + 1) if cat else 1
+                next_unit = (max(unit.values()) + 1) if unit else 1
+                next_meta = (max(metam.values()) + 1) if metam else 1
+                ids = [d["DataId"] for d in raw_rows if d.get("DataId") is not None]
+                next_data = (max(ids) + 1) if ids else 1
+
+                # get-or-create against the FRESH maps (a name a peer just committed is
+                # reused, not duplicated; a genuinely new name gets the next free id).
+                def cat_id(name):
+                    nonlocal next_cat
+                    if name not in cat:
+                        cat[name] = next_cat; next_cat += 1
+                    return cat[name]
+
+                def unit_id(name):
+                    nonlocal next_unit
+                    if name is None:
+                        return None
+                    if name not in unit:
+                        unit[name] = next_unit; next_unit += 1
+                    return unit[name]
+
+                def meta_id(value):
+                    nonlocal next_meta
+                    if value is None:
+                        return None
+                    key = ("FYE", value)
+                    if key not in metam:
+                        metam[key] = next_meta; next_meta += 1
+                    return metam[key]
+
+                # 2. idempotent replace: drop each owned pid's stale rows ONCE (first
+                #    flush of that pid). Under the lock this only removes THIS job's pid.
+                if to_clear:
+                    raw_rows = [d for d in raw_rows if d.get("ProcessingId") not in to_clear]
+                    self._cleared_pids |= to_clear
+
+                # 3. append this run's pending rows with freshly-minted ids.
+                for rec in self._pending:
+                    raw_rows.append({
+                        "DataId": next_data,
+                        "CategoryID": cat_id(rec["category_name"]),
+                        "COAHeaderID": rec["coa_id"],
+                        "MetaDataID": meta_id(rec["fye_value"]),
+                        "ProcessingId": rec["processing_id"],
+                        "Quardinate": None,
+                        "PageNo": rec["page_no"],
+                        "PdfDataPpointName": rec["pdf_name"],
+                        "Value": rec["value"],
+                        "UnitId": unit_id(rec["unit_name"]),
+                        "DataDisplaySequence": rec["disp_seq"],
+                        "InsertedOn": None, "InsertedBy": None,
+                        "ModifiedBy": None, "ModifiedOn": None, "IsActive": 1,
+                    })
+                    next_data += 1
+
+                # 4. atomic write of all four tables.
+                raw_cols = {k: [d.get(k) for d in raw_rows] for k in RAWDATA_SCHEMA}
+                _atomic_write_parquet(
+                    pl.DataFrame(raw_cols, schema=RAWDATA_SCHEMA), self.dir / "RawData.parquet")
+                _atomic_write_parquet(
+                    pl.DataFrame(
+                        {"CategoryID": list(cat.values()), "CategoryName": list(cat.keys())},
+                        schema={"CategoryID": pl.Int64, "CategoryName": pl.Utf8}),
+                    self.dir / "Category.parquet")
+                _atomic_write_parquet(
+                    pl.DataFrame(
+                        {"UnitID": list(unit.values()), "Name": list(unit.keys()),
+                         "IsActive": [1] * len(unit)},
+                        schema={"UnitID": pl.Int64, "Name": pl.Utf8, "IsActive": pl.Int64}),
+                    self.dir / "UnitMaster.parquet")
+                meta_items = list(metam.items())   # ((name, value) -> id)
+                _atomic_write_parquet(
+                    pl.DataFrame(
+                        {"MetaDataID": [i for _k, i in meta_items],
+                         "MetadataName": [k[0] for k, _i in meta_items],
+                         "Value": [k[1] for k, _i in meta_items]},
+                        schema={"MetaDataID": pl.Int64, "MetadataName": pl.Utf8, "Value": pl.Utf8}),
+                    self.dir / "MetaData.parquet")
+
+                # 5. pending rows are now on disk; keep _cleared_pids so a later flush of
+                #    the same pid appends (accumulates) instead of re-dropping.
+                self._pending = []
 
 
 # ---------------------------------------------------------------------------

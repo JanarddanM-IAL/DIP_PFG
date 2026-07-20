@@ -85,11 +85,13 @@ except Exception as e:
 
 
 def _make_parquet_store():
-    """Open the RawData parquet store, or return None (ingestion then skipped)."""
+    """Open the RawData parquet store at the centralized PARQUET_DIR, or return None
+    (ingestion then skipped). Passing PARQUET_DIR is what keeps the store location tied
+    to the single _DATA_ROOT control point rather than parquet_ingest's own default."""
     if ParquetStore is None:
         return None
     try:
-        return ParquetStore()
+        return ParquetStore(PARQUET_DIR)
     except Exception as e:
         print(f"[WARN] parquet store could not be opened — RawData ingestion "
               f"disabled (run build_coa_reference.py first): {type(e).__name__}: {e}")
@@ -121,14 +123,21 @@ PROMPTS_FOLDER     = _ENGINE_DIR / "prompts"
 XLSX_PATH          = _ENGINE_DIR / "Master" / "standard_coa_master.xlsx"
 COA_MAPPING_FOLDER = _ENGINE_DIR / "COA_Mapping"
 
-# --- extraction OUTPUT roots (where JSON/Excel/parquet are written; adjust if needed) ---
+# --- extraction OUTPUT roots (where JSON/Excel/parquet/logs are written) --------------
+# ┌────────────────────────────────────────────────────────────────────────────────┐
+# │ SINGLE CONTROL POINT for every output location. Change _DATA_ROOT here and the   │
+# │ JSON/Excel output, the shared parquet store, and the processing-log parquet all  │
+# │ move together — no edits needed in the Extraction/ folder. PFG_Extraction injects │
+# │ PARQUET_DIR into ParquetStore(...) and LOG_DIR into start_pipeline_logging(...);  │
+# │ the engine modules' own path literals are only fallbacks for standalone runs.     │
+# └────────────────────────────────────────────────────────────────────────────────┘
 # The INPUT PDF is read from each row's TProcessStatus.PdfFilePath (an absolute path,
 # used verbatim); these constants only control where OUTPUT is written.
-_DATA_ROOT    = Path(r"C:\S2\Public Finance")
-OUTPUT_BASE   = _DATA_ROOT / "04_Validated_output"            # all-pass deals
+_DATA_ROOT    = Path(r"C:\S2\Public Finance")                 # <<< the one place to change
+OUTPUT_BASE   = _DATA_ROOT / "04_Validated_output"            # all-pass deals (JSON/Excel)
 MANUAL_OUTPUT = _DATA_ROOT / "05_Manual_Validation_Required"  # any-fail / total-check-fail deals
-# The shared parquet store lives under OUTPUT_BASE/"Parquet" for both pass and fail
-# (see parquet_ingest.PARQUET_DIR, which ParquetStore() uses by default).
+PARQUET_DIR   = OUTPUT_BASE / "Parquet"                       # shared normalized store (pass & fail)
+LOG_DIR       = _DATA_ROOT / "999_Log_Trackers"               # processing-log parquet
 
 
 # =========================================================
@@ -386,8 +395,8 @@ def process_one_row(db, db_row, coa_text, store=None):
 # BATCH MODE  (no CLI arg -> extract every pending row)
 # =========================================================
 def main_extract():
-    # Capture this run's full print trace to the processing-log parquet.
-    start_pipeline_logging()
+    # Capture this run's full print trace to the processing-log parquet (centralized LOG_DIR).
+    start_pipeline_logging(LOG_DIR)
     try:
         _main_extract()
     finally:
@@ -462,8 +471,8 @@ def extract_one_id(db, row_id, coa_text, store=None):
 
 
 def main_extract_by_id(row_id):
-    # Capture this run's full print trace to the processing-log parquet.
-    start_pipeline_logging()
+    # Capture this run's full print trace to the processing-log parquet (centralized LOG_DIR).
+    start_pipeline_logging(LOG_DIR)
     try:
         _main_extract_by_id(row_id)
     finally:

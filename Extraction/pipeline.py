@@ -62,15 +62,16 @@ builtins.print = _logging_print
 # ── Public logging API (used by the DB workflow, PFG_Extraction.py) ──────────
 # The standalone CLI (main() below) manages the writer inline; these let an
 # external caller drive the SAME writer without duplicating that logic.
-def start_pipeline_logging():
+def start_pipeline_logging(log_dir=None):
     """Attach a LogWriter so intercepted print() output is captured to the
-    processing-log parquet. Idempotent; returns the active writer (or None if
-    log_writer is unavailable, in which case logging is silently disabled)."""
+    processing-log parquet. `log_dir` lets a caller (PFG_Extraction) inject its
+    centralized log location; None → LogWriter's standalone default. Idempotent;
+    returns the active writer (or None if log_writer is unavailable)."""
     global _pipeline_log_writer
     if _pipeline_log_writer is None:
         try:
             from log_writer import LogWriter
-            _pipeline_log_writer = LogWriter()
+            _pipeline_log_writer = LogWriter(log_dir)
         except Exception:
             _pipeline_log_writer = None
     return _pipeline_log_writer
