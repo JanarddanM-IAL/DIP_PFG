@@ -28,7 +28,10 @@ from pathlib import Path
 import polars as pl
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-LOG_DIR     = Path(__file__).parent / "logs"
+# Single source of truth for the processing-log parquet. Kept under the shared
+# C:\S2\Public Finance root (mirrors parquet_ingest.PARQUET_DIR / PFG_Extraction._DATA_ROOT),
+# but in its own 999_Log_Trackers folder — an operational log, separate from the data parquets.
+LOG_DIR     = Path(r"C:\S2\Public Finance") / "999_Log_Trackers"
 LOG_PARQUET = LOG_DIR / "pipeline_logs.parquet"
 
 # ── Stage constants ───────────────────────────────────────────────────────────

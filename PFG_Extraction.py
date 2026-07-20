@@ -63,6 +63,10 @@ try:
         process_one_deal,
         load_xlsx_as_pipe_text,
         get_base_pdf_name,
+        start_pipeline_logging,
+        stop_pipeline_logging,
+        set_log_context,
+        clear_log_context,
     )
 except Exception as e:  # ImportError, or SystemExit from a missing engine module
     sys.exit(
@@ -266,6 +270,10 @@ def process_one_row(db, db_row, coa_text, store=None):
     sector        = sector_from_segment(getattr(db_row, "SegmentId", None))
     pdf_file_path = _norm(db_row.PdfFilePath)
 
+    # Lock every log line for this row to the DB ProcessingId (overrides the temp
+    # PDF filename that run_extraction would otherwise use); released in `finally`.
+    set_log_context(processing_id)
+
     print(f"\n[ROW] Id={row_id} ProcessingId={processing_id} | {issuer_name} "
           f"sector={sector}")
 
@@ -278,6 +286,7 @@ def process_one_row(db, db_row, coa_text, store=None):
         print(f"[WARN] Id={row_id}: source PDF not found at {pdf_file_path!r}")
         finalize_extraction(db, row_id, 0, 0, 0,
                             remarks="source PDF not found for extraction")
+        clear_log_context()
         return
 
     deal_name = get_base_pdf_name(src_pdf.stem)
@@ -369,12 +378,23 @@ def process_one_row(db, db_row, coa_text, store=None):
         # The temp dir (copied source PDF + sliced sub-PDFs) is disposable — the
         # JSON now lives under OUTPUT_BASE/MANUAL_OUTPUT and is intentionally kept.
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Release the ProcessingId lock so run-level lines aren't misattributed.
+        clear_log_context()
 
 
 # =========================================================
 # BATCH MODE  (no CLI arg -> extract every pending row)
 # =========================================================
 def main_extract():
+    # Capture this run's full print trace to the processing-log parquet.
+    start_pipeline_logging()
+    try:
+        _main_extract()
+    finally:
+        stop_pipeline_logging()   # flush + detach even on crash
+
+
+def _main_extract():
     coa_text = load_xlsx_as_pipe_text(str(XLSX_PATH))
     print(f"[COA] Loaded {len(coa_text.splitlines())} rows from {XLSX_PATH}")
 
@@ -442,6 +462,15 @@ def extract_one_id(db, row_id, coa_text, store=None):
 
 
 def main_extract_by_id(row_id):
+    # Capture this run's full print trace to the processing-log parquet.
+    start_pipeline_logging()
+    try:
+        _main_extract_by_id(row_id)
+    finally:
+        stop_pipeline_logging()   # flush + detach even on crash
+
+
+def _main_extract_by_id(row_id):
     coa_text = load_xlsx_as_pipe_text(str(XLSX_PATH))
     print(f"[COA] Loaded {len(coa_text.splitlines())} rows from {XLSX_PATH}")
     with Database() as db:

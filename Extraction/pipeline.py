@@ -27,15 +27,21 @@ _ensure_engine_on_path()
 from pdf_to_indented_text import pdf_to_indented_text
 import functools, builtins
 
-# ── Intercept print() → also write to DuckDB log ─────────────────────────────
-_pipeline_log_writer = None   # set in main() after args are parsed
-_log_processing_id   = 0 
+# ── Intercept print() → also write to the processing-log parquet ─────────────
+_pipeline_log_writer = None   # set in main() (CLI) or via start_pipeline_logging() (DB workflow)
+_log_processing_id   = 0
+_log_pid_override    = None   # when set, wins over the per-file filename (see _next_log_pid)
 _original_print = builtins.print
 def _next_log_pid(filename: str = "") -> None:
-    """Set current filename as ProcessingId on the log writer."""
+    """Set the current ProcessingId on the log writer.
+
+    Uses the caller-locked override (e.g. the DB TProcessStatus.ProcessingId set via
+    set_log_context) when present; otherwise falls back to the per-file filename stem
+    (the standalone-CLI behavior — unchanged when no override is set).
+    """
     if _pipeline_log_writer is not None:
         _pipeline_log_writer.set_context(
-            processing_id = filename,   # ← filename string, e.g. "LG_CIT_WI_600005841_2024.pdf"
+            processing_id = _log_pid_override if _log_pid_override else filename,
             stage         = "p",
         )
     return _log_processing_id
@@ -51,6 +57,49 @@ def _logging_print(*args, **kwargs):
                 _pipeline_log_writer.write(sub)
 
 builtins.print = _logging_print
+
+
+# ── Public logging API (used by the DB workflow, PFG_Extraction.py) ──────────
+# The standalone CLI (main() below) manages the writer inline; these let an
+# external caller drive the SAME writer without duplicating that logic.
+def start_pipeline_logging():
+    """Attach a LogWriter so intercepted print() output is captured to the
+    processing-log parquet. Idempotent; returns the active writer (or None if
+    log_writer is unavailable, in which case logging is silently disabled)."""
+    global _pipeline_log_writer
+    if _pipeline_log_writer is None:
+        try:
+            from log_writer import LogWriter
+            _pipeline_log_writer = LogWriter()
+        except Exception:
+            _pipeline_log_writer = None
+    return _pipeline_log_writer
+
+
+def stop_pipeline_logging():
+    """Flush and detach the LogWriter (safe to call when none is attached)."""
+    global _pipeline_log_writer
+    if _pipeline_log_writer is not None:
+        try:
+            _pipeline_log_writer.close()   # flushes the buffer
+        finally:
+            _pipeline_log_writer = None
+
+
+def set_log_context(pid) -> None:
+    """Lock the log ProcessingId to `pid` (e.g. the DB TProcessStatus.ProcessingId),
+    overriding the per-file filename that run_extraction sets internally. Persists
+    until clear_log_context()."""
+    global _log_pid_override
+    _log_pid_override = None if pid is None else str(pid)
+    if _pipeline_log_writer is not None and _log_pid_override:
+        _pipeline_log_writer.set_context(_log_pid_override, "p")
+
+
+def clear_log_context() -> None:
+    """Release the ProcessingId lock; _next_log_pid falls back to the filename."""
+    global _log_pid_override
+    _log_pid_override = None
 #
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
