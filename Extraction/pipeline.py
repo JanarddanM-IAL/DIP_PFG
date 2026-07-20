@@ -10,6 +10,20 @@ from pathlib import Path
 import openpyxl
 import time
 from openai import OpenAI, APIError, APITimeoutError, RateLimitError
+
+# ── Self-bootstrap this engine folder onto sys.path ───────────────────────────
+# Every engine module imports its siblings by BARE name (import page_extractor,
+# from llm_page_identifier import ...). Those resolve only when THIS folder is on
+# sys.path. Ensure it — so the engine runs no matter how it was launched (manual,
+# Dagster op, subprocess, package import, differing cwd). Re-asserted at the start
+# of the runtime entry points below in case sys.path changes after import.
+def _ensure_engine_on_path() -> None:
+    _d = os.path.dirname(os.path.abspath(__file__))
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
+
+_ensure_engine_on_path()
+
 from pdf_to_indented_text import pdf_to_indented_text
 import functools, builtins
 
@@ -466,6 +480,7 @@ def run_extraction(
     use_llm_id: bool = False,
     id_model: str = "claude-sonnet-4-6",
 ) -> list[str]:
+    _ensure_engine_on_path()   # deep lazy imports (e.g. llm_page_identifier) need this
     folder_path = Path(folder)
 
     raw_pdfs = [
@@ -1658,6 +1673,7 @@ def process_one_deal(
     is also called directly by the DB-driven runner (PFG_Extraction.py), one deal
     per TProcessStatus row, with ``sector`` supplied from ``TCOAMaster.SegmentId``.
     """
+    _ensure_engine_on_path()   # gemini clients / column_shift_repair are lazy bare imports
     outcome = {
         "deal_name":          deal_name,
         "skipped":            False,

@@ -3727,6 +3727,11 @@ def process_file_llm_guided(
     2. Use identified page numbers to slice PDFs with extract_pages_to_pdf()
     3. Falls back to Python keyword detection per-table if LLM misses any
     """
+    # Ensure this engine folder is importable for the bare sibling import below,
+    # robust under Dagster / subprocess / package-import launch contexts.
+    _ed = os.path.dirname(os.path.abspath(__file__))
+    if _ed not in sys.path:
+        sys.path.insert(0, _ed)
     from llm_page_identifier import identify_pages_with_fallback
 
     if out_dir is None:
