@@ -105,6 +105,23 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# ---------- user-facing display log (optional; never breaks a run) ----------
+# Short, human-readable "what happened to this report?" log (see
+# user_display_log_pfg.PFG_LOG_DIR). Distinct from the engine's detailed
+# pipeline_logs.parquet. A missing module degrades every udl.* call to a no-op.
+try:
+    import user_display_log_pfg as udl  # type: ignore  # resolved via sys.path -> project root
+except Exception:
+    class _UDLNoop:
+        def __getattr__(self, _):
+            return lambda *a, **k: None
+    udl = _UDLNoop()
+
+# Display allow-list: extraction is one 'p' sub-stage.
+_DISPLAY_STAGES = [
+    ("Extraction", "p", "Extraction"),
+]
+
 
 # =========================================================
 # CONFIG (module-level constants — the sibling convention)
@@ -283,6 +300,10 @@ def process_one_row(db, db_row, coa_text, store=None):
     # PDF filename that run_extraction would otherwise use); released in `finally`.
     set_log_context(processing_id)
 
+    # User-facing display log: bind these rows to this document.
+    udl.set_context(row_id, processing_id)
+    udl.started("Extraction")
+
     print(f"\n[ROW] Id={row_id} ProcessingId={processing_id} | {issuer_name} "
           f"sector={sector}")
 
@@ -295,6 +316,7 @@ def process_one_row(db, db_row, coa_text, store=None):
         print(f"[WARN] Id={row_id}: source PDF not found at {pdf_file_path!r}")
         finalize_extraction(db, row_id, 0, 0, 0,
                             remarks="source PDF not found for extraction")
+        udl.failure("Extraction", "source PDF not found for extraction")
         clear_log_context()
         return
 
@@ -317,6 +339,7 @@ def process_one_row(db, db_row, coa_text, store=None):
             print(f"[WARN] Id={row_id}: no extractable tables produced")
             finalize_extraction(db, row_id, 0, 0, 0,
                                 remarks="no extractable tables found")
+            udl.failure("Extraction", "no extractable tables found")
             return
 
         outcome = process_one_deal(
@@ -342,6 +365,7 @@ def process_one_row(db, db_row, coa_text, store=None):
             finalize_extraction(db, row_id, 0, 0, 0,
                                 output_path=outcome.get("output_folder"),
                                 remarks=f"extraction error: {outcome['error']}")
+            udl.failure("Extraction", f"extraction error: {outcome['error']}")
             return
 
         extraction_status      = 1 if outcome.get("json_files") else 0
@@ -365,6 +389,14 @@ def process_one_row(db, db_row, coa_text, store=None):
               f"data_validation={data_validation_status} completion={completion_status} "
               f"-> {outcome.get('output_folder')}")
 
+        # Display log: verdict + finish.
+        if completion_status == 1:
+            udl.check("Extraction", "Total Check", "PASSED")
+            udl.finished("Extraction")
+        else:
+            udl.check("Extraction", "Total Check", "FAILED",
+                      remark or "routed to manual validation")
+
         # ---- RawData parquet ingestion (in addition to JSON + Excel) ----
         if store is not None and outcome.get("json_files"):
             try:
@@ -379,6 +411,7 @@ def process_one_row(db, db_row, coa_text, store=None):
     except Exception as e:
         msg = f"Extraction exception: {type(e).__name__}: {e}"[:500]
         print(f"[ERROR] Id={row_id}: {msg}")
+        udl.failure("Extraction", msg)
         try:
             finalize_extraction(db, row_id, 0, 0, 0, remarks=msg)
         except Exception as e2:
@@ -389,6 +422,8 @@ def process_one_row(db, db_row, coa_text, store=None):
         shutil.rmtree(tmp_dir, ignore_errors=True)
         # Release the ProcessingId lock so run-level lines aren't misattributed.
         clear_log_context()
+        # Flush + release this row's user-facing display-log rows.
+        udl.clear_context()
 
 
 # =========================================================
@@ -397,10 +432,12 @@ def process_one_row(db, db_row, coa_text, store=None):
 def main_extract():
     # Capture this run's full print trace to the processing-log parquet (centralized LOG_DIR).
     start_pipeline_logging(LOG_DIR)
+    udl.register_stages(_DISPLAY_STAGES)
     try:
         _main_extract()
     finally:
-        stop_pipeline_logging()   # flush + detach even on crash
+        udl.flush_all()          # safety net (rows already flushed per-row)
+        stop_pipeline_logging()  # flush + detach even on crash
 
 
 def _main_extract():
@@ -473,10 +510,12 @@ def extract_one_id(db, row_id, coa_text, store=None):
 def main_extract_by_id(row_id):
     # Capture this run's full print trace to the processing-log parquet (centralized LOG_DIR).
     start_pipeline_logging(LOG_DIR)
+    udl.register_stages(_DISPLAY_STAGES)
     try:
         _main_extract_by_id(row_id)
     finally:
-        stop_pipeline_logging()   # flush + detach even on crash
+        udl.flush_all()          # safety net (rows already flushed per-row)
+        stop_pipeline_logging()  # flush + detach even on crash
 
 
 def _main_extract_by_id(row_id):

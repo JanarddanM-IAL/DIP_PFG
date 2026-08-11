@@ -48,6 +48,24 @@ from playwright.sync_api import (
     Error as PlaywrightError,
 )
 
+# ---------- user-facing display log (optional; never breaks a run) ----------
+# Short, human-readable "what happened to this report?" log. Writes to the PFG
+# display-log parquet (see user_display_log_pfg.PFG_LOG_DIR). If the module is
+# missing, every udl.* call becomes a safe no-op so sourcing is never affected.
+try:
+    import user_display_log_pfg as udl
+except Exception:
+    class _UDLNoop:
+        def __getattr__(self, _):
+            return lambda *a, **k: None
+    udl = _UDLNoop()
+
+# Display allow-list for the sourcing stage (list order = display order).
+_DISPLAY_STAGES = [
+    ("FAC Search",      "s", "FAC sourcing"),
+    ("Report Download", "s", "Report download"),
+]
+
 
 # =========================================================
 # DB CONNECTION
@@ -1220,6 +1238,9 @@ def run_fac_for_rows_source_only(rows: List[dict], db):
         # ✅ Make the main Chrome page full screen/maximized
         maximize_playwright_page(page)
 
+        # Register the sourcing sub-stages for the user-facing display log.
+        udl.register_stages(_DISPLAY_STAGES)
+
         for item in rows:
             r = item["processing_id"]
             year = item["year"]
@@ -1235,6 +1256,11 @@ def run_fac_for_rows_source_only(rows: List[dict], db):
             # ein = item["ein"]
 
             print(f"\n--- Processing id: {processing_id} | Year={year} UEI={uei} State={state} Sector={sector} ---")
+
+            # Display log: bind these rows to this document; starting a new row_id
+            # auto-flushes the previous row's buffered rows.
+            udl.set_context(row_id, processing_id)
+            udl.started("FAC Search")
 
             # SOURCING START → in progress, result pending (signal for the frontend)
             update_sourcing_status(db, row_id, status=None, flag='p')
@@ -1260,9 +1286,11 @@ def run_fac_for_rows_source_only(rows: List[dict], db):
                         mark_master_list_ix_failed_to_download(db, row_id, processing_id)#!!!done
                         set_remarks(db, row_id, f"FAC Excel download failed after {DOWNLOAD_RETRIES + 1} attempts.")
                         print(f"[FAILED] processing_id {r}: Excel download failed after retries => Marked as '{FAILED_TO_DOWNLOAD_TEXT}'")
+                        udl.failure("FAC Search", f"FAC Excel download failed after {DOWNLOAD_RETRIES + 1} attempts")
                         continue
                     raise
                 print(f"[SUCCESS] Excel downloaded: {downloaded_xlsx}")
+                udl.step("FAC Search", "FAC Excel downloaded")
 
                 criteria = {"year": year, "uei": uei, "state": state, "sector": sector}
 
@@ -1280,9 +1308,11 @@ def run_fac_for_rows_source_only(rows: List[dict], db):
                 if pdf_ok:
                     update_sourcing_status(db, row_id, status=1, flag='c', pdf_path=pdf_saved)  # success
                     print(f"[SUCCESS] PDF saved: {pdf_saved}")
+                    udl.step("Report Download", f"PDF saved: {Path(pdf_saved).name}")
                 else:
                     update_sourcing_status(db, row_id, status=0, flag='c')   # done + fail
                     print(f"[INFO] {processing_id}: PDF not found/saved => marked FAIL.")
+                    udl.check("Report Download", "PDF", "Not Found")
 
                 # -----------------------------
                 # PERFORMANCE: run all validations at once (single PDF open + cached extraction)
@@ -1293,10 +1323,16 @@ def run_fac_for_rows_source_only(rows: List[dict], db):
                 print(f"[TIMEOUT] processing_id {r}: {te}")
                 set_remarks(db, row_id, f"Timed out during FAC sourcing: {te}")
                 update_sourcing_status(db, row_id, status=0, flag='c')   # done + fail
+                udl.failure("FAC Search", f"Timed out during FAC sourcing: {te}")
             except Exception as e:
                 print(f"[FAILED] processing_id {r}: {e}")
                 set_remarks(db, row_id, f"Error during sourcing: {e}")
                 update_sourcing_status(db, row_id, status=0, flag='c')   # done + fail
+                udl.failure("FAC Search", f"Error during sourcing: {e}")
+
+        # Commit the last row's buffered display-log rows (earlier rows were
+        # auto-flushed as each new set_context() arrived).
+        udl.flush_all()
 
         try:
             context.close()

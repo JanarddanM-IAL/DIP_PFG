@@ -40,6 +40,34 @@ from dateutil import parser as dtparser
 # ---------- project DB layer (db.py) ----------
 from db import Database, build_in_clause
 
+# ---------- user-facing display log (optional; never breaks a run) ----------
+# Short, human-readable "what happened to this report?" log (see
+# user_display_log_pfg.PFG_LOG_DIR). A missing module degrades every udl.* call
+# to a safe no-op so validation is never affected.
+try:
+    import user_display_log_pfg as udl
+except Exception:
+    class _UDLNoop:
+        def __getattr__(self, _):
+            return lambda *a, **k: None
+    udl = _UDLNoop()
+
+# Display allow-list: validation is one 'sv' sub-stage with a per-gate check row.
+_DISPLAY_STAGES = [
+    ("Validation", "sv", "Sourcing validation"),
+]
+
+# Human labels for the gate step codes shown in the display log (unknown codes
+# fall back to the raw code).
+_CHECK_LABELS = {
+    "G1-1": "Entity Name", "G1-2": "State", "G1-3": "FYE",
+    "G2-1": "Audit Opinion", "G2-2": "FYE in Opinion",
+    "G2-3": "Auditor Name", "G2-4": "Auditor Signature",
+    "G3-1": "Cash Receipts & Disbursements", "G3-2": "Net Position / Balance Sheet",
+    "G3-3": "Governmental Funds Balance Sheet", "G3-4": "Statement of Activities",
+    "G3-5": "Revenue, Expenditure & Fund Balances", "G3-6": "Cash Flows",
+}
+
 warnings.filterwarnings("ignore")
 
 # The lifted engine prints emoji/arrows in its diagnostics. When stdout is a
@@ -4221,6 +4249,11 @@ def _process_validation_row(db, db_row):
     print(f"\n[ROW] Id={row_id} ProcessingId={processing_id} | {issuer_name} "
           f"({state_abbr}) sector={sector} year={audit_year}")
 
+    # Display log: bind these rows to this document; a new row_id auto-flushes the
+    # previous row's buffered rows.
+    udl.set_context(row_id, processing_id)
+    udl.started("Validation")
+
     # Mark in-progress AND wipe any stale remark from a prior run (Remarks -> NULL).
     update_sourcing_validation_status(db, row_id, None, 'p', clear_remarks=True)
 
@@ -4237,6 +4270,7 @@ def _process_validation_row(db, db_row):
             write_validation_row(row_id, processing_id, fail_row)
             update_sourcing_validation_status(db, row_id, status=0, flag='c',
                                               remarks="PDF not found for validation")
+            udl.failure("Validation", "PDF not found for validation")
             return
 
         # ---- run the gate engine ----
@@ -4244,6 +4278,13 @@ def _process_validation_row(db, db_row):
                                       uei, fy_end_val, pdf_saved, sector, audit_year)
         overall = out.get("overall", "FAIL")
         step_status = out.get("step_status") or {}
+
+        # Display log: one check row per gate step that ran, then the verdict.
+        for _code in _ALL_STEP_CODES:
+            _st = step_status.get(_code)
+            if _st:
+                udl.check("Validation", _CHECK_LABELS.get(_code, _code), str(_st))
+        udl.check("Validation", "Overall", overall)
 
         # ---- verdict mapping: PASS=1, everything else=0 (+ remark + folder) ----
         if overall == "PASS":
@@ -4285,6 +4326,7 @@ def _process_validation_row(db, db_row):
             update_sourcing_validation_status(db, row_id, status=0, flag='c', remarks=msg)
         except Exception as e2:
             print(f"[ERROR] Could not persist exception remark for Id={row_id}: {e2}")
+        udl.failure("Validation", msg)
         print(f"[ERROR] Id={row_id}: {msg}")
         # best-effort: move the PDF to the failed folder if it still exists at source
         try:
@@ -4331,8 +4373,12 @@ def main_validate():
             print(f"[ERROR] Could not claim rows: {claim.error}")
             return
 
-        for db_row in master_rows:
-            _process_validation_row(db, db_row)
+        udl.register_stages(_DISPLAY_STAGES)
+        try:
+            for db_row in master_rows:
+                _process_validation_row(db, db_row)
+        finally:
+            udl.flush_all()   # commit the last row's display-log rows
 
     print("[DONE] Batch validation complete.")
 
@@ -4354,7 +4400,11 @@ def validate_one_id(db, row_id):
         print(f"[INFO] No active TProcessStatus row for Id={row_id}.")
         return False
     db.update("UPDATE TProcessStatus SET SourcingValidationFlag='s' WHERE IsActive=1 AND Id=?", [row_id])
-    _process_validation_row(db, res.data)   # SAME per-row path as batch
+    udl.register_stages(_DISPLAY_STAGES)
+    try:
+        _process_validation_row(db, res.data)   # SAME per-row path as batch
+    finally:
+        udl.flush_all()   # commit this row's display-log rows
     return True
 
 
