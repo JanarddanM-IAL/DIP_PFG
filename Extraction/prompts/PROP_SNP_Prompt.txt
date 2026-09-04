@@ -103,6 +103,8 @@ Metadata.Issuer Name: exact entity name from header.
 Metadata.FYE: exact fiscal year end as printed (e.g., "June 30, 2022").
 Metadata.Page No: printed page number(s). Multiple pages: comma-separated (e.g., "47, 48, 49, 50"). Use SOURCE PAGE REFERENCE if provided.
 Metadata.Currency reported: "USD ($)" unless statement explicitly uses another currency.
+Metadata."Reported in Thousand": "Yes" if the sourced table title shows "(In Thousands)"
+  or "(000s)"; "No" otherwise. Default "No" if the unit scale is not stated.
 Metadata.Unit: detect from title/header. "(Dollars in Thousands)"/"(In Thousands)"->"Thousands" | "(In Millions)"->"Millions" | none->"Units".
 
 ===============================================================================
@@ -175,15 +177,19 @@ Net Position:
   - Net investment in capital assets (DP)
   - Restricted (DP — may have sub-items with hierarchy prefix, e.g., "Restricted - Debt service")
   - Unrestricted (DP)
-  - CP "Total net position"
-  - Adjustments DP row (if present): "Adjustments to reflect the consolidation of internal service fund
-    activities related to enterprise funds" — emit as DP immediately after "Total net position" CP.
-  - CP "Net position of business-type activities" / "Net position of primary government" (if present):
-    place as LAST row in Net Position section.
+   - CP "Total net position" — THIS IS THE HARD STOP. The Net Position section ends here.
 
-GRAND TOTAL ROW:
-  "Total liabilities, deferred inflows of resources, and net position" — if printed, place as LAST row in Net Position section.
-  If the statement instead uses "Net position of business-type activities" as the grand total, that is the LAST row.
+TRAILING RECONCILIATION ROWS (*** DO NOT STOP AT "TOTAL NET POSITION" ***):
+  When the PDF prints rows AFTER "Total net position", INCLUDE them as the final rows of the
+  Net Position section in this order:
+  1. DP "Adjustment to reflect the consolidation of internal service fund activities related
+     to enterprise funds" → COA Datapoint "Other_Net_Position"
+     Values: populate ONLY the Total/SUM column; all other fund columns = "-".
+  2. CP grand total "Net position of business-type activities" (or "Net position of primary
+     government") → COA Datapoint "Total Net Position"
+     Values: SUM column only; all other fund columns = "-".
+     THIS IS THE LAST ROW of the entire JSON output when these trailing rows are present.
+  If the PDF does NOT print these trailing rows, "Total net position" remains the last row.
 
 ===============================================================================
 E. HIERARCHY FLATTENING (PARENT->CHILD PREFIXING)
@@ -261,7 +267,7 @@ CP: Totals/subtotal rows. All expected CP rows:
   Deferred Outflows:  "Total deferred outflows of resources" (if printed) | "Total assets and deferred outflows of resources"
   Liabilities:        "Total current liabilities" | "Total noncurrent liabilities" | "Total liabilities"
   Deferred Inflows:   "Total deferred inflows of resources" (if printed) | "Total liabilities and deferred inflows of resources"
-  Net Position:       "Total net position" | "Net position of business-type activities" (if printed) | "Total liabilities, deferred inflows of resources, and net position" (if printed)
+  Net Position:       "Total net position"
 
 DP: All other data rows (leaf items with actual values). MUST have COA Datapoint.
 
@@ -337,6 +343,49 @@ G4) No duplication: each PDF value in only one column.
 G5) DPG rows: all values = null (JSON null, NOT "-" and NOT "").
 
 ===============================================================================
+G3.4  MANDATORY: DIGIT-DROP DETECTION & REPAIR (CRITICAL — RUN ON EVERY CP ROW)
+===============================================================================
+A digit-drop occurs when a PDF text extractor silently drops a character from
+a number (e.g., "16,760,001" → "1,676,001"). The LLM must NOT accept a
+malformed CP token without arithmetic validation.
+
+STEP 1 — PRE-ACCEPTANCE SANITY BOUND (run before column assignment):
+  For every token T on a CP / Total row assigned to column C:
+    floor_estimate = 0.80 × sum(all DP values seen above in column C)
+    ceil_estimate  = 1.20 × sum(all DP values seen above in column C)
+    If T < floor_estimate OR T > ceil_estimate:
+      Mark T as SUSPECT → proceed to STEP 2.
+    Else: accept T as-is.
+
+STEP 2 — DIGIT-DROP REPAIR ATTEMPT (only for SUSPECT tokens):
+  Generate candidates by inserting a single digit (0–9) at every
+  character position in T.
+    - If exactly one candidate matches sum(DP[C]) within $1 → ACCEPT
+      that candidate. Replace T with the repaired value.
+    - If zero or multiple candidates match → keep original T but log it.
+
+STEP 3 — MANDATORY TOTAL RECONCILIATION (G3.3 equivalent):
+  After all rows in a section are assigned:
+    For each column C: verify sum(DP[C]) ≈ CP[C].
+    If mismatch exceeds $1 AND digit-drop repair in STEP 2 was not yet
+    applied → re-run STEP 2 now.
+
+STEP 4 — EXTRACTION WARNING (if repair fails):
+  If a SUSPECT token could not be repaired, add to Metadata:
+    "Extraction Warnings": [
+      "Digit-drop suspected: Col=<ColName>, Row=<RowLabel>,
+       raw=<T>, expected=<sum(DP[C])>"
+    ]
+  Still output the original raw token T — never silently substitute
+  an unverified guess.
+
+ABSOLUTE RULES:
+  - Never accept a CP token on a Total row without running STEP 1.
+  - Never skip this check even if token count = N.
+  - The repair in STEP 2 is arithmetic-confirmed only; never guess.
+===============================================================================
+
+===============================================================================
 H. COA DATAPOINT MAPPING (AUTHORITATIVE)
 The exact mapping rules (mandatory mappings, matching order, fallback rules) for this statement type and sector are provided separately in this message under "SECTOR-SPECIFIC COA MAPPING RULES". Apply those rules exactly as given -- they are authoritative and supersede any general guidance in this prompt about how to derive a COA Datapoint.
 K. TOTAL CHECK STATUS (PLACEHOLDER FIELD — DO NOT CALCULATE)
@@ -356,7 +405,7 @@ Do not write "PASS", "FAIL", "Skipped", or any other value into this field.
 I. OUTPUT SHAPE (STRICT)
 ===============================================================================
 {
-  "Metadata": {"Statement":"...","Issuer Name":"...","FYE":"...","Page No":"...","Currency reported":"USD ($)","Unit":"..."},
+  "Metadata": {"Statement":"...","Issuer Name":"...","FYE":"...","Page No":"...","Currency reported":"USD ($)","Reported in Thousand":"Yes|No","Unit":"..."},
   "Reporting Columns": ["<Enterprise Fund 1>","<Enterprise Fund 2>","...","Total Enterprise Funds","Internal Service Funds"],
   "Sections": {
     "Assets": [rows...],
@@ -366,7 +415,7 @@ I. OUTPUT SHAPE (STRICT)
     "Net Position": [rows...]
   }
 }
-Each row: {"PROP_SNP Items":"...","COA Flag":"...","COA Datapoint":"...","Total Check Status":"", + exactly N column keys matching Reporting Columns strings exactly}
+Each row: {"Row Items":"...","COA Flag":"...","COA Datapoint":"...","Total Check Status":"", + exactly N column keys matching Reporting Columns strings exactly}
 
 ===============================================================================
 J. FINAL SELF-CHECK BEFORE YOU OUTPUT JSON
@@ -388,8 +437,14 @@ downstream in Python.
 OUTPUT VALUES AS STRINGS WITH COMMAS — "1,234,567" not 1234567. Parenthesized negatives as-is: "(1,234)". Never use integers or floats.
 Grand total CP row is LAST row in Net Position section.
 LAST ROW ANCHOR (CRITICAL):
-"Total net position" is typically the LAST row in the Net Position 
-section and therefore the LAST row of the entire JSON output.
+The LAST row of the Net Position section (and the entire JSON output) is:
+  - CP "Net position of business-type activities" / "Net position of primary government"
+    IF the PDF prints trailing reconciliation rows after "Total net position" (see Section D).
+  - Otherwise, "Total net position" is the last row.
+When trailing reconciliation rows ARE printed, emit them in order after "Total net position":
+  1. DP adjustment row → COA Datapoint "Other_Net_Position" (SUM column only; others "-")
+  2. CP grand total → COA Datapoint "Total Net Position" (SUM column only; others "-")
+Never omit these rows when the PDF prints them.
 
 Before closing the final "}]}" of the output, verify:
   1. The last row contains ALL N column keys from Reporting Columns.

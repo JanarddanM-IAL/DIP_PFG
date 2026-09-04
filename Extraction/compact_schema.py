@@ -99,7 +99,40 @@ SECTION_ITEM_LABEL: dict[str, str] = {
     "_PROP_CFS": "PROP_CFS Items",
     "_DSR":      "DSR Items",
     "_DEBT":     "Row Items",
+
+    # ── Notes / RSI / Statistical-Section tabs ──
+    # Header names taken from the consolidated business specification (TAB 1,
+    # 9, 12, 13, 14, 15). CAPITAL_ASSETS reuses the generic "Row Items" label,
+    # matching SNP and DEBT.
+    "_OVERVIEW":       "Overview Item",
+    "_CAPITAL_ASSETS": "Row Items",
+    "_TAX_BASE":       "TAX_BASE Items",
+    "_PEN":            "Pension Items",
+    "_OPEB":           "OPEB Items",
+    "_FAQS":           "Finding",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# CANONICAL STATEMENT-SUFFIX LIST  (single source of truth)
+# ─────────────────────────────────────────────────────────────────────────
+# Before this existed, the same alternation was hand-written into SEVEN
+# regexes across pipeline.py, page_extractor.py, jsonToCsv.py (x2),
+# normalizer.py and backfill_coords.py. Adding a statement type meant editing
+# all seven, and missing one produced a silent mis-parse rather than an error.
+# Import STATEMENT_SUFFIX_ALTERNATION instead of re-typing the list.
+#
+# ORDER IS SIGNIFICANT: sorted LONGEST-FIRST so that regex alternation is
+# greedy in the right direction. With "SNP" ahead of "PROP_SNP", the pattern
+# r"_(SNP|...|PROP_SNP|...)" matches the "_SNP" *inside* "_PROP_SNP", which
+# mis-identifies a PROP_SNP file as SNP and truncates its base name to
+# "<deal>_PROP". Longest-first makes "PROP_SNP" win.
+STATEMENT_SUFFIXES: tuple[str, ...] = tuple(sorted(
+    (s.lstrip("_") for s in SECTION_ITEM_LABEL),
+    key=lambda s: (-len(s), s),
+))
+
+STATEMENT_SUFFIX_ALTERNATION: str = "|".join(STATEMENT_SUFFIXES)
 
 # ─────────────────────────────────────────────────────────────────────────
 # COA FLAG SHORT FORMS  (compresses every row by ~5 chars)

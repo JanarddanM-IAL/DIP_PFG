@@ -67,6 +67,8 @@ Metadata.Page No: MUST be extracted from the PDF filename (NOT from the PDF body
 
 Metadata.Currency reported:
   Normalize to exactly "USD ($)" unless statement explicitly uses another.
+Metadata."Reported in Thousand": "Yes" if the sourced table title shows "(In Thousands)"
+  or "(000s)"; "No" otherwise. Default "No" if the unit scale is not stated.
 
 Metadata.Unit:
   Detect unit from title or header.
@@ -100,13 +102,19 @@ Apply the same C1-C5 rules:
 ===============================================================================
 D. SECTION SPLITTING (FOR GOV_IS)
 ===============================================================================
-Your output MUST include exactly these 5 section keys in this order:
+*** DO NOT STOP AT "TOTAL REVENUES" OR AT "NET CHANGE IN FUND BALANCES" — TRUNCATION BUG ***
+Extraction MUST continue through Expenditures, the Excess CP, Other Financing Sources (Uses),
+Net Change in Fund Balances, AND the full Fund-Balances roll-forward (beginning -> restatements
+-> beginning as restated -> ending). The LAST row of the tab is the ending fund-balance CP.
+
+Your output MUST include exactly these 6 section keys in this order:
 
    Revenues
   Expenditures
   Excess of Revenues Over/Under Expenditures
   Other Financing Sources (Uses)
   Net Change in Fund Balances
+  Fund Balances
 
 SECTION DETECTION RULES:
 
@@ -137,12 +145,40 @@ SECTION DETECTION RULES:
  
 
 5. "Net Change in Fund Balances" section:
-   This is the LAST section of the GOV_IS statement.
-   Contains:
-     - ONE CP row "Net change in fund balances" (or similar).
-       This row is CP because it equals:
-       Excess (deficiency) + Total other financing sources (uses).
-   The table ENDS here. There is NO "Fund Balances" section in GOV_IS.
+   Contains ONE CP row only: "Net change in fund balances" (or similar variant).
+   This row equals: Excess (deficiency) + Total other financing sources (uses).
+   No DPG row for this section. No DP rows.
+
+   DO NOT STOP HERE — continue reading the PDF for the Fund Balances roll-forward below.
+
+6. "Fund Balances" section:
+   The roll-forward of fund balances printed AFTER the Net Change row.
+   *** DO NOT STOP AT "NET CHANGE IN FUND BALANCES" — TRUNCATION BUG ***
+   This section has NO DPG row. Row order (emit in this exact sequence):
+
+   - CP "Fund balances - beginning of year" (or "Fund balances, beginning of year")
+       COA Datapoint = "Fund Balance - Beginning of Year".
+       This is an ANCHOR CP row (a reported opening balance, NOT a sum of DP rows above);
+       leave Total Check Status blank for this row.
+
+   - DP restatement/prior-period-adjustment/accounting-principle rows (CONDITIONAL):
+       Each synonym row printed between the beginning balance and the as-restated subtotal.
+       Synonyms: "Prior period adjustment", "Restatement", "Adjustment to beginning fund
+       balance", "Change in accounting principle", "Cumulative effect of adoption of GASB <nn>",
+       "Correction of an error", "Change in reporting entity".
+       COA Datapoint: match to COA Master ("Prior Period Adjustments" / "Change in Accounting
+       Principle" / "Change in Reporting Entity"); fallback "Other_Fund_Balances".
+       OMIT this row type entirely if none are printed.
+
+   - CP "Fund balances - beginning of year, as restated" (CONDITIONAL)
+       COA Datapoint = "Fund Balance - Beginning of Year, As Restated".
+       Emit ONLY if explicitly printed in the PDF.
+
+   - CP "Fund balances - end of year" (or "Fund balances, end of year") — THE LAST ROW.
+       COA Datapoint = "Fund Balance - End of Year".
+       Equals: (Restated beginning if printed, else beginning) + Net change in fund balances.
+
+   Total Check Status is set to "" on all Fund Balances rows (downstream Python validates).
 
 ===============================================================================
 E. HIERARCHY FLATTENING (PARENT->CHILD PREFIXING)
@@ -174,7 +210,7 @@ STACK RULES:
 
 SPECIAL -- "Current:" group header:
   ALWAYS SKIP "Current:" from the prefix stack. It is a GAAP formatting
-  artifact. However, PRESERVE "Current:" in the GOV_IS Items label for
+  artifact. However, PRESERVE "Current:" in the Row Items label for
   traceability. The COA mapping (Section H) will handle stripping it.
 
 ===============================================================================
@@ -187,9 +223,8 @@ DPG:
     "Revenues", "Expenditures", "Other Financing Sources (Uses)".
   Row Items is exactly the section name.
   All reporting column values = null (JSON null).
-  NOTE: "Excess of Revenues Over/Under Expenditures" and
-  "Net Change in Fund Balances" sections have NO DPG row — they contain
-  only a single CP row each.
+  NOTE: "Excess of Revenues Over/Under Expenditures", "Net Change in Fund Balances",
+  and "Fund Balances" sections have NO DPG row.
 
 CP:
   Rows that are totals/summations. Label typically starts with "Total ".
@@ -205,7 +240,16 @@ G. VALUE EXTRACTION + COLUMN ASSIGNMENT (ANTI-SHIFT GUARANTEE)
 ===============================================================================
 
 G1) EXTRACT VALUES
+G1 — TOKEN SANITY CHECK (run before column assignment):
 
+For any CP ("Total") row token T assigned to column C:
+  Compute floor_estimate = 0.8 × sum(DP tokens already seen in col C)
+  Compute ceil_estimate  = 1.2 × sum(DP tokens already seen in col C)
+
+  If T < floor_estimate OR T > ceil_estimate:
+    Mark T as SUSPECT → trigger G3.4 digit-drop repair.
+
+This catches digit-drops AND digit-insertions before they propagate.
 DASH GLYPH NORMALIZATION (CRITICAL -- RUN BEFORE ALL OTHER STEPS):
 Treat ALL of the following as equivalent dash cell tokens:
   U+002D  -   (hyphen-minus)
@@ -321,6 +365,48 @@ G3.1 ZERO-SUM SAFEGUARD: If addends sum=0, SUM must be "-".
 G3.2 NORMAL SUM VERIFICATION: Verify/repair SUM = sum(addends).
 G3.3 MANDATORY TOTAL RECONCILIATION: After section, sum(DP) must equal CP Total per column.
      If mismatch: identify cause, re-examine, correct.
+===============================================================================
+G3.4  MANDATORY : DIGIT-DROP DETECTION & REPAIR (CRITICAL — RUN ON EVERY CP ROW)
+===============================================================================
+A digit-drop occurs when a PDF text extractor silently drops a character from
+a number (e.g., "16,760,001" → "1,676,001"). The LLM must NOT accept a
+malformed CP token without arithmetic validation.
+
+STEP 1 — PRE-ACCEPTANCE SANITY BOUND (run before column assignment):
+  For every token T on a CP / Total row assigned to column C:
+    floor_estimate = 0.80 × sum(all DP values seen above in column C)
+    ceil_estimate  = 1.20 × sum(all DP values seen above in column C)
+    If T < floor_estimate OR T > ceil_estimate:
+      Mark T as SUSPECT → proceed to STEP 2.
+    Else: accept T as-is.
+
+STEP 2 — DIGIT-DROP REPAIR ATTEMPT (only for SUSPECT tokens):
+  Generate candidates by inserting a single digit (0–9) at every
+  character position in T.
+    - If exactly one candidate matches sum(DP[C]) within $1 → ACCEPT
+      that candidate. Replace T with the repaired value.
+    - If zero or multiple candidates match → keep original T but log it.
+
+STEP 3 — MANDATORY TOTAL RECONCILIATION (G3.3 equivalent):
+  After all rows in a section are assigned:
+    For each column C: verify sum(DP[C]) ≈ CP[C].
+    If mismatch exceeds $1 AND digit-drop repair in STEP 2 was not yet
+    applied → re-run STEP 2 now.
+
+STEP 4 — EXTRACTION WARNING (if repair fails):
+  If a SUSPECT token could not be repaired, add to Metadata:
+    "Extraction Warnings": [
+      "Digit-drop suspected: Col=<ColName>, Row=<RowLabel>,
+       raw=<T>, expected=<sum(DP[C])>"
+    ]
+  Still output the original raw token T — never silently substitute
+  an unverified guess.
+
+ABSOLUTE RULES:
+  - Never accept a CP token on a Total row without running STEP 1.
+  - Never skip this check even if token count = N.
+  - The repair in STEP 2 is arithmetic-confirmed only; never guess.
+  ===============================================================================
 
 G4) No duplication: each PDF value in only one column.
 G5) DPG rows: all values = null (not "-").
@@ -338,6 +424,7 @@ I. JSON OUTPUT FORMAT
     "FYE": "<exact fiscal year end from PDF>",
     "Page No": "<filename-derived page numbers>",
     "Currency reported": "USD ($)",
+    "Reported in Thousand": "Yes|No",
     "Unit": "<Thousands|Millions|Units>"
   },
   "Reporting Columns": [
@@ -348,28 +435,36 @@ I. JSON OUTPUT FORMAT
   ],
   "Sections": {
     "Revenues": [
-      {"COA Flag": "DPG", "GOV_IS Items": "<section name from PDF>", "COA Datapoint": "<matched from master or Other_DPG>", "Total Check Status": "", "<Col1>": null, "<Col2>": null, ...},
-      {"COA Flag": "DP",  "GOV_IS Items": "<line item from PDF>", "COA Datapoint": "<matched from master or Other_<DPGName>>", "Total Check Status": "", "<Col1>": "<value>", ...},
-      {"COA Flag": "CP",  "GOV_IS Items": "<total label from PDF>", "COA Datapoint": "<matched from master or blank>", "Total Check Status": "", "<Col1>": "<value>", ...}
+      {"COA Flag": "DPG", "Row Items": "<section name from PDF>", "COA Datapoint": "<matched from master or Other_DPG>", "Total Check Status": "", "<Col1>": null, "<Col2>": null, ...},
+      {"COA Flag": "DP",  "Row Items": "<line item from PDF>", "COA Datapoint": "<matched from master or Other_<DPGName>>", "Total Check Status": "", "<Col1>": "<value>", ...},
+      {"COA Flag": "CP",  "Row Items": "<total label from PDF>", "COA Datapoint": "<matched from master or blank>", "Total Check Status": "", "<Col1>": "<value>", ...}
     ],
     "Expenditures": [
-      {"COA Flag": "DPG", "GOV_IS Items": "<section name>", "COA Datapoint": "<matched or Other_DPG>", "Total Check Status": "", ...all null...},
-      {"COA Flag": "DP",  "GOV_IS Items": "<line item>", "COA Datapoint": "<matched or Other_<DPGName>>", "Total Check Status": "", ...},
-      {"COA Flag": "CP",  "GOV_IS Items": "<total expenditures label>", "COA Datapoint": "<matched or blank>", "Total Check Status": "", ...},
+      {"COA Flag": "DPG", "Row Items": "<section name>", "COA Datapoint": "<matched or Other_DPG>", "Total Check Status": "", ...all null...},
+      {"COA Flag": "DP",  "Row Items": "<line item>", "COA Datapoint": "<matched or Other_<DPGName>>", "Total Check Status": "", ...},
+      {"COA Flag": "CP",  "Row Items": "<total expenditures label>", "COA Datapoint": "<matched or blank>", "Total Check Status": "", ...},
     ],
     "Excess of Revenues Over/Under Expenditures": [
-      {"COA Flag": "CP",  "GOV_IS Items": "<excess/deficiency label>", "COA Datapoint": "Excess Of Revenues Over/Under Expenditures", "Total Check Status": "", ...}
+      {"COA Flag": "CP",  "Row Items": "<excess/deficiency label>", "COA Datapoint": "Excess Of Revenues Over/Under Expenditures", "Total Check Status": "", ...}
     ],
     "Other Financing Sources (Uses)": [
-      {"COA Flag": "DPG", "GOV_IS Items": "<section name>", "COA Datapoint": "<matched or Other_DPG>", "Total Check Status": "", ...all null...},
-      {"COA Flag": "DP",  "GOV_IS Items": "<line item>", "COA Datapoint": "<matched or Other_<DPGName>>", "Total Check Status": "", ...},
-      {"COA Flag": "CP",  "GOV_IS Items": "<total OFS label>", "COA Datapoint": "<matched or blank>", "Total Check Status": "", ...}
+      {"COA Flag": "DPG", "Row Items": "<section name>", "COA Datapoint": "<matched or Other_DPG>", "Total Check Status": "", ...all null...},
+      {"COA Flag": "DP",  "Row Items": "<line item>", "COA Datapoint": "<matched or Other_<DPGName>>", "Total Check Status": "", ...},
+      {"COA Flag": "CP",  "Row Items": "<total OFS label>", "COA Datapoint": "<matched or blank>", "Total Check Status": "", ...}
     ],
     "Net Change in Fund Balances": [
-      {"COA Flag": "CP",  "GOV_IS Items": "<net change label>", "COA Datapoint": "<matched or blank>", "Total Check Status": "", ...}
+      {"COA Flag": "CP",  "Row Items": "<net change label>", "COA Datapoint": "<matched or blank>", "Total Check Status": "", ...}
+    ],
+    "Fund Balances": [
+      {"COA Flag": "CP", "Row Items": "<fund balances beginning label>", "COA Datapoint": "Fund Balance - Beginning of Year", "Total Check Status": "", ...},
+      {"COA Flag": "DP", "Row Items": "<restatement label>",             "COA Datapoint": "Prior Period Adjustments",          "Total Check Status": "", ...},
+      {"COA Flag": "CP", "Row Items": "<fund balances beginning, as restated label>", "COA Datapoint": "Fund Balance - Beginning of Year, As Restated", "Total Check Status": "", ...},
+      {"COA Flag": "CP", "Row Items": "<fund balances end label>",        "COA Datapoint": "Fund Balance - End of Year",         "Total Check Status": "", ...}
     ]
   }
 }
+NOTE: Restatement DP rows and "as restated" CP row are CONDITIONAL — omit if not printed.
+"Fund balances - end of year" is always the LAST row in the entire JSON output.
 
 
 
@@ -402,15 +497,17 @@ L. FINAL SELF-CHECK BEFORE OUTPUT
 ===============================================================================
 - JSON only (no extra text, no markdown fences).
 - Exactly 3 top-level keys: Metadata, Reporting Columns, Sections.
-- Exactly 5 section keys in order: Revenues, Expenditures,
+- Exactly 6 section keys in order: Revenues, Expenditures,
   Excess of Revenues Over/Under Expenditures,
-  Other Financing Sources (Uses), Net Change in Fund Balances.
+  Other Financing Sources (Uses), Net Change in Fund Balances, Fund Balances.
 - Exactly 3 DPG rows (Revenues, Expenditures, Other Financing Sources (Uses)).
   All column values null.
 - "Excess of Revenues Over/Under Expenditures" has NO DPG row — only one CP row.
   Calculation = Total revenues - Total expenditures.
 - "Net Change in Fund Balances" has NO DPG row — only one CP row.
   Calculation = Excess (deficiency) + Total OFS.
+- "Fund Balances" has NO DPG row. Row order: CP beginning → DP restatement(s) if printed →
+  CP as-restated if printed → CP end of year. "Fund balances - end of year" is the LAST row.
 - Column names and count N fixed once; never change mid-statement.
 - Every row has exactly N column keys matching Reporting Columns strings.
 - Every row has "Total Check Status" field set to "" (empty string), with
@@ -424,5 +521,11 @@ L. FINAL SELF-CHECK BEFORE OUTPUT
               NEVER an invented value.
     DPG rows: MUST be either a value from COA Master OR "Other_DPG".
               NEVER blank "". NEVER an invented value.
-- "Net change in fund balances" is CP no DPG and must be the last row in the last section.
+- "Net change in fund balances" is CP no DPG and is the ONLY row in "Net Change in Fund Balances".
+- "Fund balances - end of year" CP is the LAST row in the entire JSON output (last row of "Fund Balances").
+- "Fund Balances" section beginning CP is an ANCHOR row (opening balance); leave Total Check blank.
+  "as restated" CP = beginning + sum(restatement DPs). "end of year" CP = (as-restated else beginning) + net change.
+  All Total Check Status cells = "" — downstream Python validates.
 - Elimination rows: addends sum = 0, SUM column = "-", output as-is.
+- "Before writing any CP value to output, verify it is ≥ 80% of the sum of its DP column values. If not, flag and attempt repair."
+  

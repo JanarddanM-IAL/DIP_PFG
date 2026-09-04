@@ -9,6 +9,21 @@ A. IDENTIFY THE TARGET TABLE
 Find the "Changes in Long-Term Liabilities" table (may also be titled "Long-Term Liability Activity", "Summary of Changes in Long-Term Debt", "Noncurrent Liabilities Activity", or similar).
 This table always has columns resembling: Beginning Balance | Additions (or Increases/Issued) | Reductions (or Decreases/Maturities/Retirements/Deletions) | Ending Balance | Due Within One Year.
 Ignore debt service requirement tables, individual bond listings, pledged revenue tables, and capital asset tables.
+
+SHORT-TERM DEBT — CAPTURE IN THE SAME MANNER (mandatory):
+In ADDITION to the long-term roll-forward, this tab ALSO captures the entity's SHORT-TERM DEBT
+using the SAME columns, flags, signs, and reconciliation logic. Locate short-term debt wherever
+the audit discloses it — a dedicated "Changes in Short-Term Debt" / "Short-Term Debt Activity" /
+"Short-Term Obligations" note schedule, or short-term lines embedded within the changes-in-
+liabilities note (Tax/Revenue/Bond/Grant Anticipation Notes, temporary/interim/bridge financing,
+lines of credit, commercial paper, warrants payable, and any other obligation due within one year).
+Emit EACH short-term line as its own DP row under the correct Section (Governmental Activities |
+Business-type Activities | Component Units), in printed order, with all five numeric columns
+populated ("-" for empties; Reductions/Maturities stored NEGATIVE), and classify it as COA
+Datapoint "Short-term Debt" per COA category 1.
+If a separate Short-Term Debt schedule prints its own subtotal/total, emit that as a CP row and
+reconcile it exactly as for the long-term schedule. Short-term debt is NEVER dropped merely because
+it sits in a table separate from the long-term roll-forward.
 ===============================================================================
 B. METADATA EXTRACTION
 Extract exactly:
@@ -25,6 +40,8 @@ Metadata.Page No: MUST be extracted from the PDF filename (NOT from the PDF body
   3. Join using comma+space.
   4. Do NOT read printed page number from the PDF content.
 Metadata.Currency reported: "USD ($)" unless explicitly stated otherwise.
+Metadata."Reported in Thousand": "Yes" if the sourced table title shows "(In Thousands)"
+  or "(000s)"; "No" otherwise. Default "No" if the unit scale is not stated.
 ===============================================================================
 C. REPORTING COLUMNS (FIXED — 5 COLUMNS)
 The DEBT schedule always has exactly 5 standard numeric columns.
@@ -71,8 +88,14 @@ E1) Every data row must have these keys:
     }
 
 E2) COA Flag assignment:
-    DPG: Activity header row (e.g., "Governmental Activities", "Business-type Activities").
-         All column values = null (JSON null, NOT "-").
+    DPG: Activity header row (e.g., "Governmental Activities", "Business-type Activities",
+      "General Obligation Bonds", "OWDA Loans - Direct Borrowing",
+      "Other Long-Term Obligations") where NO numeric data exists on that line
+      AND the following line(s) are independent named items, not continuations.
+      All column values = null (JSON null, NOT "-").
+      IMPORTANT: A label line immediately followed by a generic continuation
+      term ("Serial and term bonds", "Premium") is NOT a DPG — apply E9
+      consolidation instead.
     DP:  All individual line item rows with numeric data.
     CP:  Total / subtotal rows (e.g., "Total governmental-type activities",
          "Total business-type activities").
@@ -87,12 +110,136 @@ below is a placeholder field instruction only — do not compute anything.
 E5) Numeric values: remove "$" and commas, output as plain numbers.
     Negative values in parentheses (123,456) → -123456.
     "-" or blank cells → "-" (string).
+===============================================================================
+G3.4  MANDATORY : DIGIT-DROP DETECTION & REPAIR (CRITICAL — RUN ON EVERY CP ROW)
+===============================================================================
+A digit-drop occurs when a PDF text extractor silently drops a character from
+a number (e.g., "16,760,001" → "1,676,001"). The LLM must NOT accept a
+malformed CP token without arithmetic validation.
 
+STEP 1 — PRE-ACCEPTANCE SANITY BOUND (run before column assignment):
+  For every token T on a CP / Total row assigned to column C:
+    floor_estimate = 0.80 × sum(all DP values seen above in column C)
+    ceil_estimate  = 1.20 × sum(all DP values seen above in column C)
+    If T < floor_estimate OR T > ceil_estimate:
+      Mark T as SUSPECT → proceed to STEP 2.
+    Else: accept T as-is.
+
+STEP 2 — DIGIT-DROP REPAIR ATTEMPT (only for SUSPECT tokens):
+  Generate candidates by inserting a single digit (0–9) at every
+  character position in T.
+    - If exactly one candidate matches sum(DP[C]) within $1 → ACCEPT
+      that candidate. Replace T with the repaired value.
+    - If zero or multiple candidates match → keep original T but log it.
+
+STEP 3 — MANDATORY TOTAL RECONCILIATION (G3.3 equivalent):
+  After all rows in a section are assigned:
+    For each column C: verify sum(DP[C]) ≈ CP[C].
+    If mismatch exceeds $1 AND digit-drop repair in STEP 2 was not yet
+    applied → re-run STEP 2 now.
+
+STEP 4 — EXTRACTION WARNING (if repair fails):
+  If a SUSPECT token could not be repaired, add to Metadata:
+    "Extraction Warnings": [
+      "Digit-drop suspected: Col=<ColName>, Row=<RowLabel>,
+       raw=<T>, expected=<sum(DP[C])>"
+    ]
+  Still output the original raw token T — never silently substitute
+  an unverified guess.
+
+ABSOLUTE RULES:
+  - Never accept a CP token on a Total row without running STEP 1.
+  - Never skip this check even if token count = N.
+  - The repair in STEP 2 is arithmetic-confirmed only; never guess.
+===============================================================================
 E6) If a restated/adjusted beginning balance is shown, use the restated value.
 
 E7) If the table spans multiple pages, combine all rows into the correct section.
 
 E8) Do NOT include narrative text, footnotes, or non-tabular content.
+
+===============================================================================
+E9) MULTI-LINE ROW CONSOLIDATION (CRITICAL)
+===============================================================================
+PDF text extraction often splits a single logical data row across two physical
+lines: the first line carries a sub-heading label (with no numbers), and the
+second line carries the numeric data.
+
+DETECTION RULE: If a line L1 has NO numeric values AND the immediately
+following line L2 has numeric values AND L2's label is a generic continuation
+term (e.g., "Serial and term bonds", "Premium", "Bonds", "Notes", "Loans",
+"Principal", or any label that is incomplete/ambiguous without L1's context),
+THEN treat L1 + L2 as ONE single row:
+
+  Combined Row Items = "<L1 label> - <L2 label>"
+  COA Flag           = DP   (never DPG for a combined row)
+  Numeric values     = taken from L2
+
+EXAMPLES:
+  PDF line 1: "Series 2016 Refunding - US 224/CR 95"   (no numbers)
+  PDF line 2: "Serial and term bonds"   645,000  -  (250,000)  395,000  -
+  → Output ONE row:
+    "Row Items": "Series 2016 Refunding - US 224/CR 95 - Serial and term bonds"
+    COA Flag: "DP"
+    Numbers from line 2.
+
+  PDF line 1: "Series 2016 Refunding - US 224/CR 95"   (no numbers)
+  PDF line 2: "Premium"   71,235  -  (24,422)  46,813  -
+  → Output ONE row:
+    "Row Items": "Series 2016 Refunding - US 224/CR 95 - Premium"
+    COA Flag: "DP"
+    Numbers from line 2.
+
+EXCEPTION — Do NOT consolidate if L1 is a true section/activity header such
+as "Governmental Activities", "Business-type Activities", "General Obligation
+Bonds", "OWDA Loans - Direct Borrowing", or "Other Long-Term Obligations"
+where the subsequent line is an INDEPENDENT named line item with its own
+distinct identity (e.g., "Leases payable", "Net pension liability").
+
+True section headers become DPG rows with null values; only ambiguous
+continuation labels trigger consolidation.
+===============================================================================
+===============================================================================
+G3.4  DIGIT-DROP DETECTION & REPAIR (CRITICAL — RUN ON EVERY CP ROW)
+===============================================================================
+A digit-drop occurs when a PDF text extractor silently drops a character from
+a number (e.g., "16,760,001" → "1,676,001"). The LLM must NOT accept a
+malformed CP token without arithmetic validation.
+
+STEP 1 — PRE-ACCEPTANCE SANITY BOUND (run before column assignment):
+  For every token T on a CP / Total row assigned to column C:
+    floor_estimate = 0.80 × sum(all DP values seen above in column C)
+    ceil_estimate  = 1.20 × sum(all DP values seen above in column C)
+    If T < floor_estimate OR T > ceil_estimate:
+      Mark T as SUSPECT → proceed to STEP 2.
+    Else: accept T as-is.
+
+STEP 2 — DIGIT-DROP REPAIR ATTEMPT (only for SUSPECT tokens):
+  Generate candidates by inserting a single digit (0–9) at every
+  character position in T.
+    - If exactly one candidate matches sum(DP[C]) within $1 → ACCEPT
+      that candidate. Replace T with the repaired value.
+    - If zero or multiple candidates match → keep original T but log it.
+
+STEP 3 — MANDATORY TOTAL RECONCILIATION (G3.3 equivalent):
+  After all rows in a section are assigned:
+    For each column C: verify sum(DP[C]) ≈ CP[C].
+    If mismatch exceeds $1 AND digit-drop repair in STEP 2 was not yet
+    applied → re-run STEP 2 now.
+
+STEP 4 — EXTRACTION WARNING (if repair fails):
+  If a SUSPECT token could not be repaired, add to Metadata:
+    "Extraction Warnings": [
+      "Digit-drop suspected: Col=<ColName>, Row=<RowLabel>,
+       raw=<T>, expected=<sum(DP[C])>"
+    ]
+  Still output the original raw token T — never silently substitute
+  an unverified guess.
+
+ABSOLUTE RULES:
+  - Never accept a CP token on a Total row without running STEP 1.
+  - Never skip this check even if token count = N.
+  - The repair in STEP 2 is arithmetic-confirmed only; never guess.
 ===============================================================================
 F. OUTPUT JSON STRUCTURE (EXAMPLE)
 {
@@ -101,7 +248,8 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
     "Issuer Name": "City of Ottumwa",
     "FYE": "30-JUN-2025",
     "Page No": "69",
-    "Currency reported": "USD ($)"
+    "Currency reported": "USD ($)",
+    "Reported in Thousand": "Yes|No"
   },
   "Reporting Columns": [
     "Beginning Balance (Restated)",

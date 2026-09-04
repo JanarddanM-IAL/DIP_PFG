@@ -25,6 +25,7 @@ GEMINI_COST_TABLE: dict[str, tuple[float, float]] = {
     "gemini-2.5-pro":                      (1.25,  10.00),
     "gemini-3.1-flash-lite-preview":       (0.25,   1.50),
     "gemini-3.5-flash":                    (1.50,   9.00),
+    "gemini-3.6-flash":                    (1.50,   7.50),
 }
 
 DEFAULT_COST = (0.075, 0.30)
@@ -32,6 +33,7 @@ DEFAULT_COST = (0.075, 0.30)
 
 # Max output tokens per model family
 MODEL_MAX_OUTPUT: dict[str, int] = {
+    "gemini-3.6-flash":                  65536,
     "gemini-3.5-flash":                  65536,
     "gemini-3.1-flash-lite-preview":     65536,
     "gemini-2.5-pro":                    65536,
@@ -202,7 +204,8 @@ def normalize_one_gemini(
     max_tokens: int,
     page_info: dict | None = None,
     stmt_type: str = "UNKNOWN",
-    coa_map_rules: str = "",           # ← ADD
+    coa_map_rules: str = "",
+    indented_text: str | None = None,       # ← NEW
 ) -> dict:
     """
     Gemini equivalent of pipeline.normalize_one_openai().
@@ -213,7 +216,7 @@ def normalize_one_gemini(
             "usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
         }
     """
-    import time
+    
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
@@ -251,7 +254,14 @@ def normalize_one_gemini(
     # else:
     #     print(f"  Source pages  : [WARN] no page_info provided — Metadata.Page No may be inaccurate")
 
-    # Assemble user text: COA master → page reference → instructions
+    if indented_text is None:
+        try:
+            from pdf_to_indented_text import pdf_to_indented_text as _pit
+            indented_text = _pit(pdf_path)
+        except Exception:
+            indented_text = None
+
+    # Assemble user text: COA master → page reference → indented text → instructions
     user_text_parts = [
         "STANDARD COA MASTER (pipe-delimited):\n"
         "Format: COA Flag | COA Datapoint | Statement | Section\n\n"
@@ -259,8 +269,23 @@ def normalize_one_gemini(
     ]
     if page_ref_block:
         user_text_parts.append(page_ref_block)
+    if indented_text:
+        user_text_parts.append(
+            "INDENTED TEXT EXTRACTION OF THE PDF (HIERARCHY-PRESERVING):\n"
+            "The following is the financial statement text extracted with visual\n"
+            "indentation preserved. Leading spaces indicate hierarchy level:\n"
+            "  0 spaces = root level\n"
+            "  2 spaces = level-1 child\n"
+            "  4 spaces = level-2 grandchild\n"
+            "  6 spaces = total/subtotal row\n\n"
+            "USE THIS INDENTED TEXT (NOT the raw PDF) for Section E hierarchy "
+            "flattening. Trust the leading spaces -- do not override them with "
+            "semantic reasoning about label names.\n\n"
+            "--- BEGIN INDENTED TEXT ---\n"
+            + indented_text
+            + "\n--- END INDENTED TEXT ---"
+        )
     user_text_parts.append("\n".join(instruction_lines))
-
     user_text = "\n\n".join(user_text_parts)
 
     # ── Build PDF part using new SDK ─────────────────────────────────────────
@@ -287,77 +312,46 @@ def normalize_one_gemini(
             response_mime_type="application/json",
         )
 
-        MAX_RETRIES = 5
-        RETRY_DELAYS = [30, 60, 90, 120, 180]
+        try:
+            response = client.models.generate_content(
+                model=use_model,
+                contents=[pdf_part, user_text],
+                config=call_config,
+            )
+        except APIError as e:
+            error_code = getattr(e, "code", None) or getattr(e, "status", "")
+            error_msg  = str(e)
 
-        response = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = client.models.generate_content(
-                    model=use_model,
-                    contents=[pdf_part, user_text],
-                    config=call_config,
-                )
-                break
-            except APIError as e:
-                error_code = getattr(e, "code", None) or getattr(e, "status", "")
-                error_msg  = str(e)
-
-                if "429" in str(error_code) or "RESOURCE_EXHAUSTED" in error_msg.upper():
-                    if attempt < MAX_RETRIES - 1:
-                        retry_after = None
-                        try:
-                            retry_after = int(
-                                getattr(e, "retry_after", None) or
-                                getattr(e, "headers", {}).get("Retry-After", None) or 0
-                            )
-                        except Exception:
-                            pass
-                        delay = retry_after if retry_after and retry_after > 0 else RETRY_DELAYS[attempt]
-                        print(f"  [WARN] Rate limit hit (attempt {attempt+1}/{MAX_RETRIES}). "
-                              f"Retrying in {delay}s ...")
-                        time.sleep(delay)
-                    else:
-                        raise RuntimeError(
-                            f"  Gemini quota exhausted after {MAX_RETRIES} attempts (429).\n"
-                            f"    Check your quota at https://aistudio.google.com\n"
-                        ) from e
-
-                elif any(kw in error_msg.upper() for kw in [
-                    "503", "UNAVAILABLE", "OVERLOADED", "HIGH DEMAND",
-                    "DEADLINE_EXCEEDED", "INTERNAL",
-                ]):
-                    if attempt < MAX_RETRIES - 1:
-                        delay = RETRY_DELAYS[attempt]
-                        print(f"  [WARN] Server error (attempt {attempt+1}/{MAX_RETRIES}). "
-                              f"Retrying in {delay}s ...")
-                        time.sleep(delay)
-                    else:
-                        raise RuntimeError(
-                            f"  Gemini server error after {MAX_RETRIES} attempts.\n"
-                            f"    Last error: {error_msg[:200]}\n"
-                        ) from e
-
-                elif "403" in str(error_code) or "PERMISSION_DENIED" in error_msg.upper():
-                    raise RuntimeError(
-                        "  Gemini API key rejected (PermissionDenied / 403).\n"
-                        "    Check GEMINI_API_KEY is correct and Gemini API is enabled.\n"
-                    ) from e
-
-                elif "401" in str(error_code) or "UNAUTHENTICATED" in error_msg.upper():
-                    raise RuntimeError(
-                        "  Gemini API key invalid or missing (Unauthenticated / 401).\n"
-                    ) from e
-
-                else:
-                    raise RuntimeError(
-                        f"  Gemini API call failed: {type(e).__name__}: {e}"
-                    ) from e
-
-            except Exception as e:
+            if "429" in str(error_code) or "RESOURCE_EXHAUSTED" in error_msg.upper():
+                raise RuntimeError(
+                    "  Gemini quota exhausted / rate limit hit (429).\n"
+                    "    Check your quota at https://aistudio.google.com\n"
+                ) from e
+            elif any(kw in error_msg.upper() for kw in [
+                "503", "UNAVAILABLE", "OVERLOADED", "HIGH DEMAND",
+                "DEADLINE_EXCEEDED", "INTERNAL",
+            ]):
+                raise RuntimeError(
+                    f"  Gemini server busy / unavailable.\n"
+                    f"    Error: {error_msg[:200]}\n"
+                ) from e
+            elif "403" in str(error_code) or "PERMISSION_DENIED" in error_msg.upper():
+                raise RuntimeError(
+                    "  Gemini API key rejected (PermissionDenied / 403).\n"
+                    "    Check GEMINI_API_KEY is correct and Gemini API is enabled.\n"
+                ) from e
+            elif "401" in str(error_code) or "UNAUTHENTICATED" in error_msg.upper():
+                raise RuntimeError(
+                    "  Gemini API key invalid or missing (Unauthenticated / 401).\n"
+                ) from e
+            else:
                 raise RuntimeError(
                     f"  Gemini API call failed: {type(e).__name__}: {e}"
                 ) from e
+        except Exception as e:
+            raise RuntimeError(
+                f"  Gemini API call failed: {type(e).__name__}: {e}"
+            ) from e
 
         # ── Token usage ──────────────────────────────────────────────────────
         usage_meta        = response.usage_metadata
@@ -442,7 +436,7 @@ def normalize_one_gemini(
 
 
     # ── Call with primary model; escalate to gemini-2.5-flash on failure ─────
-    FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"
+    FALLBACK_MODEL = "gemini-2.5-flash"
 
     try:
         return _call_gemini(model)
@@ -463,3 +457,107 @@ def normalize_one_gemini(
                 f"  Primary error  : {str(primary_err)[:200]}\n"
                 f"  Fallback error : {str(fallback_err)[:200]}\n"
             ) from fallback_err
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSOLIDATED EXTRACTION — whole PDF → all statement types in one call
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CONSOLIDATED_STMT_TYPES = [
+    "SNP", "SOA", "GOV_BS", "GOV_IS", "PROP_SNP", "PROP_IS", "PROP_CFS",
+    "DSR", "DEBT", "OVERVIEW", "CAPITAL_ASSETS", "TAX_BASE", "PEN", "OPEB", "FAQS",
+]
+
+
+def normalize_consolidated_gemini(
+    pdf_path: str,
+    prompt_path: str,
+    coa_text: str,
+    model: str,
+    max_tokens: int,
+) -> dict:
+    """
+    Send the WHOLE PDF with the consolidated extraction prompt.
+
+    Returns a dict keyed by statement type:
+      {
+        "SNP":  { "Metadata":{}, "Reporting Columns":[], "Sections":{} },
+        "SOA":  { ... },
+        ...
+        "FAQS": { ... },
+        "_usage": { "prompt_tokens":int, "completion_tokens":int, "total_tokens":int },
+        "_cost_usd": float,
+        "_model": str,
+      }
+    Statement types not present in the PDF have value {"NOT_FOUND": True}.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable is not set."
+        )
+
+    client = genai.Client(api_key=api_key)
+
+    system_prompt = Path(prompt_path).read_text(encoding="utf-8", errors="replace")
+    pdf_bytes     = Path(pdf_path).read_bytes()
+
+    user_text = (
+        "Extract ALL financial statement tables from the attached PDF.\n"
+        "Follow the consolidated prompt exactly.\n"
+        "Return VALID JSON ONLY — no markdown, no fences, no commentary.\n"
+        "Your response starts with { and ends with }.\n\n"
+        "STANDARD COA MASTER (pipe-delimited):\n"
+        "Format: COA Flag | COA Datapoint | Statement | Section\n\n"
+        + coa_text
+    )
+
+    pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+
+    model_max     = _model_max_tokens(model)
+    effective_max = min(max_tokens, model_max)
+
+    call_config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        max_output_tokens=effective_max,
+        temperature=0.0,
+        response_mime_type="application/json",
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=[pdf_part, user_text],
+            config=call_config,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"[CONSOLIDATED] Gemini API call failed: {type(e).__name__}: {e}"
+        ) from e
+
+    usage_meta        = response.usage_metadata
+    prompt_tokens     = getattr(usage_meta, "prompt_token_count",     0) or 0
+    completion_tokens = getattr(usage_meta, "candidates_token_count", 0) or 0
+    total_tokens      = getattr(usage_meta, "total_token_count",      0) or 0
+    cost              = calculate_cost(model, prompt_tokens, completion_tokens)
+
+    raw = _check_finish_reason(response, model)
+    if not raw:
+        raise RuntimeError("[CONSOLIDATED] Gemini returned an empty response.")
+
+    combined = _parse_json(raw)
+
+    # Ensure every expected key is present (add NOT_FOUND for missing ones)
+    for stype in _CONSOLIDATED_STMT_TYPES:
+        if stype not in combined:
+            combined[stype] = {"NOT_FOUND": True}
+
+    combined["_usage"]    = {
+        "prompt_tokens":     prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens":      total_tokens,
+    }
+    combined["_cost_usd"] = cost
+    combined["_model"]    = model
+
+    return combined

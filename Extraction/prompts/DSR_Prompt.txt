@@ -15,6 +15,29 @@ Find the "Debt Service Requirements to Maturity" table. This table shows
 year-by-year (or period-by-period) future principal and interest payments
 for each outstanding debt type.
 
+DEBT-TYPE SCOPE — INCLUDE LEASES & SBITAs ALONGSIDE DEBT (mandatory):
+The outstanding debt types captured are NOT limited to bonds. Capture the year-by-year
+future-payment (debt-service / maturity) requirements for EVERY financing obligation that
+discloses one, INCLUDING: Bonds payable, Loans payable, Notes payable, any Direct Borrowings
+or Direct Placements, Debt payable, AND EQUALLY — Leases payable (GASB 87 lease liabilities)
+and SBITA payable (GASB 96 subscription liabilities). These GASB 87 lease and GASB 96 SBITA
+future-payment schedules are FREQUENTLY printed as their own "Future minimum lease payments" /
+"Future principal and interest — leases" / "SBITA future payments" tables, often adjacent to or
+within the same Long-Term Liabilities note; process them the SAME way (Principal | Interest per
+year/period), decomposed into their own Activity — Debt-Type Sections
+(e.g. "Governmental Activities: Leases Payable", "Business-type Activities: SBITA Payable").
+Never omit a lease or SBITA payout schedule merely because its title says "lease"/"subscription".
+
+A page QUALIFIES as DSR only when ALL THREE conditions hold:
+  CONDITION 1 — ROW LABELS ARE FUTURE FISCAL YEARS WITH DOLLAR AMOUNTS. Each data row starts
+    with a year (2025, 2026 ...) or a year range (2026-2030, 2031-2035) or "Thereafter", AND
+    the NEXT value on that same line is a DOLLAR AMOUNT — not a date.
+    QUALIFIES:     "2025  435,000  116,000  921,085"  (year -> dollar)
+    DOES NOT:      "2020  05/04/20  06/30/40  2.00-4.00"  (year -> date, not dollar)
+  CONDITION 2 — "Principal" appears as a column header.
+  CONDITION 3 — "Interest" appears as a column header (bare "Interest"/"Interest (1)" qualifies;
+    "Interest Rate"/"Interest Rates" does NOT).
+
 Key identifiers:
 - Title contains "Debt Service Requirements" or "Annual Debt Service" or
   "Future Debt Service" or "Debt Service to Maturity" or similar.
@@ -52,6 +75,8 @@ Metadata.Page No: MUST be extracted from the PDF filename (NOT from the PDF body
   - Join using comma+space.
   - Do NOT read printed page number from the PDF content.
 Metadata.Currency reported: "USD ($)" unless explicitly stated otherwise.
+Metadata."Reported in Thousand": "Yes" if the sourced table title shows "(In Thousands)"
+  or "(000s)"; "No" otherwise. Default "No" if the unit scale is not stated.
 
 ===============================================================================
 C. REPORTING COLUMNS (FIXED — 4 COLUMNS, ALWAYS)
@@ -130,9 +155,9 @@ E. ROW EXTRACTION RULES
 
 E1) Every data row must have these keys:
 {
-  "DSR Items": "<label>",
+  "Row Items": "<label>",
   "COA Flag": "<DPG|DP|CP>",
-  "COA Datapoint": "<same as DSR Items — verbatim>",
+  "COA Datapoint": "<same as Row Items — verbatim>",
   "Total Check Status": "<PASS|FAIL|empty string>",
   "Principal": <value>,
   "Interest": <value>,
@@ -142,14 +167,14 @@ E1) Every data row must have these keys:
 
 E2) COA Flag assignment:
 DPG: Section header row — exactly one per section.
-     DSR Items = section name (e.g., "Governmental Activities: General Obligation Bonds").
+     Row Items = section name (e.g., "Governmental Activities: General Obligation Bonds").
      All 4 column values = null (JSON null, NOT "-").
 DP:  Individual year/period rows with numeric data.
 CP:  Total/summary row — exactly one per section (last row in section).
 
 E3) COA Datapoint:
 There is NO COA Master validation for the DSR schedule.
-COA Datapoint = DSR Items (verbatim) for ALL rows (DPG, DP, CP).
+COA Datapoint = Row Items (verbatim) for ALL rows (DPG, DP, CP).
 Never leave COA Datapoint blank.
 
 E4) Year/Period DP row extraction:
@@ -158,7 +183,7 @@ Extract each row exactly as printed in the PDF:
 - Year ranges: "2031-2035", "2036-2040", etc.
   KEEP AS PRINTED — do NOT expand ranges into individual years.
 - Special entries: "2041", "Thereafter", etc.
-- DSR Items = the year/period label exactly as printed.
+- Row Items = the year/period label exactly as printed.
 
 Column values for DP year rows:
 - Principal: extracted value from this debt type's Principal sub-column.
@@ -219,6 +244,49 @@ E10) If the PDF shows a year row where a particular debt type has "-" for
      non-dash value in Principal or Interest for that specific debt type.
 
 ===============================================================================
+G3.4  MANDATORY : DIGIT-DROP DETECTION & REPAIR (CRITICAL — RUN ON EVERY CP ROW)
+===============================================================================
+A digit-drop occurs when a PDF text extractor silently drops a character from
+a number (e.g., "16,760,001" → "1,676,001"). The LLM must NOT accept a
+malformed CP token without arithmetic validation.
+
+STEP 1 — PRE-ACCEPTANCE SANITY BOUND (run before column assignment):
+  For every token T on a CP / Total row assigned to column C:
+    floor_estimate = 0.80 × sum(all DP values seen above in column C)
+    ceil_estimate  = 1.20 × sum(all DP values seen above in column C)
+    If T < floor_estimate OR T > ceil_estimate:
+      Mark T as SUSPECT → proceed to STEP 2.
+    Else: accept T as-is.
+
+STEP 2 — DIGIT-DROP REPAIR ATTEMPT (only for SUSPECT tokens):
+  Generate candidates by inserting a single digit (0–9) at every
+  character position in T.
+    - If exactly one candidate matches sum(DP[C]) within $1 → ACCEPT
+      that candidate. Replace T with the repaired value.
+    - If zero or multiple candidates match → keep original T but log it.
+
+STEP 3 — MANDATORY TOTAL RECONCILIATION (G3.3 equivalent):
+  After all rows in a section are assigned:
+    For each column C: verify sum(DP[C]) ≈ CP[C].
+    If mismatch exceeds $1 AND digit-drop repair in STEP 2 was not yet
+    applied → re-run STEP 2 now.
+
+STEP 4 — EXTRACTION WARNING (if repair fails):
+  If a SUSPECT token could not be repaired, add to Metadata:
+    "Extraction Warnings": [
+      "Digit-drop suspected: Col=<ColName>, Row=<RowLabel>,
+       raw=<T>, expected=<sum(DP[C])>"
+    ]
+  Still output the original raw token T — never silently substitute
+  an unverified guess.
+
+ABSOLUTE RULES:
+  - Never accept a CP token on a Total row without running STEP 1.
+  - Never skip this check even if token count = N.
+  - The repair in STEP 2 is arithmetic-confirmed only; never guess.
+===============================================================================
+
+===============================================================================
 F. OUTPUT JSON STRUCTURE (EXAMPLE)
 ===============================================================================
 {
@@ -227,13 +295,14 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
     "Issuer Name": "City of Ottumwa",
     "FYE": "30-JUN-2022",
     "Page No": "68",
-    "Currency reported": "USD ($)"
+    "Currency reported": "USD ($)",
+    "Reported in Thousand": "Yes|No"
   },
   "Reporting Columns": ["Principal", "Interest", "Premium/Discount", "Total Debt Service"],
   "Sections": {
     "Governmental Activities: General Obligation Bonds": [
       {
-        "DSR Items": "Governmental Activities: General Obligation Bonds",
+        "Row Items": "Governmental Activities: General Obligation Bonds",
         "COA Flag": "DPG",
         "COA Datapoint": "Governmental Activities: General Obligation Bonds",
         "Total Check Status": "",
@@ -243,7 +312,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
         "Total Debt Service": null
       },
       {
-        "DSR Items": "2026",
+        "Row Items": "2026",
         "COA Flag": "DP",
         "COA Datapoint": "2026",
         "Total Check Status": "",
@@ -253,7 +322,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
         "Total Debt Service": "1,861,522"
       },
       {
-        "DSR Items": "2027",
+        "Row Items": "2027",
         "COA Flag": "DP",
         "COA Datapoint": "2027",
         "Total Check Status": "",
@@ -263,7 +332,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
         "Total Debt Service": "1,360,177"
       },
       {
-        "DSR Items": "2028",
+        "Row Items": "2028",
         "COA Flag": "DP",
         "COA Datapoint": "2028",
         "Total Check Status": "",
@@ -273,7 +342,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
         "Total Debt Service": "523,042"
       },
       {
-        "DSR Items": "2029",
+        "Row Items": "2029",
         "COA Flag": "DP",
         "COA Datapoint": "2029",
         "Total Check Status": "",
@@ -283,7 +352,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
         "Total Debt Service": "953,968"
       },
       {
-        "DSR Items": "2030",
+        "Row Items": "2030",
         "COA Flag": "DP",
         "COA Datapoint": "2030",
         "Total Check Status": "",
@@ -293,7 +362,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
         "Total Debt Service": "879,750"
       },
       {
-        "DSR Items": "2031-2035",
+        "Row Items": "2031-2035",
         "COA Flag": "DP",
         "COA Datapoint": "2031-2035",
         "Total Check Status": "",
@@ -303,7 +372,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
         "Total Debt Service": "3,945,746"
       },
       {
-        "DSR Items": "2036-2040",
+        "Row Items": "2036-2040",
         "COA Flag": "DP",
         "COA Datapoint": "2036-2040",
         "Total Check Status": "",
@@ -313,7 +382,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
         "Total Debt Service": "1,382,934"
       },
       {
-        "DSR Items": "Total",
+        "Row Items": "Total",
         "COA Flag": "CP",
         "COA Datapoint": "Total",
         "Total Check Status": "",
@@ -325,7 +394,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
     ],
     "Governmental Activities: General Obligation Notes": [
       {
-        "DSR Items": "Governmental Activities: General Obligation Notes",
+        "Row Items": "Governmental Activities: General Obligation Notes",
         "COA Flag": "DPG",
         "COA Datapoint": "Governmental Activities: General Obligation Notes",
         "Total Check Status": "",
@@ -335,7 +404,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
         "Total Debt Service": null
       },
       {
-        "DSR Items": "2026",
+        "Row Items": "2026",
         "COA Flag": "DP",
         "COA Datapoint": "2026",
         "Total Check Status": "",
@@ -346,7 +415,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
       },
       ...more year rows...
       {
-        "DSR Items": "Total",
+        "Row Items": "Total",
         "COA Flag": "CP",
         "COA Datapoint": "Total",
         "Total Check Status": "",
@@ -358,7 +427,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
     ],
     "Governmental Activities: Total": [
       {
-        "DSR Items": "Governmental Activities: Total",
+        "Row Items": "Governmental Activities: Total",
         "COA Flag": "DPG",
         "COA Datapoint": "Governmental Activities: Total",
         "Total Check Status": "",
@@ -368,7 +437,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
         "Total Debt Service": null
       },
       {
-        "DSR Items": "2026",
+        "Row Items": "2026",
         "COA Flag": "DP",
         "COA Datapoint": "2026",
         "Total Check Status": "",
@@ -379,7 +448,7 @@ F. OUTPUT JSON STRUCTURE (EXAMPLE)
       },
       ...more year rows...
       {
-        "DSR Items": "Total",
+        "Row Items": "Total",
         "COA Flag": "CP",
         "COA Datapoint": "Total",
         "Total Check Status": "",
@@ -457,7 +526,7 @@ I. FINAL SELF-CHECK BEFORE OUTPUT
   DPG is always first. CP "Total" is always last.
   DP rows are in chronological order between DPG and CP.
 - DPG rows: all 4 column values = null (JSON null).
-  DSR Items = section name. COA Datapoint = section name.
+  Row Items = section name. COA Datapoint = section name.
 - DP rows: Premium/Discount = "-" always.
   Total Debt Service = Principal + Interest (calculated).
   No null values. Use "-" for missing/empty.
@@ -466,7 +535,7 @@ I. FINAL SELF-CHECK BEFORE OUTPUT
   No null values. Use "-" for missing/empty.
 - Every row has "Total Check Status": "" (empty string), with NO exceptions —
   this applies to CP, DP, and DPG rows alike. Do not compute or write PASS/FAIL.
-- COA Datapoint = DSR Items for ALL rows. Never blank. Never null.
+- COA Datapoint = Row Items for ALL rows. Never blank. Never null.
 - Year ranges preserved as printed (e.g., "2031-2035", NOT expanded).
 - Column key names EXACTLY match Reporting Columns: "Principal", "Interest",
   "Premium/Discount", "Total Debt Service". No variations.

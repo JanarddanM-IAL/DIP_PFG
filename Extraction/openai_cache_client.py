@@ -199,6 +199,7 @@ def normalize_one_openai_cached(
     response = None
     for attempt in range(1, 4):
         try:
+            
             response = client.chat.completions.create(
                 model=model,
                 max_completion_tokens=max_tokens,   # reasoning models need this

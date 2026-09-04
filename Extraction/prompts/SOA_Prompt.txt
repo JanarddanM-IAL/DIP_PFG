@@ -7,7 +7,7 @@ OUTPUT: VALID JSON ONLY. NO markdown, NO commentary. Top-level keys exactly: {"M
 IMPORTANT — This is a GOVERNMENT-WIDE Statement of Activities (SOA). It reports the net cost of governmental and business-type activities, program revenues, general revenues, transfers, and the resulting change in net position. Key characteristics:
   • TWO-PAGE SPLIT IS VERY COMMON: Page 1 = Functions/Programs column + Expenses + Program Revenues (Charges for Services, Operating Grants, Capital Grants). Page 2 = Net (Expense) Revenue columns + General Revenues + Change in Net Position.
   • COLUMN STRUCTURE: Governmental Activities | Business-type Activities | Total | [Component Unit columns]. "Total" is a SUM column; component unit columns are INDEPENDENT.
-  • TABLE ENDS AT "Change in net position" — do NOT include Net Position beginning, restatements, or Net Position ending rows in the output.
+  • FOUR SECTIONS: General Revenues | Program Revenue | Program Expenses | Change in Net Position. The "Change in Net Position" section captures the net-cost change plus the full net-position roll-forward (Beginning → Restatement(s) if any → Beginning as Restated if restated → Ending). "Net Position - Ending" is the LAST row of the entire output.
   • Functions/Programs rows on Page 1 supply one value each per revenue/expense column. Each is emitted as a DP row within the appropriate sub-section.
 Do NOT confuse with: PROP_IS (enterprise-fund income statement) | GOV_IS (governmental-fund income statement) | SNP / PROP_SNP (balance sheet statements).
 
@@ -41,6 +41,8 @@ Rule:The filename contains a page tag in the format "_p<start>" or "_p<start>-<e
   5. Do NOT use PDF index numbers.
   6. Always prefer filename-derived page numbers.
 Metadata.Currency reported: "USD ($)" unless statement explicitly uses another currency.
+Metadata."Reported in Thousand": "Yes" if the sourced table title shows "(In Thousands)"
+  or "(000s)"; "No" otherwise. Default "No" if the unit scale is not stated.
 Metadata.Unit: detect from title/header. "(Dollars in Thousands)"/"(In Thousands)"->"Thousands" | "(In Millions)"->"Millions" | none->"Units".
 
 ===============================================================================
@@ -61,7 +63,16 @@ C5) Classify columns:
   ADDEND columns: Governmental Activities and Business-type Activities (to the LEFT of SUM).
   INDEPENDENT columns: Component unit columns to the RIGHT of SUM — no arithmetic relationship to SUM. Never include in primary government total arithmetic.
 Record permanently: ColumnNames[1..N], SUM index S (the "Total" column), Addend indices A, Independent indices I.
-
+C6-COMBINED) COMBINED STATEMENT COLUMN CLASSIFICATION:
+  When combined statement detected:
+    SUM column = "Total" (sum of fund columns only).
+    ADDEND columns = all fund columns to the LEFT of Total.
+    INDEPENDENT columns = "Adjustments (Note X)" and "Statement of Activities" 
+      — to the RIGHT of Total. No arithmetic relationship enforced between them 
+      or to Total.
+    HAS_COMPONENT_UNITS = FALSE unless component unit columns explicitly present.
+    CU_MODE = "NONE".
+    TWO-PAGE SPLIT logic (G2-SPLIT) does NOT apply — all data on same page(s).
 C6) COMPONENT UNIT COLUMN DETECTION — TWO MODES (CRITICAL):
 
   SCAN BOTH PAGES for component unit column data. Component unit data appears in TWO possible forms:
@@ -118,13 +129,81 @@ C7) MODE B COLUMN CONSTRUCTION (apply ONLY when CU_MODE = "B"):
 ===============================================================================
 D. SECTION SPLITTING (FOR SOA)
 ===============================================================================
+COMBINED STATEMENT DETECTION (CRITICAL):
+Some PDFs print the Statement of Activities and the Governmental Funds 
+Statement of Revenues, Expenditures, and Changes in Fund Balances 
+side-by-side under a combined title (e.g., "Statement of Activities and 
+Governmental Funds Statement of Revenues, Expenditures, and Changes in 
+Fund Balances").
+
+When detected:
+  • This output covers BOTH the GOV_IS (fund-level) AND the SOA (full-accrual) 
+    content — unlike SNP where you extract only one view.
+  • The GOV_IS content (fund columns) and SOA content (Statement of Activities 
+    column) are extracted TOGETHER into a SINGLE output.
+  • Do NOT use the two-page split logic (G2-SPLIT). There is no Page 1/Page 2 
+    expense vs. revenue split — all columns appear on the same page(s).
+
+DETECTION SIGNALS — combined statement present if ANY of:
+  - Title contains both "Statement of Activities" AND ("Fund Balance" OR 
+    "Revenues, Expenditures")
+  - Columns include fund names (General Fund, Debt Service Fund, Capital 
+    Projects Fund) alongside an "Adjustments" or "Eliminations" column AND 
+    a "Statement of Activities" column
+  - An Adjustments/Eliminations column appears between fund totals and the 
+    Statement of Activities column
+
+COLUMN RULE FOR COMBINED STATEMENTS:
+  Reporting Columns = ALL columns as printed:
+    [General Fund] | [Debt Service Fund] | [Capital Projects Fund] | [Total] | 
+    [Adjustments (Note X)] | [Statement of Activities]
+  LOCK N = number of columns exactly as printed. Never exclude any column.
+  There is NO Governmental Activities / Business-type Activities split.
+  There is NO SUM column in the traditional sense — "Total" is a sum of fund 
+  columns only; "Statement of Activities" is the full-accrual result column.
+
+SECTION RULE FOR COMBINED STATEMENTS:
+  Use the same 3 section keys: General Revenues | Program Revenue | Program Expenses.
+  
+  General Revenues section:
+    - DP rows: all general revenue line items with values across ALL columns.
+    - No Transfers DPG unless explicitly printed.
+    - No CP "Total General Revenues" unless explicitly printed.
+  
+  Program Revenue section:
+    - DPG rows for each sub-section exactly as in standard SOA.
+    - DP rows: one per line item (Charges for Services items).
+    - Values extracted across ALL columns (fund columns + adjustments + SOA).
+    - NO "Component Unit" DP row unless component units are present.
+    - NO business-type DPG with DP rows unless business-type functions listed.
+    - Empty DPG rows (Operating Grants, Capital Grants DPGs) are still emitted 
+      if no line items exist under them.
+  
+  Program Expenses section:
+    - DPG: "Expenses - Governmental Activities" for governmental expense items.
+    - DPG: "Expenses - Business-type Activities" for business-type items (if any).
+    - DP rows: one per expense LINE ITEM as printed (NOT one per function).
+      These are detail rows (Purchased water, Personnel costs, etc.), not 
+      function-level summaries.
+    - Values extracted across ALL columns.
+    - CP "Total expenditures / expenses" (or equivalent as printed).
+    - CP "Net change in fund balances / net position" (or equivalent as printed).
+
+COLUMN ASSIGNMENT FOR COMBINED STATEMENTS:
+  No RULE 1/RULE 2/RULE 3 activity-column logic applies.
+  Each DP row gets values extracted directly from PDF for each column.
+  No special Total = copy-of-one-addend logic.
+  G3.2 normal sum verification applies: Total = sum(fund columns).
+  Adjustments column and Statement of Activities column are INDEPENDENT 
+  of each other — no arithmetic relationship enforced between them.
+  
 Output exactly 3 section keys in order: General Revenues | Program Revenue | Program Expenses
 
 D1) General Revenues section:
-  - DPG row: SOA Items = "General Revenues", COA Flag = DPG, COA Datapoint = "General Revenues", all columns = null.
+  - DPG row: Row Items = "General Revenues", COA Flag = DPG, COA Datapoint = "General Revenues", all columns = null.
     • DP rows: all general revenue line items (property taxes, sales taxes, investment earnings, gain on sale, miscellaneous, etc.)
     • CP "Total General Revenues" — emit ONLY if explicitly printed. May be omitted if statement goes directly to combined total.
-  -  DPG row: SOA Items = "Transfers", COA Flag = DPG, COA Datapoint = "Transfers", all columns = null.
+  -  DPG row: Row Items = "Transfers", COA Flag = DPG, COA Datapoint = "Transfers", all columns = null.
     CONDITIONAL: Emit this DPG and its DP rows ONLY if a Transfers line item is explicitly printed in the PDF.
     If no Transfers line appears anywhere in the statement, OMIT the entire Transfers DPG and its DP row(s).
     • DP row: Transfers line item (one combined row, or split Transfers In / Transfers Out)
@@ -146,18 +225,18 @@ D2) Program Revenue section:
     component unit data exists in the statement.
 
   i) Charges for Services
-     - DPG: SOA Items = "Program Receipts - Charges for Services - Governmental Activities"
+     - DPG: Row Items = "Program Receipts - Charges for Services - Governmental Activities"
        • DP rows: one per governmental function (General government, Public safety, Public works, etc.)
          Values: Governmental Activities = extracted value, Business-type Activities = "-", Total = same as Governmental Activities.
          If a governmental function has no Charges for Services (dash/blank in PDF): Governmental Activities = "-", Total = "0".
          Individual entity columns = "-". "Component Units" aggregate column = "-".
-     - DPG: SOA Items = "Program Receipts - Charges for Services - Business-type Activities"
+     - DPG: Row Items = "Program Receipts - Charges for Services - Business-type Activities"
        • DP rows: one per business-type function (Sewer, Water, Electric, Event Center, Golf, Solid waste, etc.)
          Values: Governmental Activities = "-", Business-type Activities = extracted value, Total = same as Business-type Activities.
          If a business-type function has no value (dash/blank): Business-type Activities = "-", Total = "0".
          Individual entity columns = "-". "Component Units" aggregate column = "-".
      - DP "Component Unit" (ONLY if HAS_COMPONENT_UNITS = TRUE):
-         SOA Items = "Component Unit", COA Flag = DP.
+         Row Items = "Component Unit", COA Flag = DP.
          Governmental Activities = "-", Business-type Activities = "-", Total = "0".
          If CU_MODE = "A": each dedicated CU column = extracted value from Page 2 (or "-" if entity has no value here).
          If CU_MODE = "B": each individual entity column = extracted value from Page 1 for that entity's Charges for Services.
@@ -166,20 +245,20 @@ D2) Program Revenue section:
          Sums ALL DP rows in this sub-section (both DPGs + Component Unit if present).
 
   ii) Operating Grants and Contributions
-     - DPG: SOA Items = "Program Receipts - Operating Grants and Contributions - Governmental Activities"
+     - DPG: Row Items = "Program Receipts - Operating Grants and Contributions - Governmental Activities"
        • DP rows: one per governmental function
          Individual entity columns = "-". "Component Units" aggregate column = "-".
-     - DPG: SOA Items = "Program Receipts - Operating Grants and Contributions - Business-type Activities"
+     - DPG: Row Items = "Program Receipts - Operating Grants and Contributions - Business-type Activities"
        • DP rows: one per business-type function
          Individual entity columns = "-". "Component Units" aggregate column = "-".
      - DP "Component Unit" (ONLY if HAS_COMPONENT_UNITS = TRUE — see Mode B rule above)
      - CP "Total Program Receipts - Operating Grants and Contributions"
 
   iii) Capital Grants and Contributions
-     - DPG: SOA Items = "Program Receipts - Capital Grants and Contributions - Governmental Activities"
+     - DPG: Row Items = "Program Receipts - Capital Grants and Contributions - Governmental Activities"
        • DP rows: one per governmental function
          Individual entity columns = "-". "Component Units" aggregate column = "-".
-     - DPG: SOA Items = "Program Receipts - Capital Grants and Contributions - Business-type Activities"
+     - DPG: Row Items = "Program Receipts - Capital Grants and Contributions - Business-type Activities"
        • DP rows: one per business-type function
          Individual entity columns = "-". "Component Units" aggregate column = "-".
      - DP "Component Unit" (ONLY if HAS_COMPONENT_UNITS = TRUE — see Mode B rule above)
@@ -193,10 +272,10 @@ D3) Program Expenses section:
   The PDF prints the expense group headers in many inconsistent ways. ALWAYS replace with the fixed canonical label:
 
   ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ ANY PDF text that identifies the GOVERNMENTAL expense group → SOA Items MUST be:            │
+  │ ANY PDF text that identifies the GOVERNMENTAL expense group → Row Items MUST be:            │
   │   "Expenses - Governmental Activities"                                                      │
   │                                                                                             │
-  │ ANY PDF text that identifies the BUSINESS-TYPE expense group → SOA Items MUST be:           │
+  │ ANY PDF text that identifies the BUSINESS-TYPE expense group → Row Items MUST be:           │
   │   "Expenses - Business-type Activities"                                                     │
   └─────────────────────────────────────────────────────────────────────────────────────────────┘
 
@@ -215,24 +294,24 @@ D3) Program Expenses section:
   "Expenses - Business-type Activities"  → "Expenses - Business-type Activities"  (already correct)
   "Program Expenses - Business-type"     → "Expenses - Business-type Activities"
 
-  ✗ WRONG:  "SOA Items": "Governmental activities"
-  ✗ WRONG:  "SOA Items": "Business-type activities"
-  ✓ CORRECT: "SOA Items": "Expenses - Governmental Activities"
-  ✓ CORRECT: "SOA Items": "Expenses - Business-type Activities"
+  ✗ WRONG:  "Row Items": "Governmental activities"
+  ✗ WRONG:  "Row Items": "Business-type activities"
+  ✓ CORRECT: "Row Items": "Expenses - Governmental Activities"
+  ✓ CORRECT: "Row Items": "Expenses - Business-type Activities"
 
 D3) Program Expenses section:
-  - DPG: SOA Items = "Expenses - Governmental Activities"  ← HARD REQUIREMENT. See normalization table above.
+  - DPG: Row Items = "Expenses - Governmental Activities"  ← HARD REQUIREMENT. See normalization table above.
       COA Datapoint = "Program Expenses - Governmental Activities".
     • DP rows: one per governmental function (General government, Public safety, Public works, Health and social services, Culture and recreation, Economic development, Interest and fiscal charges, etc.)
       Values: Governmental Activities = extracted expense value, Business-type Activities = "-", Total = same as Governmental Activities.
       Individual entity columns = "-". "Component Units" aggregate column = "-".
-  - DPG: SOA Items = "Expenses - Business-type Activities"  ← HARD REQUIREMENT. See normalization table above.
+  - DPG: Row Items = "Expenses - Business-type Activities"  ← HARD REQUIREMENT. See normalization table above.
       COA Datapoint = "Program Expenses - Business-type Activities".
     • DP rows: one per business-type function (Sewer, Water, Electric, Event Center, Golf, Solid waste, etc.)
       Values: Governmental Activities = "-", Business-type Activities = extracted expense value, Total = same as Business-type Activities.
       Individual entity columns = "-". "Component Units" aggregate column = "-".
   - DP "Component Unit" (ONLY if HAS_COMPONENT_UNITS = TRUE — see rule in C6):
-      SOA Items = "Component Unit", COA Flag = DP.
+      Row Items = "Component Unit", COA Flag = DP.
       Governmental Activities = "-", Business-type Activities = "-", Total = "0".
       If CU_MODE = "A": each dedicated CU column = extracted expense value for that entity.
       If CU_MODE = "B": each individual entity column = extracted Expenses value from Page 1 for that entity.
@@ -242,10 +321,56 @@ D3) Program Expenses section:
       Sums ALL DP rows under BOTH expense DPGs + Component Unit DP (if present).
       The CP row carries values in ALL N columns as read directly from the PDF.
       For CU_MODE = "B": "Component Units" aggregate = as printed on Page 2; individual entity columns = as derivable from Page 1.
-  - CP "Change in net position": LAST row of this section and of the entire output.
-      Carry all N column values as printed on the PDF.
-      For CU_MODE = "B": "Component Units" aggregate = as printed on Page 2; individual entity columns = "-" unless derivable.
-      Total Check Status for this row is left as "" — see Section K.
+    CP ROWS IN CU_MODE = "B" — INDIVIDUAL ENTITY COLUMNS (CRITICAL):
+      For ALL CP rows (Total Program Receipts - Charges for Services,
+      Total Program Receipts - Operating Grants and Contributions,
+      Total Program Receipts - Capital Grants and Contributions,
+      Total Expenses, Change in net position):
+
+        Individual entity columns (<Entity 1..M>) = "-"
+        ALWAYS. No exceptions.
+
+        The PDF only prints the aggregate "Component Units" total in CP rows —
+        it does NOT break down CP values per individual entity.
+        NEVER place the aggregate Component Units CP value into an individual
+        entity column. It belongs ONLY in the "Component Units" aggregate column.
+
+        "Component Units" aggregate column = extract from PDF as printed.
+
+D4) Change in Net Position section:
+  Emit in this EXACT order. Every row in this section carries Section = "Change in Net Position".
+  All column values come from the PDF as printed (nearest-center per G2-MAP):
+
+  - CP "Change in net position"  → COA Datapoint "Changes in Net Position"
+      Carry all N printed column values (primary government + any CU columns as printed).
+
+  - CP "Net Position - Beginning"  → COA Datapoint "Net Position - Beginning of Year"
+      The beginning-of-year net position balance. Carry all N printed column values.
+      This is a BALANCE row (reported anchor), NOT a sum of DP rows above — do NOT apply
+      the 0.80×/1.20× digit-drop bound to it; reconcile via roll-forward arithmetic instead.
+
+  - DP restatement/prior-period-adjustment/accounting-principle lines(s)
+      → COA Datapoint "Restatements and Prior Period Adjustments"
+      CONDITIONAL: emit ONE DP per printed adjustment line (Row Items = exact printed caption).
+      Synonyms include: "Restatement", "Prior period adjustment", "Correction of an error",
+      "Change in accounting principle", "Cumulative effect of adoption of GASB <nn>",
+      "Change in reporting entity". OMIT this row type entirely if none are printed.
+
+  - CP "Net Position - Beginning, as Restated"
+      → COA Datapoint "Net Position - Beginning of Year (Restated)"
+      CONDITIONAL: emit ONLY if a restated-beginning subtotal is explicitly printed.
+
+  - CP "Net Position - Ending"  → COA Datapoint "Net Position - End of Year"
+      THE LAST ROW OF THE ENTIRE SECTIONS OUTPUT.
+      Carry all N printed column values.
+      Caption recognition is MEANING-based (case-insensitive; ignore trailing colons/footnote
+      marks). Issuer wording varies ("Net assets, beginning of year"; "Net position, <date>";
+      "Ending net position"; "Cumulative effect of change in accounting principle") — classify
+      to the correct roll-forward datapoint above; never drop a printed roll-forward line.
+
+  NET-POSITION IDENTITY CHECK (used by downstream Python; do NOT write into Total Check Status):
+  For EACH reporting column: Net Position - Ending == (Beginning as Restated if printed else
+  Beginning) + Change in net position.
 
 ===============================================================================
 E. HIERARCHY FLATTENING (PARENT->CHILD PREFIXING)
@@ -269,7 +394,7 @@ SAME-LEVEL POP: Data row at indent == stack_top.indent -> pop stack_top first.
 NO SEMANTIC OVERRIDES: Never pop based on label words. Only indent level triggers pops.
 PRE-PREFIXED LABELS: If line already contains ":" separator, treat as already-correct; no additional prefix.
 
-SOA-SPECIFIC NOTE: Function/program rows (General government, Public safety, Sewer, etc.) are at uniform indent. Their PDF group headers ("Governmental activities:", "Business-type activities:") are TYPE A — they set the DPG context but are NOT emitted as data rows. The function rows are DP rows emitted directly with the function name as SOA Items (no colon-prefix is added because the DPG is already captured as a separate DPG row).
+SOA-SPECIFIC NOTE: Function/program rows (General government, Public safety, Sewer, etc.) are at uniform indent. Their PDF group headers ("Governmental activities:", "Business-type activities:") are TYPE A — they set the DPG context but are NOT emitted as data rows. The function rows are DP rows emitted directly with the function name as Row Items (no colon-prefix is added because the DPG is already captured as a separate DPG row).
 
 ===============================================================================
 F. COA FLAG RULES
@@ -286,17 +411,25 @@ DPG: Section/group header rows. All column values = null (JSON null, not "-" and
                       "Program Receipts - Capital Grants and Contributions - Governmental Activities" | "Program Receipts - Capital Grants and Contributions - Business-type Activities"
   [Program Expenses]  "Expenses - Governmental Activities" | "Expenses - Business-type Activities"
     NORMALIZATION REQUIRED: "Governmental activities" and "Business-type activities" (raw PDF text) are
-    FORBIDDEN as SOA Items values. They MUST be replaced with the fixed labels above before output.
+    FORBIDDEN as Row Items values. They MUST be replaced with the fixed labels above before output.
   PDF group headers like "Governmental activities:" or "Business-type activities:" are TYPE A — they set context only, NOT emitted as DPG rows.
 CP: Totals/subtotal rows. All POSSIBLE CP rows (emit only if explicitly printed in the PDF):
-    "Total General Revenues" (if printed separately) | "Total General Revenues and Transfer" (if printed separately) |
-    "Total Program Receipts - Charges for Services" | "Total Program Receipts - Operating Grants and Contributions" | "Total Program Receipts - Capital Grants and Contributions" |
-    "Total Expenses" | "Change in net position"
+    [General Revenues section] "Total General Revenues" | "Total General Revenues and Transfer"
+    [Program Revenue section]  "Total Program Receipts - Charges for Services" |
+                               "Total Program Receipts - Operating Grants and Contributions" |
+                               "Total Program Receipts - Capital Grants and Contributions"
+    [Program Expenses section] "Total Expenses"
+    [Change in Net Position section]
+      "Change in net position" | "Net Position - Beginning" |
+      "Net Position - Beginning, as Restated" (conditional — only if printed) |
+      "Net Position - Ending"  ← LAST row of the entire output
 
 DP: All other data rows (leaf items with actual values). MUST have COA Datapoint.
   Includes: all function/program rows, general revenue items, transfer items.
   Includes "Component Unit" row ONLY when HAS_COMPONENT_UNITS = TRUE (see Section C6).
   NEVER emit a "Component Unit" DP row when HAS_COMPONENT_UNITS = FALSE.
+  Includes restatement/prior-period-adjustment lines in the "Change in Net Position" section
+  (CONDITIONAL — only when printed; see D4).
 
 ===============================================================================
 G. VALUE EXTRACTION + COLUMN ASSIGNMENT
@@ -345,7 +478,7 @@ RULE 3 — ALL-DASH ROW (no value in either activity column): Function has no pr
   "Component Units" aggregate column = "-"  (only applicable when HAS_COMPONENT_UNITS = TRUE)
 
 RULE 4 — COMPONENT UNIT DP ROW (ONLY when HAS_COMPONENT_UNITS = TRUE):
-  SOA Items = "Component Unit" (always this generic label, NOT the entity names)
+  Row Items = "Component Unit" (always this generic label, NOT the entity names)
   COA Flag = DP
   Governmental Activities = "-"
   Business-type Activities = "-"
@@ -473,6 +606,48 @@ G3.3 MANDATORY TOTAL RECONCILIATION: After all rows assigned, for each column: s
 G4) No duplication: each PDF value in only one column.
 G5) DPG rows: all values = null (JSON null, NOT "-" and NOT "").
 
+===============================================================================
+G3.4  MANDATORY : DIGIT-DROP DETECTION & REPAIR (CRITICAL — RUN ON EVERY CP ROW)
+===============================================================================
+A digit-drop occurs when a PDF text extractor silently drops a character from
+a number (e.g., "16,760,001" → "1,676,001"). The LLM must NOT accept a
+malformed CP token without arithmetic validation.
+
+STEP 1 — PRE-ACCEPTANCE SANITY BOUND (run before column assignment):
+  For every token T on a CP / Total row assigned to column C:
+    floor_estimate = 0.80 × sum(all DP values seen above in column C)
+    ceil_estimate  = 1.20 × sum(all DP values seen above in column C)
+    If T < floor_estimate OR T > ceil_estimate:
+      Mark T as SUSPECT → proceed to STEP 2.
+    Else: accept T as-is.
+
+STEP 2 — DIGIT-DROP REPAIR ATTEMPT (only for SUSPECT tokens):
+  Generate candidates by inserting a single digit (0–9) at every
+  character position in T.
+    - If exactly one candidate matches sum(DP[C]) within $1 → ACCEPT
+      that candidate. Replace T with the repaired value.
+    - If zero or multiple candidates match → keep original T but log it.
+
+STEP 3 — MANDATORY TOTAL RECONCILIATION (G3.3 equivalent):
+  After all rows in a section are assigned:
+    For each column C: verify sum(DP[C]) ≈ CP[C].
+    If mismatch exceeds $1 AND digit-drop repair in STEP 2 was not yet
+    applied → re-run STEP 2 now.
+
+STEP 4 — EXTRACTION WARNING (if repair fails):
+  If a SUSPECT token could not be repaired, add to Metadata:
+    "Extraction Warnings": [
+      "Digit-drop suspected: Col=<ColName>, Row=<RowLabel>,
+       raw=<T>, expected=<sum(DP[C])>"
+    ]
+  Still output the original raw token T — never silently substitute
+  an unverified guess.
+
+ABSOLUTE RULES:
+  - Never accept a CP token on a Total row without running STEP 1.
+  - Never skip this check even if token count = N.
+  - The repair in STEP 2 is arithmetic-confirmed only; never guess.
+===============================================================================
 
 ===============================================================================
 H. COA DATAPOINT MAPPING (AUTHORITATIVE)
@@ -502,15 +677,23 @@ Do not write "PASS", "FAIL", "Skipped", or any other value into this field.
 I. OUTPUT SHAPE (STRICT)
 ===============================================================================
 {
-  "Metadata": {"Statement":"...","Issuer Name":"...","FYE":"...","Page No":"...","Currency reported":"USD ($)","Unit":"..."},
+  "Metadata": {"Statement":"...","Issuer Name":"...","FYE":"...","Page No":"...","Currency reported":"USD ($)","Reported in Thousand":"Yes|No","Unit":"..."},
   "Reporting Columns": ["Governmental Activities","Business-type Activities","Total","<Entity 1>","<Entity 2>","...","Component Units"],
   "Sections": {
     "General Revenues": [rows...],
     "Program Revenue": [rows...],
-    "Program Expenses": [rows...]
+    "Program Expenses": [rows...],
+    "Change in Net Position": [rows...]
   }
 }
-Each row: {"SOA Items":"...","COA Flag":"...","COA Datapoint":"...","Total Check Status":"", + exactly N column keys matching Reporting Columns strings exactly}
+Each row: {"Row Items":"...","COA Flag":"...","COA Datapoint":"...","Total Check Status":"", + exactly N column keys matching Reporting Columns strings exactly}
+
+"Change in Net Position" section row order (see D4):
+  CP "Change in net position"  → COA Datapoint "Changes in Net Position"
+  CP "Net Position - Beginning"  → COA Datapoint "Net Position - Beginning of Year"
+  DP restatement line(s) (conditional)  → COA Datapoint "Restatements and Prior Period Adjustments"
+  CP "Net Position - Beginning, as Restated" (conditional)  → "Net Position - Beginning of Year (Restated)"
+  CP "Net Position - Ending"  → COA Datapoint "Net Position - End of Year"  ← LAST ROW
 
 For CU_MODE = "B", the column key order in each row must be:
   "Governmental Activities", "Business-type Activities", "Total", "<Entity 1>", "<Entity 2>", ..., "Component Units"
@@ -518,8 +701,9 @@ For CU_MODE = "B", the column key order in each row must be:
 ===============================================================================
 J. FINAL SELF-CHECK BEFORE YOU OUTPUT JSON
 ===============================================================================
-JSON only (no extra text). Exactly 3 top-level keys.
-9 or 10 DPG rows total (9 if no Transfers in PDF; 10 if Transfers explicitly printed).
+JSON only (no extra text). Exactly 3 top-level keys: Metadata, Reporting Columns, Sections.
+Exactly 4 section keys in order: "General Revenues" | "Program Revenue" | "Program Expenses" | "Change in Net Position".
+9 or 10 DPG rows total (9 if no Transfers in PDF; 10 if Transfers explicitly printed). "Change in Net Position" section has NO DPG row.
 All DPG rows have all column values = null.
 Column names/count fixed once; never change mid-output. Every data row has exactly N column keys.
 Function/program DP rows (primary government): one activity column has a value, the other = "-", Total = copy of the value column. Exception: when both are "-", Total = "0". Individual entity columns = "-". "Component Units" aggregate = "-".
@@ -542,7 +726,8 @@ GENERAL REVENUES SECTION — FINAL CHECK (CU_MODE = "B"):
 Transfers DP row: negative in Governmental Activities (plain dash-prefix string), positive in Business-type Activities, Total = "0". Individual entity columns = "-". "Component Units" = "-".
 Total column for elimination rows (addends sum to 0): "0" — NEVER "-".
 Section boundaries: General Revenues ends at "Total General Revenues and Transfer" (if printed),
-  or "Total General Revenues" (if printed without Transfer), or the last DP row if neither CP is printed;
+  or "Total General Revenues" (if printed without Transfer), or the last DP row if neither CP is printed.
+  Program Expenses ends at "Total Expenses". Change in Net Position ends at "Net Position - Ending".
 Transfers DPG and "Total General Revenues and Transfer" CP are CONDITIONAL:
   only emit if explicitly printed in the PDF. If no Transfers line and no
   combined total row appear, the General Revenues section ends at "Total
@@ -553,7 +738,20 @@ Every row (CP, DP, DPG) has "Total Check Status": "" (empty string). Do not
 compute or write PASS/FAIL/Skipped — arithmetic validation, including the
 "Change in net position" formula, is performed downstream in Python.
 All values output as STRINGS WITH COMMAS — "1,234,567" not 1234567. Parenthesized negatives as-is: "(1,234)". Plain negatives as-is: "-2,577,907". Never use integers or floats.
-"Change in net position" is the LAST row in Program Expenses section and in the entire Sections output.
-Program Expenses DPG SOA Items are FIXED — "Expenses - Governmental Activities" and "Expenses - Business-type Activities".
-NEVER output "Governmental activities" or "Business-type activities" as a DPG SOA Items value.
-Table ends at "Change in net position" — do NOT include Net Position beginning, restatements, or Net Position ending rows.
+"Total Expenses" is the LAST CP row in the Program Expenses section.
+"Change in Net Position" is the FOURTH and LAST section. Its rows in order: CP "Change in net position" → CP "Net Position - Beginning" → DP restatement(s) if any → CP "Net Position - Beginning, as Restated" if printed → CP "Net Position - Ending". "Net Position - Ending" is the LAST row of the entire Sections output.
+Program Expenses DPG Row Items are FIXED — "Expenses - Governmental Activities" and "Expenses - Business-type Activities".
+NEVER output "Governmental activities" or "Business-type activities" as a DPG Row Items value.
+NET-POSITION IDENTITY: for each column, Ending == (Restated Beginning if printed else Beginning) + Change in net position. This check is performed downstream in Python; set "Total Check Status": "" on all rows.
+☐ COMBINED STATEMENT CHECK: If source was a combined GOV_IS + SOA page:
+    - Reporting Columns = fund columns + Total + Adjustments + Statement of Activities.
+    - No Governmental Activities / Business-type Activities column names used.
+    - Program Expenses DPs are line items (Personnel costs, Purchased water, etc.)
+      NOT function names (General government, Public safety, etc.).
+    - Two-page split logic was NOT applied.
+    - Total column = sum(fund columns) for each row.
+    - Statement of Activities column values extracted as-is (not computed).
+    - No "Component Unit" DP rows emitted (HAS_COMPONENT_UNITS = FALSE).
+☐ CU_MODE = "B" CP ROWS: All individual entity columns = "-" in every
+  CP row. The aggregate CP value goes ONLY into the "Component Units"
+  column, never into individual entity columns.

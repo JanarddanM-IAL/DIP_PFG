@@ -17,6 +17,7 @@ CACHE CONTENTS (constant per stmt_type):
 FRESH CONTENT (varies per call):
   • The PDF (file bytes)
   • The page reference block ("Source pages: page 47" etc.)
+  • The indented text extraction (hierarchy-preserving, per PDF)
 
 This maximizes the cached prefix length → bigger savings per call.
 """
@@ -102,6 +103,7 @@ def _build_cached_text(stmt_type, prompt_text, coa_text,
         parts.append(json.dumps(reporting_columns, indent=2))
     return "\n".join(parts)
 
+
 def _content_hash(text: str) -> str:
     """Short hash to invalidate cache when prompt/COA content changes."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
@@ -116,17 +118,17 @@ def _get_or_create_cache(stmt_type, prompt_text, coa_text,
     """
     cached_text = _build_cached_text(
         stmt_type, prompt_text, coa_text, reporting_columns,
-        coa_map_rules=coa_map_rules,   # ← ADD
+        coa_map_rules=coa_map_rules,
     )
     chash = _content_hash(cached_text)
     key = f"{stmt_type}|{model}|{chash}"
-    
+
     with _REGISTRY_LOCK:
         if key in _CACHE_REGISTRY:
             print(f"   [CACHE REUSE] {stmt_type} ({model}) → "
                   f"{_CACHE_REGISTRY[key][-20:]}")
             return _CACHE_REGISTRY[key]
-    
+
     # Create new cache
     try:
         client = _client()
@@ -147,11 +149,11 @@ def _get_or_create_cache(stmt_type, prompt_text, coa_text,
         raise CacheUnavailableError(
             f"Cannot create cache for {stmt_type} on {model}: {e}"
         ) from e
-    
+
     cache_name = cache.name
     print(f"   [CACHE NEW] {stmt_type} ({model}) → "
           f"{cache_name[-20:]}  TTL=6h  content_hash={chash}")
-    
+
     with _REGISTRY_LOCK:
         _CACHE_REGISTRY[key] = cache_name
     return cache_name
@@ -165,16 +167,16 @@ def _calc_cost(model: str,
                cached_tokens: int,
                completion_tokens: int) -> tuple[float, str]:
     """Returns (cost_usd, breakdown_string)."""
-    in_rate, out_rate     = GEMINI_NORMAL_RATES.get(model, (1.50, 9.00))
-    c_in_rate, _          = GEMINI_CACHED_RATES.get(model, (in_rate * 0.25, out_rate))
-    
+    in_rate, out_rate = GEMINI_NORMAL_RATES.get(model, (1.50, 9.00))
+    c_in_rate, _      = GEMINI_CACHED_RATES.get(model, (in_rate * 0.25, out_rate))
+
     fresh = max(0, prompt_tokens - cached_tokens)
-    
+
     fresh_cost  = (fresh             / 1_000_000) * in_rate
     cached_cost = (cached_tokens     / 1_000_000) * c_in_rate
     output_cost = (completion_tokens / 1_000_000) * out_rate
     total       = fresh_cost + cached_cost + output_cost
-    
+
     ratio = (cached_tokens / prompt_tokens * 100) if prompt_tokens else 0
     breakdown = (
         f"cached={cached_tokens:,}({ratio:.0f}%) "
@@ -185,56 +187,94 @@ def _calc_cost(model: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# MAIN ENTRY POINT — Sends ONLY the PDF + page_info fresh
+# MAIN ENTRY POINT — Sends PDF + page_info + indented_text fresh
 # ─────────────────────────────────────────────────────────────────────────
 def normalize_one_gemini_cached(
-    pdf_path, prompt_path, coa_text, reporting_columns,
-    model, max_tokens, page_info=None,
+    pdf_path,
+    prompt_path,
+    coa_text,
+    reporting_columns,
+    model,
+    max_tokens,
+    page_info=None,
     stmt_type="UNKNOWN",
-    coa_map_rules: str = "",           # ← ADD
+    coa_map_rules: str = "",
+    indented_text: str | None = None,      # ← NEW: pre-extracted indented text
 ) -> dict:
     """
     PAID-tier Gemini call using context caching.
-    
-    Sends ONLY the PDF + page reference as fresh content.
+
+    Sends ONLY the PDF + page reference + indented text as fresh content.
     Everything else (system prompt, compact instruction, COA, reporting
     columns) is in the cache → ~75% input discount.
+
+    indented_text — pass the output of pdf_to_indented_text_from_words()
+    from pipeline.py's single pdfplumber open.  When None, this function
+    falls back to calling pdf_to_indented_text() itself (one extra open).
     """
     from gemini_client import (
         _parse_json,
         _check_finish_reason,
         _build_page_reference_block,
     )
-    
+
     pdf_name = Path(pdf_path).name
-    
+
     # Read prompt file
     prompt_text = Path(prompt_path).read_text(encoding="utf-8", errors="replace")
-    
-    # Get or create the cache (constant content)
+
+    # Get or create the cache (constant content — no indented_text here)
     cache_name = _get_or_create_cache(
         stmt_type=stmt_type,
         prompt_text=prompt_text,
         coa_text=coa_text,
         reporting_columns=reporting_columns,
         model=model,
-        coa_map_rules=coa_map_rules,   # ← ADD
+        coa_map_rules=coa_map_rules,
     )
-    
-    # ─── Build FRESH content: only PDF + page reference ───
+
+    # ── Fallback: extract indented text if not pre-supplied ───────────────
+    # Use pre-extracted indented_text if provided; only open pdfplumber as fallback.
+    if indented_text is None:
+        try:
+            from pdf_to_indented_text import pdf_to_indented_text as _pit
+            indented_text = _pit(pdf_path)
+        except Exception:
+            indented_text = None
+
+    # ── Build FRESH content: page reference + indented text + PDF ─────────
     fresh_parts = []
-    
+
     page_ref = _build_page_reference_block(page_info)
     if page_ref:
         fresh_parts.append(types.Part.from_text(text=page_ref))
-    
+
+    if indented_text:
+        fresh_parts.append(types.Part.from_text(
+            text=(
+                "INDENTED TEXT EXTRACTION OF THE PDF (HIERARCHY-PRESERVING):\n"
+                "The following is the financial statement text extracted with visual\n"
+                "indentation preserved. Leading spaces indicate hierarchy level:\n"
+                "  0 spaces = root level\n"
+                "  2 spaces = level-1 child\n"
+                "  4 spaces = level-2 grandchild\n"
+                "  6 spaces = total/subtotal row\n\n"
+                "USE THIS INDENTED TEXT (NOT the raw PDF) for Section E hierarchy "
+                "flattening. Trust the leading spaces -- do not override them with "
+                "semantic reasoning about label names.\n\n"
+                "--- BEGIN INDENTED TEXT ---\n"
+                + indented_text
+                + "\n--- END INDENTED TEXT ---"
+            )
+        ))
+
     fresh_parts.append(
         types.Part.from_bytes(
             data=Path(pdf_path).read_bytes(),
             mime_type="application/pdf",
         )
     )
-    
+
     fresh_parts.append(
         types.Part.from_text(
             text="\nExtract per the cached system prompt. "
@@ -242,8 +282,8 @@ def normalize_one_gemini_cached(
                  "'COMPACT OUTPUT INSTRUCTION' section of the cache."
         )
     )
-    
-    # ─── Make the call using the cache ───
+
+    # ── Make the call using the cache ─────────────────────────────────────
     try:
         client = _client()
         response = client.models.generate_content(
@@ -269,27 +309,27 @@ def normalize_one_gemini_cached(
                 f"Cache expired or invalid for {stmt_type}: {e}"
             ) from e
         raise
-    
-    # ─── Parse response ───
+
+    # ── Parse response ────────────────────────────────────────────────────
     raw = _check_finish_reason(response, model)
     data = _parse_json(raw)
     data = expand_compact_json(data, stmt_type)
-    
-    # ─── Extract usage stats ───
+
+    # ── Extract usage stats ───────────────────────────────────────────────
     usage = response.usage_metadata
     prompt_tokens     = usage.prompt_token_count or 0
     cached_tokens     = usage.cached_content_token_count or 0
     completion_tokens = usage.candidates_token_count or 0
     total_tokens      = usage.total_token_count or 0
-    
+
     cost, breakdown = _calc_cost(
         model, prompt_tokens, cached_tokens, completion_tokens
     )
-    
+
     cached_hit = cached_tokens > 0
     tag = "[CACHE HIT ]" if cached_hit else "[CACHE MISS]"
     print(f"   {tag} {pdf_name}: {breakdown}")
-    
+
     return {
         "data":       data,
         "raw":        raw,
@@ -316,12 +356,11 @@ def cleanup_caches():
         client = _client()
     except CacheUnavailableError:
         return
-    
+
     deleted = 0
     for key, name in list(_CACHE_REGISTRY.items()):
         try:
             client.caches.delete(name=name)
-            #print(f"   [CACHE DEL] {key}")
             deleted += 1
         except Exception as e:
             print(f"   [WARN] cache delete failed for {key}: {e}")

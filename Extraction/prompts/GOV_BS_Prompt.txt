@@ -70,6 +70,8 @@ Metadata.Page No: MUST be extracted from the PDF filename (NOT from the PDF body
 Metadata.Currency reported:
   Normalize to exactly "USD ($)" unless the statement explicitly uses
   another currency.
+Metadata."Reported in Thousand": "Yes" if the sourced table title shows "(In Thousands)"
+  or "(000s)"; "No" otherwise. Default "No" if the unit scale is not stated.
 
 Metadata.Unit:
   Detect unit from title or header.
@@ -135,6 +137,13 @@ C5) Classify columns (for alignment repair later):
 D. SECTION SPLITTING (FOR GOV_BS)
 ===============================================================================
 SECTION COUNT IS VARIABLE — detect which sections are actually printed.
+
+*** DO NOT STOP AT "TOTAL ASSETS" — THIS IS THE #1 TRUNCATION BUG FOR THIS TAB ***
+The statement continues past Total Assets through Liabilities, Deferred Inflows, the full
+Fund-Balances block (GASB 54 classes), and the grand-total row. Extraction MUST run to the
+grand-total CP "Total liabilities, deferred inflows of resources and fund balances" (or "Total
+liabilities and fund balances"), which is the LAST row of the tab. Emitting only the Assets
+section (or stopping at any interior CP) is a HARD FAILURE.
 
 The output MUST include exactly these sections, IN THIS ORDER, but ONLY
 if the section is present in the PDF:
@@ -740,7 +749,73 @@ G3.3 MANDATORY TOTAL RECONCILIATION (ALL COLUMNS INCLUDING INDEPENDENT):
   NEVER output a JSON where a CP total row does not equal the sum of
   its DP rows for any column, unless the statement itself contains an
   arithmetic error (flag it in COA Datapoint as a note).
+===============================================================================
+G3.4  MANDATORY : DIGIT-DROP DETECTION & REPAIR (CRITICAL — RUN ON EVERY CP ROW)
+===============================================================================
+A digit-drop occurs when a PDF text extractor silently drops a character from
+a number (e.g., "16,760,001" → "1,676,001"). The LLM must NOT accept a
+malformed CP token without arithmetic validation.
 
+STEP 1 — PRE-ACCEPTANCE SANITY BOUND (run before column assignment):
+  For every token T on a CP / Total row assigned to column C:
+    floor_estimate = 0.80 × sum(all DP values seen above in column C)
+    ceil_estimate  = 1.20 × sum(all DP values seen above in column C)
+    If T < floor_estimate OR T > ceil_estimate:
+      Mark T as SUSPECT → proceed to STEP 2.
+    Else: accept T as-is.
+
+STEP 2 — DIGIT-DROP REPAIR ATTEMPT (only for SUSPECT tokens):
+  Generate candidates by inserting a single digit (0–9) at every
+  character position in T.
+    - If exactly one candidate matches sum(DP[C]) within $1 → ACCEPT
+      that candidate. Replace T with the repaired value.
+    - If zero or multiple candidates match → keep original T but log it.
+
+STEP 3 — MANDATORY TOTAL RECONCILIATION (G3.3 equivalent):
+  After all rows in a section are assigned:
+    For each column C: verify sum(DP[C]) ≈ CP[C].
+    If mismatch exceeds $1 AND digit-drop repair in STEP 2 was not yet
+    applied → re-run STEP 2 now.
+
+STEP 4 — EXTRACTION WARNING (if repair fails):
+  If a SUSPECT token could not be repaired, add to Metadata:
+    "Extraction Warnings": [
+      "Digit-drop suspected: Col=<ColName>, Row=<RowLabel>,
+       raw=<T>, expected=<sum(DP[C])>"
+    ]
+  Still output the original raw token T — never silently substitute
+  an unverified guess.
+
+ABSOLUTE RULES:
+  - Never accept a CP token on a Total row without running STEP 1.
+  - Never skip this check even if token count = N.
+  - The repair in STEP 2 is arithmetic-confirmed only; never guess.
+===============================================================================
+===============================================================================
+G3.5  GRAND TOTAL ROW — MANDATORY DASH REPAIR
+===============================================================================
+The row "Total Liabilities, Deferred Inflows of Resources and Fund Balances"
+(or "Total Liabilities and Fund Balances") is the balance sheet grand total.
+Its value CANNOT be a dash in any column where its component CP rows have
+non-zero values.
+
+APPLY THIS REPAIR BEFORE OUTPUT for every column C in the grand total row:
+
+  IF the extracted value for column C is "-" or blank:
+    computed = Total Liabilities[C]
+             + Total Deferred Inflows of Resources[C]
+             + Total Fund Balances[C]
+    IF computed != 0:
+      Replace "-" with the formatted computed value.
+
+RATIONALE: PDF extractors routinely drop grand total values at column
+boundaries, particularly in the rightmost "Total" column. The component
+CP rows are always arithmetically authoritative for this row.
+A grand total cell MUST NEVER output "-" when its three components
+sum to a non-zero value.
+
+This repair is MANDATORY. Run it on every column, not just the Total column.
+===============================================================================
 G4) No duplication:
   Each PDF value can exist in only one column.
 
@@ -760,6 +835,7 @@ I. JSON OUTPUT FORMAT
     "FYE": "<exact fiscal year end>",
     "Page No": "<printed page number(s)>",
     "Currency reported": "USD ($)",
+    "Reported in Thousand": "Yes|No",
     "Unit": "<Thousands|Millions|Units>"
   },
   "Reporting Columns": [
@@ -771,34 +847,34 @@ I. JSON OUTPUT FORMAT
   ],
   "Sections": {
     "Assets": [
-      {"COA Flag": "DPG", "GOV_BS Items": "Assets", "COA Datapoint": "Assets", "Total Check Status": "", "General Fund": null, ...all null...},
-      {"COA Flag": "DP",  "GOV_BS Items": "Cash and investments", "COA Datapoint": "Cash and investments", "Total Check Status": "", "General Fund": "229,039", ...},
-      {"COA Flag": "CP",  "GOV_BS Items": "Total assets", "COA Datapoint": "Total Assets", "Total Check Status": "", "General Fund": "987,868", ...}
+      {"COA Flag": "DPG", "Row Items": "Assets", "COA Datapoint": "Assets", "Total Check Status": "", "General Fund": null, ...all null...},
+      {"COA Flag": "DP",  "Row Items": "Cash and investments", "COA Datapoint": "Cash and investments", "Total Check Status": "", "General Fund": "229,039", ...},
+      {"COA Flag": "CP",  "Row Items": "Total assets", "COA Datapoint": "Total Assets", "Total Check Status": "", "General Fund": "987,868", ...}
     ],
     "Deferred Outflows of Resources": [
-      {"COA Flag": "DPG", "GOV_BS Items": "Deferred Outflows of Resources", "COA Datapoint": "Deferred Outflows of Resources", "Total Check Status": "", ...all null...},
-      {"COA Flag": "DP",  "GOV_BS Items": "Prepaid items", "COA Datapoint": "Prepaid items", "Total Check Status": "", "General Fund": "-", ...},
-      {"COA Flag": "CP",  "GOV_BS Items": "Total assets and deferred outflows of resources", "COA Datapoint": "Total Assets and Deferred Outflows of Resources", "Total Check Status": "", ...}
+      {"COA Flag": "DPG", "Row Items": "Deferred Outflows of Resources", "COA Datapoint": "Deferred Outflows of Resources", "Total Check Status": "", ...all null...},
+      {"COA Flag": "DP",  "Row Items": "Prepaid items", "COA Datapoint": "Prepaid items", "Total Check Status": "", "General Fund": "-", ...},
+      {"COA Flag": "CP",  "Row Items": "Total assets and deferred outflows of resources", "COA Datapoint": "Total Assets and Deferred Outflows of Resources", "Total Check Status": "", ...}
     ],
     "Liabilities": [
-      {"COA Flag": "DPG", "GOV_BS Items": "Liabilities", "COA Datapoint": "Liabilities", "Total Check Status": "", ...all null...},
-      {"COA Flag": "DP",  "GOV_BS Items": "Accounts payable and accrued liabilities", "COA Datapoint": "...", "Total Check Status": "", ...},
-      {"COA Flag": "CP",  "GOV_BS Items": "Total liabilities", "COA Datapoint": "Total Liabilities", "Total Check Status": "", ...}
+      {"COA Flag": "DPG", "Row Items": "Liabilities", "COA Datapoint": "Liabilities", "Total Check Status": "", ...all null...},
+      {"COA Flag": "DP",  "Row Items": "Accounts payable and accrued liabilities", "COA Datapoint": "...", "Total Check Status": "", ...},
+      {"COA Flag": "CP",  "Row Items": "Total liabilities", "COA Datapoint": "Total Liabilities", "Total Check Status": "", ...}
     ],
     "Deferred Inflows of Resources": [
-      {"COA Flag": "DPG", "GOV_BS Items": "Deferred Inflows of Resources", "COA Datapoint": "Deferred Inflows of Resources", "Total Check Status": "", ...all null...},
-      {"COA Flag": "DP",  "GOV_BS Items": "Unavailable revenues - property taxes", "COA Datapoint": "...", "Total Check Status": "", ...},
-      {"COA Flag": "CP",  "GOV_BS Items": "Total deferred inflows of resources", "COA Datapoint": "Total Deferred Inflows of Resources", "Total Check Status": "", ...}
+      {"COA Flag": "DPG", "Row Items": "Deferred Inflows of Resources", "COA Datapoint": "Deferred Inflows of Resources", "Total Check Status": "", ...all null...},
+      {"COA Flag": "DP",  "Row Items": "Unavailable revenues - property taxes", "COA Datapoint": "...", "Total Check Status": "", ...},
+      {"COA Flag": "CP",  "Row Items": "Total deferred inflows of resources", "COA Datapoint": "Total Deferred Inflows of Resources", "Total Check Status": "", ...}
     ],
     "Fund Balances": [
-      {"COA Flag": "DPG", "GOV_BS Items": "Fund Balances", "COA Datapoint": "Fund Balances", "Total Check Status": "", ...all null...},
-      {"COA Flag": "DP",  "GOV_BS Items": "Nonspendable", "COA Datapoint": "...", "Total Check Status": "", ...},
-      {"COA Flag": "DP",  "GOV_BS Items": "Restricted", "COA Datapoint": "...", "Total Check Status": "", ...},
-      {"COA Flag": "DP",  "GOV_BS Items": "Committed", "COA Datapoint": "...", "Total Check Status": "", ...},
-      {"COA Flag": "DP",  "GOV_BS Items": "Assigned", "COA Datapoint": "...", "Total Check Status": "", ...},
-      {"COA Flag": "DP",  "GOV_BS Items": "Unassigned", "COA Datapoint": "...", "Total Check Status": "", ...},
-      {"COA Flag": "CP",  "GOV_BS Items": "Total fund balances", "COA Datapoint": "Total Fund Balances", "Total Check Status": "", ...},
-      {"COA Flag": "CP",  "GOV_BS Items": "Total liabilities, deferred inflows of resources and fund balances", "COA Datapoint": "...", "Total Check Status": "", ...}
+      {"COA Flag": "DPG", "Row Items": "Fund Balances", "COA Datapoint": "Fund Balances", "Total Check Status": "", ...all null...},
+      {"COA Flag": "DP",  "Row Items": "Nonspendable", "COA Datapoint": "...", "Total Check Status": "", ...},
+      {"COA Flag": "DP",  "Row Items": "Restricted", "COA Datapoint": "...", "Total Check Status": "", ...},
+      {"COA Flag": "DP",  "Row Items": "Committed", "COA Datapoint": "...", "Total Check Status": "", ...},
+      {"COA Flag": "DP",  "Row Items": "Assigned", "COA Datapoint": "...", "Total Check Status": "", ...},
+      {"COA Flag": "DP",  "Row Items": "Unassigned", "COA Datapoint": "...", "Total Check Status": "", ...},
+      {"COA Flag": "CP",  "Row Items": "Total fund balances", "COA Datapoint": "Total Fund Balances", "Total Check Status": "", ...},
+      {"COA Flag": "CP",  "Row Items": "Total liabilities, deferred inflows of resources and fund balances", "COA Datapoint": "...", "Total Check Status": "", ...}
     ]
   }
 }
@@ -884,3 +960,7 @@ L. FINAL SELF-CHECK BEFORE OUTPUT
 - Grand total CP row is the LAST row in Fund Balances section.
 - Elimination rows: addends sum = 0, SUM column = "-", output as-is.
 - Deferred Outflows all-dash DP rows: emit with "-" in every column. DO NOT skip.
+- Grand total row ("Total Liabilities, Deferred Inflows of Resources and Fund
+  Balances"): every column value must be a number, never "-", if its component
+  CP rows (Total Liabilities + Total Deferred Inflows + Total Fund Balances)
+  sum to non-zero for that column. Apply G3.5 repair if "-" was extracted.

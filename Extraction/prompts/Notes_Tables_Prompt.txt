@@ -1,0 +1,478 @@
+You are scanning a government financial report PDF for SIX content types that live in the
+Introductory Section, the Notes to the Financial Statements, the Required Supplementary
+Information (RSI), and the Statistical Section.
+Return ONLY physical page numbers (1-based position in the file).
+No markdown. No explanation. ONLY raw JSON.
+
+════════════════════════════════════════════════════════════════
+CRITICAL: Scan EVERY SINGLE PAGE of this PDF without exception.
+════════════════════════════════════════════════════════════════
+Everything you are looking for on this pass sits OUTSIDE the basic financial statements.
+Unlike a statement-page scan, you MUST NOT skip a page because its header says
+"Notes to the Financial Statements", "Required Supplementary Information",
+"Statistical Section", "Schedule of ...", or "Unaudited". Those are exactly the
+sections that contain the target content.
+
+Include ALL continuation pages of every schedule you find. A schedule that says
+"(Continued)", or that continues mid-table onto the next page, belongs with its first
+page — return every page of it.
+
+Return PHYSICAL PDF page numbers (1-based position in the file), NOT the printed page
+numbers shown in the footer. Page 1 = the very first page of the PDF file, regardless of
+what number is printed on it.
+
+════════════════════════════════════════════════════════════════
+TARGET 1 — OVERVIEW: entity profile pages
+════════════════════════════════════════════════════════════════
+Return the pages that describe WHAT AND WHERE THE ENTITY IS. Include a page if it carries
+any of:
+  • the Letter of Transmittal or the "Profile of the Government" / "The Reporting Entity"
+    narrative (legal form, year and authority of creation, services provided, enterprise
+    activities, principal revenue base);
+  • the entity's head-office / administrative address (street, city, state, ZIP) — often on
+    the report cover, the Letter of Transmittal letterhead, or the auditor's report
+    addressee block;
+  • Note 1 "Summary of Significant Accounting Policies" where it defines the REPORTING
+    ENTITY and its component units;
+  • the Statistical Section "Demographic and Economic Statistics" schedule (population,
+    land area) and any "Principal Employers" schedule.
+
+Typically 2 to 6 pages. Do NOT return the whole introductory section — only pages carrying
+one of the four kinds of content above.
+
+DO NOT include: the table of contents, the GFOA certificate of achievement, the
+organisational chart, or a list of elected officials.
+
+════════════════════════════════════════════════════════════════
+TARGET 2 — CAPITAL_ASSETS: Changes in Capital Assets roll-forward
+════════════════════════════════════════════════════════════════
+A page qualifies if BOTH conditions are true:
+
+CONDITION 1 — it prints a roll-forward with columns resembling:
+    Beginning Balance | Additions | Deletions | Ending Balance
+  Accept these printed variants:
+    Beginning : "Balance at Oct. 1", "Balance at October 1, 2024", "Beginning Balance",
+                "Restated Balance", "Balance <date>"
+    Additions : "Additions", "Increases", "Acquisitions"
+    Deletions : "Deletions", "Reductions", "Retirements", "Disposals", "Decreases"
+    Ending    : "Balance at <FYE>", "Ending Balance"
+  A "Transfers" / "Reclassifications" / "Adjustments" column may also be present.
+
+CONDITION 2 — its ROWS are capital-asset categories, i.e. it contains at least one of:
+    "Capital assets, not being depreciated" / "not being depreciated"
+    "Capital assets, being depreciated" / "being depreciated and amortized"
+    "Less accumulated depreciation" / "Less: accumulated depreciation" /
+      "Accumulated depreciation and amortization"
+    "Construction in progress"
+    "Land" together with "Buildings" or "Infrastructure" or "Machinery and equipment"
+    "Right-to-use" assets or "SBITA" listed as asset classes
+    "capital assets, net"
+
+The schedule is usually inside a note titled "Capital Assets" / "Changes in Capital
+Assets" / "Capital Asset Activity", and normally spans 2 to 4 pages covering Governmental
+Activities, then Business-type Activities, then Component Units. Return ALL of them.
+
+DO NOT include (these are different tables):
+  • the Changes in Long-Term Liabilities roll-forward — its rows are bonds, notes, leases,
+    compensated absences, and it has a "Due Within One Year" column. That is DEBT, not
+    CAPITAL_ASSETS.
+  • a depreciation-expense-by-function schedule (rows are General Government, Public
+    Safety, ... with a single expense column and no Beginning/Ending balance).
+  • the capital assets line on the Statement of Net Position.
+  • a schedule of capital-project commitments or the capital improvement plan.
+
+DISCRIMINATOR: if a roll-forward page has a "Due Within One Year" column → it is DEBT.
+If it has asset-class rows and NO "Due Within One Year" column → it is CAPITAL_ASSETS.
+
+════════════════════════════════════════════════════════════════
+TARGET 3 — TAX_BASE: the three property-tax trend schedules
+════════════════════════════════════════════════════════════════
+
+§1A REJECT-F OVERRIDE — MANDATORY, HIGHEST PRIORITY:
+The rule barring Notes, RSI, and Statistical Section pages does
+NOT apply to TARGET 3. Never skip a page because its header
+says "Notes to the Financial Statements", "Required
+Supplementary Information", "Statistical Section", "Schedule
+of ...", or "Unaudited".
+
+════════════════════════════════════════════════════════════════
+SECTION A — NOTES PAGES THAT QUALIFY FOR TAX_BASE
+════════════════════════════════════════════════════════════════
+During your scan of the Notes to the Financial Statements,
+flag a page for TAX_BASE if its text contains ANY of the
+following. Check every Notes page — do not stop after finding
+the first one.
+
+  GROUP A — tax calendar (dates or periods):
+    Any of: "levy date" | "lien date" | "tax lien date" |
+    "lien attaches" | "become due and payable" |
+    "delinquent on" | "collection period" | "discount period" |
+    "discounts are allowed" | "ad valorem taxes are levied" |
+    "taxes are due" | "fiscal year for which levied" |
+    "tax roll" | "October 1" | "November 1" | "April 1"
+    ► A Notes page containing ANY of these phrases = INCLUDE,
+      even if it has no dollar amounts.
+
+  GROUP B — assessed or taxable value (needs a figure):
+    Any of: "assessed value" | "taxable value" |
+    "taxable assessed" | "estimated actual value" |
+    "just value" | "appraised value" | "millable value" |
+    "market value of the tax base"
+    ► A Notes page containing any of these WITH a dollar
+      figure or percentage = INCLUDE.
+
+  GROUP C — levy amount (needs a dollar figure):
+    Any of: "total tax levy" | "taxes levied" |
+    "amount levied" | "levy amount" | "ad valorem levy"
+    ► A Notes page containing any of these WITH a dollar
+      figure = INCLUDE.
+
+  GROUP D — millage or tax rate (any numeric figure):
+    Any of: "millage rate" | "mill levy" | "tax rate" |
+    "operating millage" | "debt service millage" |
+    "total direct rate" | "mills" | "per $1,000" |
+    "per $100" | "maximum ad valorem tax millage" |
+    "10 mills" | "limited to" followed by a mill figure
+    ► A Notes page containing any of these WITH any
+      numeric figure (e.g. "10 mills", "5.276 mills",
+      "7.107") = INCLUDE.
+
+NOTES PAGES QUALIFY EVEN WHEN:
+  • Tax content is only narrative — no tables, no schedules.
+  • The page covers only the current year, not ten years.
+  • The same information appears in the Statistical Section.
+  • The tax note starts partway down the page after a
+    different note (e.g. a budget note ends, then "NOTE 3 —
+    Property Taxes" begins on the same physical page).
+  • The page has no dollar amounts — dates and rates alone
+    are sufficient for Groups A and D.
+
+NOTES PAGES ARE EXCLUDED ONLY WHEN: the only tax reference
+is a bare mention of property taxes with no figure, rate,
+date, or calendar detail at all — for example, a single
+sentence "The County levies ad valorem taxes" with nothing
+else tax-specific on the entire page.
+
+════════════════════════════════════════════════════════════════
+SECTION B — STATISTICAL SECTION PAGES THAT QUALIFY
+════════════════════════════════════════════════════════════════
+Locate every page belonging to these THREE schedules.
+Match by PRINTED TITLE (schedule numbers like "Schedule 5"
+are aliases only — always confirm the printed title):
+
+  SCHEDULE A — "Assessed Value and Estimated Actual Value
+               of Taxable Property" (Last Ten Fiscal Years)
+  SCHEDULE B — "Direct and Overlapping Property Tax Rates"
+               (Last Ten Fiscal Years)
+  SCHEDULE C — "Property Tax Levies and Collections"
+               (Last Ten Fiscal Years)
+
+Recognition aids:
+  • Schedule A rows: Real Property, Personal Property,
+    Centrally Assessed Property, Total Taxable Assessed
+    Value, Estimated Actual Value, Total Direct Tax Rate.
+  • Schedule B columns: entity's own operating/debt millage
+    plus overlapping rates for school boards, municipalities,
+    special districts.
+  • Schedule C columns: Total Tax Levy, Collections within
+    the Fiscal Year of the Levy, Percentage of Levy,
+    Collections in Subsequent Years, Total Collections to
+    Date, Percentage of Levy.
+════════════════════════════════════════════════════════════════
+SECTION B0 — PHYSICALLY ROTATED PAGES (90° or 270° landscape)
+════════════════════════════════════════════════════════════════
+Some PDFs embed one or more pages in landscape orientation
+(rotated 90° or 270°). When extracted as plain text, a rotated
+page produces one of these garbled patterns:
+
+  PATTERN 1 — single-character-per-line stream:
+    Characters appear one per line down the left margin, e.g.:
+      F
+      i
+      s
+      c
+      a
+      l
+    Collapse all single characters top-to-bottom into a word
+    or phrase before evaluating the page content.
+
+  PATTERN 2 — reversed or mirrored word stream:
+    Words or numbers appear in reversed reading order or as a
+    single long horizontal string with no spacing. Re-assemble
+    the intended text before evaluating.
+
+  PATTERN 3 — numeric columns printed as a single row:
+    All values that should be in separate year columns appear
+    run together on one line, e.g.:
+      63599222 68171229 73503171 79376212 85468864 91725857
+
+MANDATORY RULE FOR ROTATED PAGES:
+  (a) NEVER discard a rotated page without first reconstructing
+      its text content by collapsing the garbled stream.
+  (b) After reconstruction, apply ALL normal schedule-title and
+      content matching rules (Sections B, B1, B2, B3, B4) to
+      the reconstructed text.
+  (c) A rotated page that, after reconstruction, contains any
+      of the three target schedule titles OR matches TYPE R1 or
+      TYPE R2 content patterns MUST be included in TAX_BASE.
+  (d) The absence of a readable title on a rotated page is NOT
+      a reason to exclude it — reconstruct first, then decide.
+  (e) Include the rotated page's physical page number in the
+      TAX_BASE array alongside all other qualifying pages.
+════════════════════════════════════════════════════════════════
+SECTION B1 — HORIZONTAL COLUMN-OVERFLOW PAGES
+(title-less right-half pages — THE MOST COMMONLY MISSED TYPE)
+════════════════════════════════════════════════════════════════
+Reports produced by Workiva and similar tools often split one
+wide schedule across TWO physical pages horizontally:
+
+  LEFT PAGE: has the schedule title, entity name, and the
+    first group of columns (e.g. Estimated Actual Value
+    columns, or fiscal years 2016–2019).
+  RIGHT PAGE: has NO schedule title, NO entity name, NO
+    "(Continued)" label. It begins directly with column
+    sub-headers (e.g. "Taxable Assessed Value" with
+    sub-columns "Real Property | Personal Property |
+    Centrally Assessed | Total | Total Direct Tax Rate"),
+    or with year numbers ("2020  2021  2022  2023  2024
+    2025"), followed immediately by numeric data rows.
+
+These right-half pages contain essential data from Schedule A
+or Schedule B and MUST be included in TAX_BASE.
+
+QUALIFY A RIGHT-HALF PAGE DIRECTLY by its own content:
+
+  RIGHT-HALF TYPE R1 — Schedule A right half:
+    A page qualifies as a Schedule A continuation if it:
+    (a) has no printed schedule title or entity name, AND
+    (b) begins with any of these column sub-headers:
+        "Taxable Assessed Value" | "Taxable Real Property" |
+        "Total Taxable" | "Total Direct Tax Rate" |
+        "Real Property  Personal Property  Centrally
+         Assessed  Total", AND
+    (c) its rows contain dollar amounts in the millions or
+        billions (assessed value scale), typically 8–12 rows.
+
+  RIGHT-HALF TYPE R2 — Schedule B right half:
+    A page qualifies as a Schedule B continuation if it:
+    (a) has no printed schedule title or entity name, AND
+    (b) begins with a "Fiscal Year" header followed
+        immediately by a row of year numbers such as
+        "2020  2021  2022  2023  2024  2025", AND
+    (c) its rows contain millage-scale decimal numbers
+        (e.g. 5.276, 0.916, 7.107) — typically 3–4 digit
+        values with 3 decimal places.
+
+  A page matching TYPE R1 or TYPE R2 is included in TAX_BASE
+  regardless of whether it has a schedule title or a
+  "(Continued)" label. The absence of a title is EXPECTED
+  for these pages and is NOT a reason to exclude them.
+
+════════════════════════════════════════════════════════════════
+SECTION B2 — VERTICAL ROW-OVERFLOW PAGES
+════════════════════════════════════════════════════════════════
+If a schedule continues onto additional pages with more year
+rows (with or without a "(Continued)" label), include every
+such continuation page. Returning only the first page of a
+multi-page schedule is a HARD FAILURE.
+
+════════════════════════════════════════════════════════════════
+SECTION B3 — SHARED PHYSICAL PAGES
+════════════════════════════════════════════════════════════════
+A page containing BOTH a qualifying schedule AND an excluded
+schedule (e.g. Schedule A in the top half and Principal
+Property Taxpayers in the bottom half of the same page) MUST
+be included. The exclusions below apply only to pages whose
+ENTIRE content is non-qualifying.
+
+════════════════════════════════════════════════════════════════
+SECTION B4 — DO NOT INCLUDE
+════════════════════════════════════════════════════════════════
+Exclude only pages whose ENTIRE content is non-qualifying:
+  • Principal Property Taxpayers schedule (rows are taxpayer
+    names, not property classes or year columns) — unless it
+    shares a page with a qualifying schedule per B3;
+  • ratio-of-outstanding-debt or legal-debt-margin schedules;
+  • MD&A narrative tax summaries with no tabular data;
+  • future-year budget or proposed millage pages with zero
+    audited historical data on the same page.
+
+NEVER exclude a page solely because it has no schedule title
+or no "(Continued)" label — if it matches TYPE R1 or TYPE R2
+above, it is a qualifying continuation page.
+
+════════════════════════════════════════════════════════════════
+YEAR-COLUMN CONTROL
+════════════════════════════════════════════════════════════════
+  • Latest TAX_BASE year must not exceed the audit FYE year.
+  • For FYE September 30, 2025: ten years FY2025–FY2016.
+  • Exclude pages whose only data is a future year (FY2026
+    budget/proposed millage) with no audited data present.
+  • A page mixing future proposed rates WITH current audited
+    data still qualifies.
+
+════════════════════════════════════════════════════════════════
+READ THE ENTIRE PAGE BEFORE DECIDING
+════════════════════════════════════════════════════════════════
+A single physical page can hold the end of one note and the
+start of another, or both a qualifying and an excluded
+schedule. Read every page fully before classifying it.
+
+════════════════════════════════════════════════════════════════
+TAX_BASE VERIFICATION — CHECK BEFORE FINALISING
+════════════════════════════════════════════════════════════════
+Before writing the TAX_BASE array, confirm:
+
+  [ ] Every Notes page containing GROUP A trigger phrases
+      (tax dates, lien date, levy calendar) is included —
+      even if it has no dollar amounts.
+
+  [ ] Every Notes page containing GROUP D trigger phrases
+      (mills, millage rate) with any numeric figure is
+      included — even if it has no assessed-value dollars.
+
+  [ ] A Notes page where a property-tax note begins partway
+      down the page (after an unrelated note) is included
+      if the tax note itself contains any Group A–D trigger.
+
+  [ ] Schedule A: first page found by printed title; the
+      immediately following page checked for TYPE R1 pattern
+      (starts with "Taxable Assessed Value" sub-headers +
+      dollar-amount rows); all pages included.
+
+  [ ] Schedule B: first page found by printed title; the
+      immediately following page checked for TYPE R2 pattern
+      (starts with year-number row "2020 2021 2022..." +
+      millage-scale decimals); all pages included.
+
+  [ ] Schedule C: all pages found and included.
+
+  [ ] No qualifying schedule has fewer pages in the array
+      than it physically occupies.
+════════════════════════════════════════════════════════════════
+
+════════════════════════════════════════════════════════════════
+TARGET 4 — PEN: Defined Benefit PENSION note and RSI pages
+════════════════════════════════════════════════════════════════
+Return every page that carries pension disclosure for a DEFINED BENEFIT plan, including:
+  • the note titled "Pension Plan(s)", "Retirement Plan(s)", "Employee Retirement
+    Systems", "Defined Benefit Pension Plans", or similar — ALL its pages;
+  • actuarial assumptions for a pension plan (discount rate, long-term expected rate of
+    return, inflation, salary increases, mortality table, amortization method);
+  • the "Sensitivity of the Net Pension Liability to changes in the discount rate"
+    schedule (a 1% decrease / current rate / 1% increase table);
+  • the "Changes in the Net Pension Liability" or "Changes in Total Pension Liability"
+    roll-forward (rows: Service cost, Interest, Benefit payments, Contributions,
+    Net investment income, ...);
+  • the Deferred Outflows / Deferred Inflows of Resources schedule RELATED TO PENSIONS,
+    including any "contributions subsequent to the measurement date" line;
+  • RSI pension schedules: "Schedule of Changes in Net Pension Liability and Related
+    Ratios", "Schedule of the Employer's Proportionate Share of the Net Pension
+    Liability", "Schedule of Contributions" (pension), and their notes;
+  • the "Long-Term Liabilities" / "Changes in Long-Term Obligations" note page that splits
+    the net pension liability between Governmental and Business-type activities — this page
+    is REQUIRED for the activity-proportion calculation, so include it even though it is
+    primarily a DEBT page.
+
+DO NOT include a page whose ONLY pension content is a Defined Contribution or Deferred
+Compensation plan (401(a), 403(b), 457) with no defined benefit disclosure.
+
+════════════════════════════════════════════════════════════════
+TARGET 5 — OPEB: Defined Benefit OPEB note and RSI pages
+════════════════════════════════════════════════════════════════
+Return every page that carries OPEB disclosure, including:
+  • the note titled "Other Postemployment Benefits", "OPEB", "Postemployment Healthcare
+    Benefits", "Retiree Health Plan", "Other Post-Employment Benefits Obligations", or
+    similar — ALL its pages;
+  • actuarial assumptions for the OPEB plan, including the HEALTHCARE COST TREND RATE;
+  • the "Sensitivity of the Net OPEB Liability to changes in the DISCOUNT RATE" schedule;
+  • the SEPARATE "Sensitivity of the Net OPEB Liability to changes in the HEALTHCARE COST
+    TREND RATE" schedule — this is a DIFFERENT table from the discount-rate sensitivity and
+    both must be returned;
+  • the "Changes in the Net OPEB Liability" / "Changes in Total OPEB Liability"
+    roll-forward;
+  • the Deferred Outflows / Inflows of Resources schedule RELATED TO OPEB;
+  • RSI OPEB schedules: "Schedule of Changes in Total OPEB Liability and Related Ratios",
+    "Schedule of Contributions" (OPEB), and their notes;
+  • the "Long-Term Liabilities" note page that splits the net OPEB liability between
+    Governmental and Business-type activities — REQUIRED for the activity-proportion
+    calculation.
+
+A pay-as-you-go OPEB plan with no trust STILL qualifies — return its pages.
+
+════════════════════════════════════════════════════════════════
+TARGET 6 — FAQS: credit-findings evidence pages
+════════════════════════════════════════════════════════════════
+Return pages carrying evidence for adverse credit findings. Include a page if it has any
+of:
+  • the Independent Auditor's Report — ALL its pages (the opinion paragraph, any
+    qualification, any going-concern paragraph, any emphasis-of-matter paragraph);
+  • a "Commitments and Contingencies" / "Contingent Liabilities" / "Litigation" note;
+  • a "Subsequent Events" note;
+  • a "Risk Management" / "Self-Insurance" / "Claims and Judgments" note;
+  • a debt-covenant / rate-covenant / debt-service-coverage disclosure, or a pledged-revenue
+    coverage schedule;
+  • a pollution remediation (GASB 49), environmental cleanup, consent decree, or landfill
+    closure/postclosure care disclosure;
+  • a disclosure of default, missed or late debt-service payment, forbearance, or
+    debt-service reserve draw;
+  • a disclosure of fraud, defalcation, misappropriation, criminal investigation, or a
+    cyber/ransomware incident;
+  • a hurricane / flood / wildfire / earthquake / declared-disaster or FEMA recovery
+    disclosure;
+  • the Schedule of Findings and Questioned Costs, the Single Audit / Uniform Guidance
+    compliance reports, or a management letter with findings;
+  • a going-concern or fiscal-distress discussion in MD&A;
+  • a component-unit condensed financial information note showing each CU's change in net
+    position.
+
+Return ONLY the narrative / disclosure evidence pages described above.
+
+Do NOT return main financial statement pages here (the Statement of Activities, the
+governmental or proprietary fund statements, the cash-flow statement). Those supply the
+numeric operands for the debt-service-coverage and component-unit calculations, they are
+located by a separate scan, and they are attached to this key automatically afterwards.
+Returning them here would only duplicate pages already added.
+
+If you find NO adverse-finding evidence anywhere in the document, return an EMPTY ARRAY for
+this key — that is a valid answer, and the operand pages are still attached downstream.
+
+════════════════════════════════════════════════════════════════
+DISAMBIGUATION — A PAGE MAY BELONG TO SEVERAL TARGETS
+════════════════════════════════════════════════════════════════
+These targets OVERLAP, and that is expected and correct. The same physical page may be
+returned under more than one key. Examples:
+  • the "Long-Term Liabilities" note page that splits liabilities by activity → return it
+    under BOTH "PEN" and "OPEB";
+  • a note page covering pensions and OPEB together → return it under BOTH "PEN" and
+    "OPEB";
+  • the Independent Auditor's Report → "FAQS";
+  • a Statistical Section page with two schedules printed on it → return it under every
+    target it satisfies.
+NEVER omit a page from one key merely because you already returned it under another.
+
+Read the ENTIRE page before deciding — a single page can hold the end of one schedule and
+the start of another.
+
+════════════════════════════════════════════════════════════════
+IF A TARGET IS ABSENT
+════════════════════════════════════════════════════════════════
+Return an EMPTY ARRAY for that key. Never guess a page number, never return a range you
+did not verify, and never pad a key to make it non-empty. An empty array is a valid,
+correct answer when the audit genuinely does not contain that content.
+
+════════════════════════════════════════════════════════════════
+CRITICAL: Return ONLY raw JSON. No markdown. No explanation.
+════════════════════════════════════════════════════════════════
+{
+  "OVERVIEW":       [...],
+  "CAPITAL_ASSETS": [...],
+  "TAX_BASE":       [...],
+  "PEN":            [...],
+  "OPEB":           [...],
+  "FAQS":           [...]
+}
+CRITICAL: Return PHYSICAL PDF page numbers (1-based position in the file),
+NOT the printed page numbers shown in the footer.
+Page 1 = the very first page of the PDF file, regardless of what number
+is printed on it.

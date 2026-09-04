@@ -17,6 +17,17 @@ import tempfile
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
 logging.getLogger("pypdf").setLevel(logging.ERROR)
+
+# ── Engine-folder self-bootstrap (DB / Dagster launch contexts) ───────────────
+# This module imports its siblings by BARE name and LAZILY (see the
+# `from llm_page_identifier import ...` calls further down). Those only resolve
+# while this folder is on sys.path — true for `python pipeline.py`, but a Dagster
+# op invoking the DB stage lost that path and the lazy import raised
+# ModuleNotFoundError mid-run. Asserting it here, at import time, covers every
+# lazy import site in this file regardless of how it was launched.
+_ed = os.path.dirname(os.path.abspath(__file__))
+if _ed not in sys.path:
+    sys.path.insert(0, _ed)
 # ── Global scan start (1-based) ───────────────────────────────────────────────
 START_PAGE = 4
 
@@ -3432,10 +3443,26 @@ def find_debt_pages(pdf_path: str, start_page: int = START_PAGE) -> list:
 # SHARED UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
 
+_MAX_SUFFIX_CHARS = 80   # switch to compact form when suffix exceeds this length
+
 def _pages_suffix(pages: list) -> str:
     if len(pages) == 1:
         return f"_p{pages[0]}"
-    return "_p" + "-".join(str(p) for p in pages)
+    inline = "_p" + "-".join(str(p) for p in pages)
+    if len(inline) <= _MAX_SUFFIX_CHARS:
+        return inline
+    # Compact form to stay under Windows MAX_PATH (260 chars).
+    # Uses only digits and hyphens to keep _p[\d\-]+ regexes working.
+    # Full list is written alongside the PDF as a <stem>.pages sidecar by _emit.
+    return f"_p{pages[0]}-{pages[-1]}"
+
+
+def _write_pages_sidecar(pdf_out_path: str, pages: list) -> None:
+    """Write full page list alongside a compacted-filename PDF slice."""
+    sidecar = pdf_out_path[:-4] + ".pages"  # replace .pdf → .pages
+    import json as _json
+    with open(sidecar, "w", encoding="utf-8") as fh:
+        _json.dump(pages, fh)
 
 
 def extract_pages_to_pdf(src: str, page_numbers: list, out: str):
@@ -3498,6 +3525,8 @@ def process_file(src: str, out_dir: str = None, prompts_folder: str = None,
         out_path = os.path.join(out_dir, out_name)
         try:
             extract_pages_to_pdf(src, pages, out_path)
+            if len("_p" + "-".join(str(p) for p in pages)) > _MAX_SUFFIX_CHARS:
+                _write_pages_sidecar(out_path, pages)
             produced.append(out_path)   # ← FIX: full path, not bare name
             #print(f"      [{suffix:<10}] pages {pages}  →  {out_name}")
         except Exception as e:
@@ -3707,10 +3736,29 @@ def process_file(src: str, out_dir: str = None, prompts_folder: str = None,
 # ══════════════════════════════════════════════════════════════════════════════
 # FOLDER RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
+from compact_schema import STATEMENT_SUFFIX_ALTERNATION
+
 _PRODUCED_RE = re.compile(
-    r"_(?:SNP|SOA|GOV_BS|GOV_IS|PROP_SNP|PROP_IS|PROP_CFS|DSR|DEBT)_p\d*(?:-\d+)*\.pdf$",
+    rf"_(?:{STATEMENT_SUFFIX_ALTERNATION})_p\d*(?:-\d+)*\.pdf$",
     re.IGNORECASE,
 )
+def _notes_fallback(src: str, key: str) -> list:
+    """
+    Python fallback for the Notes / RSI / Statistical-Section tabs.
+
+    Reuses the structural validators in llm_page_identifier that also back the
+    LLM notes scan, so the fallback and the primary path agree on what a
+    CAPITAL_ASSETS / TAX_BASE / PEN / OPEB / OVERVIEW / FAQS page looks like.
+    Imported lazily to keep page_extractor importable without the LLM stack.
+    """
+    try:
+        from llm_page_identifier import _full_scan_notes_tables
+    except Exception as e:
+        print(f"  [{key:<10}] fallback unavailable: {e}")
+        return []
+    return _full_scan_notes_tables(src, [key]).get(key, [])
+
+
 def process_file_llm_guided(
     src: str,
     out_dir: str = None,
@@ -3718,8 +3766,9 @@ def process_file_llm_guided(
     allowed_suffixes: set = None,
     id_model: str = "gemini-2.5-flash",
     use_llm_id: bool = True,
-    file_index: int = None,   # ← ADD
-    file_total: int = None,   # ← ADD
+    file_index: int = None,
+    file_total: int = None,
+    _precomputed_page_map: dict = None,  # injected by batch pipeline to skip LLM call
 ) -> list:
     """
     LLM-guided extraction:
@@ -3727,11 +3776,6 @@ def process_file_llm_guided(
     2. Use identified page numbers to slice PDFs with extract_pages_to_pdf()
     3. Falls back to Python keyword detection per-table if LLM misses any
     """
-    # Ensure this engine folder is importable for the bare sibling import below,
-    # robust under Dagster / subprocess / package-import launch contexts.
-    _ed = os.path.dirname(os.path.abspath(__file__))
-    if _ed not in sys.path:
-        sys.path.insert(0, _ed)
     from llm_page_identifier import identify_pages_with_fallback
 
     if out_dir is None:
@@ -3759,6 +3803,8 @@ def process_file_llm_guided(
         out_path = os.path.join(out_dir, out_name)
         try:
             extract_pages_to_pdf(src, pages, out_path)
+            if len("_p" + "-".join(str(p) for p in pages)) > _MAX_SUFFIX_CHARS:
+                _write_pages_sidecar(out_path, pages)
             produced.append(out_path)
             #print(f"  [{suffix:<10}] pages {pages}  →  {out_name}")
         except Exception as e:
@@ -3769,7 +3815,10 @@ def process_file_llm_guided(
         target_suffixes = ["PROP_SNP", "PROP_IS", "PROP_CFS"]
     else:
         target_suffixes = ["SNP", "SOA", "GOV_BS", "GOV_IS",
-                           "PROP_SNP", "PROP_IS", "PROP_CFS", "DSR", "DEBT"]
+                           "PROP_SNP", "PROP_IS", "PROP_CFS", "DSR", "DEBT",
+                           # Notes / RSI / Statistical-Section tabs
+                           "OVERVIEW", "CAPITAL_ASSETS", "TAX_BASE",
+                           "PEN", "OPEB", "FAQS"]
 
     if allowed_suffixes:
         normalized_allowed = {s.lstrip("_").upper() for s in allowed_suffixes}
@@ -3777,13 +3826,15 @@ def process_file_llm_guided(
 
     # ── Step 1: LLM page identification (one call for whole PDF) ──
     llm_pages: dict[str, list[int]] = {}
-    if use_llm_id:
-        # Build a fallback that runs Python detection for a specific suffix
+    if _precomputed_page_map is not None:
+        # Batch mode: page map already fetched via Claude Batch API
+        llm_pages = _precomputed_page_map
+    elif use_llm_id:
         llm_pages = identify_pages_with_fallback(
             pdf_path=src,
             model=id_model,
-            fallback_fn=None,  # we handle per-suffix fallback below
-            allowed_suffixes=allowed_suffixes,   # ← ADD THIS LINE
+            fallback_fn=None,
+            allowed_suffixes=allowed_suffixes,
         )
 
     # ── Step 2: For each target suffix, use LLM result or Python fallback ──
@@ -3815,6 +3866,15 @@ def process_file_llm_guided(
                         START_PAGE),
         "DSR":      lambda: find_dsr_pages(src),
         "DEBT":     lambda: find_debt_pages(src),
+        # The notes/RSI/statistical tabs have no bespoke Python finder.
+        # They fall back to the SAME structural validators that back the
+        # LLM notes scan, run over the whole document.
+        "OVERVIEW":       lambda: _notes_fallback(src, "OVERVIEW"),
+        "CAPITAL_ASSETS": lambda: _notes_fallback(src, "CAPITAL_ASSETS"),
+        "TAX_BASE":       lambda: _notes_fallback(src, "TAX_BASE"),
+        "PEN":            lambda: _notes_fallback(src, "PEN"),
+        "OPEB":           lambda: _notes_fallback(src, "OPEB"),
+        "FAQS":           lambda: _notes_fallback(src, "FAQS"),
     }
 
     for suffix in target_suffixes:

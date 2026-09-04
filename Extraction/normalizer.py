@@ -39,11 +39,12 @@ from pathlib import Path
 import time
 import openpyxl
 from openai import OpenAI, APIError, APITimeoutError, RateLimitError
+from compact_schema import STATEMENT_SUFFIX_ALTERNATION
 
 # Examples: _SNP_p15  _SOA_p16-17  _BS_p22
 
 _PAGE_TAG_RE = re.compile(
-    r"_(?:SNP|SOA|GOV_BS|GOV_IS|PROP_SNP|PROP_IS|PROP_CFS|DSR|DEBT)_p(\d+)((?:-\d+)*)$",
+    rf"_(?:{STATEMENT_SUFFIX_ALTERNATION})_p(\d+)((?:-\d+)*)$",
     re.IGNORECASE,
 )
 # ─────────────────────────────────────────────────────────────────────────────

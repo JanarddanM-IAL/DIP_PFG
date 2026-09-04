@@ -24,11 +24,10 @@ A. IDENTIFY THE TARGET STATEMENT PAGE(S)
 Look for pages containing BOTH:
   1. "Statement of Cash Flows" (or "Cash Flow Statement")
   2. "Proprietary Funds" (or "Enterprise Funds")
-IGNORE: GOV_IS | PROP_IS | SOA | Reconciliation pages.
+IGNORE: GOV_IS | PROP_IS | SOA | pages that are purely a Reconciliation of Balance Sheet
+(REJECT-E type). Do NOT stop at the ending cash balance — the PDF may continue with a
+Reconciliation of Operating Income and/or Non-cash Activities block (see Section D).
 If split across pages, treat as one continuous table. Ignore footer boilerplate.
-STOP PARSING at "Total Balance of Cash and Cash Equivalents" (or "Ending balance"
-CP row in the Cash and Cash Equivalents section). Do NOT include any Reconciliation
-rows in the output.
 MULTI-TABLE DETECTION:
 Some PDFs contain TWO complete, independent statements on different pages.
 Always scan ALL pages before deciding. Two triggers exist:
@@ -77,6 +76,8 @@ Metadata.Page No: MUST be extracted from the PDF filename (NOT from the PDF body
   Rule: The filename contains a page tag "_p<start>" or "_p<start>-<end>".
   Parsing rules: same as GOV_IS/PROP_IS.
 Metadata.Currency reported: "USD ($)" unless explicitly another.
+Metadata."Reported in Thousand": "Yes" if the sourced table title shows "(In Thousands)"
+  or "(000s)"; "No" otherwise. Default "No" if the unit scale is not stated.
 Metadata.Unit: "(In Thousands)"->"Thousands" | "(In Millions)"->"Millions" | none->"Units".
 
 ===============================================================================
@@ -116,14 +117,20 @@ FORBIDDEN: Never emit a section that contains ONLY a DPG row (no DP, no CP).
 RESULT: "Sections" will contain 3 to 6 keys depending on what the PDF
 actually reports. Order of keys (when present):
   Cash Flows from Operating Activities
-  Cash Flows from Noncapital Financing Activities
-  Cash Flows from Capital and Related Financing Activities
-  Cash Flows from Investing Activities
+  Cash Flows from Noncapital Financing Activities (if printed)
+  Cash Flows from Capital and Related Financing Activities (if printed)
+  Cash Flows from Investing Activities (if printed)
   Net Change in Cash and Cash Equivalents
   Cash and Cash Equivalents
+  Reconciliation of Operating Income (Loss) (if printed)
+  Non-cash Activities (if printed)
 
-NO "Reconciliation" section. If the PDF contains a reconciliation section,
-IGNORE it entirely. Do NOT include any reconciliation rows in the output.
+*** DO NOT STOP AT "CASH AND CASH EQUIVALENTS AT END OF YEAR" — TRUNCATION BUG ***
+When the PDF prints a "Reconciliation of operating income (loss) to net cash provided (used)
+by operating activities" block and/or a "Noncash investing, capital, and financing activities"
+block, you MUST capture BOTH as additional sections. Stop only after both are exhausted (or
+after the Ending balance if they are absent). Stopping at the ending cash balance when a
+Reconciliation or Non-cash block is printed is a HARD FAILURE.
 
 SECTION DETECTION RULES:
 
@@ -147,20 +154,31 @@ SECTION DETECTION RULES:
    Ends at CP row "Net cash provided (used) by investing activities".
 
 5. "Net Change in Cash and Cash Equivalents":
-   Contains:
-     - ONE CP row "Net increase (decrease) in cash and cash equivalents"
-       (or "Net change in cash and cash equivalents" or similar).
-       This is CP because it equals: sum of all four Net Cash CP rows from sections 1-4.
-   It has only  CP. No DP and DPG rows.
+   Contains ONE CP row: "Net increase (decrease) in cash and cash equivalents"
+   (or "Net change in cash and cash equivalents" or similar).
+   Equals sum of all four Net Cash CP rows from sections 1-4. No DPG or DP rows.
 
 6. "Cash and Cash Equivalents":
    Contains:
      - DPG row (section header, null values)
-     - DP row "Beginning of year" (or "Cash and cash equivalents, July 1" or similar)
-     - CP row "End of year" (or "Cash and cash equivalents, June 30" or similar)
+     - DP row "Beginning of year" (or "Cash and cash equivalents, <date>" or similar)
+     - CP row "End of year" (or "Cash and cash equivalents, <FYE date>" or similar)
        This CP = Beginning of year + Net change.
-   This is the LAST section. Table ENDS here.
-   STOP PARSING after this CP row. Do NOT include Reconciliation.
+
+7. "Reconciliation of Operating Income (Loss)" (CONDITIONAL — emit ONLY if PDF prints it):
+   The "Reconciliation of operating income (loss) to net cash provided (used) by operating
+   activities" block. Contains: DPG + DP rows (Operating income (loss); Depreciation and
+   amortization; Changes in assets and liabilities items) + CP "Net cash provided (used) by
+   operating activities". ALL rows in this section have COA Datapoint = "Reconciliation Item".
+
+8. "Non-cash Activities" (CONDITIONAL — emit ONLY if PDF prints it):
+   The "Noncash investing, capital, and financing activities" block. Contains DPG + DP rows
+   (Change in fair value of investments; Purchase of capital assets on account; Donated assets;
+   Right-to-use assets acquired through debt; etc.). ALL rows have COA Datapoint = "Non-cash Items".
+   This is the LAST block — STOP after it.
+
+SECTION-PRESENCE GATE: Emit a section IFF the PDF prints its heading AND >= 1 DP or CP row
+under it; a DPG-only section (no DP, no CP) is dropped.
 
 ===============================================================================
 E. HIERARCHY FLATTENING (PARENT->CHILD PREFIXING)
@@ -216,6 +234,48 @@ IMPORTANT: Cash flow outflows are COMMONLY negative (parenthesized):
   "Acquisition of capital assets" -> "(8,998,040)"
   "Interest paid on debt" -> "(134,835)"
   Preserve parentheses exactly as shown in the PDF.
+===============================================================================
+G3.4  MANDATORY: DIGIT-DROP DETECTION & REPAIR (CRITICAL — RUN ON EVERY CP ROW)
+===============================================================================
+A digit-drop occurs when a PDF text extractor silently drops a character from
+a number (e.g., "16,760,001" → "1,676,001"). The LLM must NOT accept a
+malformed CP token without arithmetic validation.
+
+STEP 1 — PRE-ACCEPTANCE SANITY BOUND (run before column assignment):
+  For every token T on a CP / Total row assigned to column C:
+    floor_estimate = 0.80 × sum(all DP values seen above in column C)
+    ceil_estimate  = 1.20 × sum(all DP values seen above in column C)
+    If T < floor_estimate OR T > ceil_estimate:
+      Mark T as SUSPECT → proceed to STEP 2.
+    Else: accept T as-is.
+
+STEP 2 — DIGIT-DROP REPAIR ATTEMPT (only for SUSPECT tokens):
+  Generate candidates by inserting a single digit (0–9) at every
+  character position in T.
+    - If exactly one candidate matches sum(DP[C]) within $1 → ACCEPT
+      that candidate. Replace T with the repaired value.
+    - If zero or multiple candidates match → keep original T but log it.
+
+STEP 3 — MANDATORY TOTAL RECONCILIATION (G3.3 equivalent):
+  After all rows in a section are assigned:
+    For each column C: verify sum(DP[C]) ≈ CP[C].
+    If mismatch exceeds $1 AND digit-drop repair in STEP 2 was not yet
+    applied → re-run STEP 2 now.
+
+STEP 4 — EXTRACTION WARNING (if repair fails):
+  If a SUSPECT token could not be repaired, add to Metadata:
+    "Extraction Warnings": [
+      "Digit-drop suspected: Col=<ColName>, Row=<RowLabel>,
+       raw=<T>, expected=<sum(DP[C])>"
+    ]
+  Still output the original raw token T — never silently substitute
+  an unverified guess.
+
+ABSOLUTE RULES:
+  - Never accept a CP token on a Total row without running STEP 1.
+  - Never skip this check even if token count = N.
+  - The repair in STEP 2 is arithmetic-confirmed only; never guess.
+===============================================================================
 
 ===============================================================================
 H. COA DATAPOINT MAPPING (AUTHORITATIVE)
@@ -230,6 +290,7 @@ I. JSON OUTPUT FORMAT
     "FYE": "<exact fiscal year end from PDF>",
     "Page No": "<filename-derived page numbers>",
     "Currency reported": "USD ($)",
+    "Reported in Thousand": "Yes|No",
     "Unit": "<Thousands|Millions|Units>"
   },
   "Reporting Columns": [
@@ -240,10 +301,10 @@ I. JSON OUTPUT FORMAT
   ],
   "Sections": {
     "Cash Flows from Operating Activities": [
-      {"COA Flag": "DPG", "PROP_CFS Items": "<section name>", "COA Datapoint": "<from master>", "Total Check Status": "", ...all null...},
-      {"COA Flag": "DP",  "PROP_CFS Items": "<line item>", "COA Datapoint": "<SAME AS DPG>", "Total Check Status": "", ...},
-      {"COA Flag": "DP",  "PROP_CFS Items": "<line item>", "COA Datapoint": "<SAME AS DPG>", "Total Check Status": "", ...},
-      {"COA Flag": "CP",  "PROP_CFS Items": "<net cash label>", "COA Datapoint": "<from master or blank>", "Total Check Status": "", ...}
+      {"COA Flag": "DPG", "Row Items": "<section name>", "COA Datapoint": "<from master>", "Total Check Status": "", ...all null...},
+      {"COA Flag": "DP",  "Row Items": "<line item>", "COA Datapoint": "<SAME AS DPG>", "Total Check Status": "", ...},
+      {"COA Flag": "DP",  "Row Items": "<line item>", "COA Datapoint": "<SAME AS DPG>", "Total Check Status": "", ...},
+      {"COA Flag": "CP",  "Row Items": "<net cash label>", "COA Datapoint": "<from master or blank>", "Total Check Status": "", ...}
     ],
     "Cash Flows from Noncapital Financing Activities": [
       {"COA Flag": "DPG", ...},
@@ -261,12 +322,12 @@ I. JSON OUTPUT FORMAT
       {"COA Flag": "CP", ...}
     ],
     "Net Change in Cash and Cash Equivalents": [
-      {"COA Flag": "CP",  "PROP_CFS Items": "<net change label>", "COA Datapoint": "<from master or blank>", "Total Check Status": "", ...}
+      {"COA Flag": "CP",  "Row Items": "<net change label>", "COA Datapoint": "<from master or blank>", "Total Check Status": "", ...}
     ],
     "Balance of Cash and Cash Equivalents": [
-      {"COA Flag": "DPG", "PROP_CFS Items": "Balance of Cash and Cash Equivalents", "COA Datapoint": "<from master>", "Total Check Status": "", ...all null...},
-      {"COA Flag": "DP",  "PROP_CFS Items": "<beginning label>", "COA Datapoint": "Beginning Balance of Cash and Cash Equivalents", "Total Check Status": "", ...},
-      {"COA Flag": "CP",  "PROP_CFS Items": "<ending label>", "COA Datapoint": "Total Balance of Cash and Cash Equivalents", "Total Check Status": "", ...}
+      {"COA Flag": "DPG", "Row Items": "Balance of Cash and Cash Equivalents", "COA Datapoint": "<from master>", "Total Check Status": "", ...all null...},
+      {"COA Flag": "DP",  "Row Items": "<beginning label>", "COA Datapoint": "Beginning Balance of Cash and Cash Equivalents", "Total Check Status": "", ...},
+      {"COA Flag": "CP",  "Row Items": "<ending label>", "COA Datapoint": "Total Balance of Cash and Cash Equivalents", "Total Check Status": "", ...}
     ]
   }
 }
@@ -308,7 +369,10 @@ L. FINAL SELF-CHECK BEFORE OUTPUT
     Cash Flows from Noncapital Financing Activities,
     Cash Flows from Capital and Related Financing Activities,
     Cash Flows from Investing Activities.
-- NO "Reconciliation" section. STOP at Total Balance of Cash and Cash Equivalents.
+- "Reconciliation of Operating Income (Loss)" and "Non-cash Activities" sections are
+  CONDITIONAL — include them if printed; all rows in Reconciliation get COA Datapoint
+  "Reconciliation Item"; all rows in Non-cash Activities get COA Datapoint "Non-cash Items".
+  STOP only after both are exhausted (or after Ending balance if absent).
 - DPG rows: exactly one per section that is present in output (3 to 6 total).
   All DPG column values = null.
   A section with zero DP/CP rows MUST NOT appear in output — not even as a DPG-only entry.

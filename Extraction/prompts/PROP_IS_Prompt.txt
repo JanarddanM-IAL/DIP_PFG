@@ -75,6 +75,8 @@ Metadata.Page No: MUST be extracted from the PDF filename (NOT from the PDF body
   Single page "_p51"      -> "51"
   Multi-page "_p51-52"   -> "51-52"
 Metadata.Currency reported: "USD ($)" unless explicitly another.
+Metadata."Reported in Thousand": "Yes" if the sourced table title shows "(In Thousands)"
+  or "(000s)"; "No" otherwise. Default "No" if the unit scale is not stated.
 Metadata.Unit: "(In Thousands)"->"Thousands" | "(In Millions)"->"Millions" | none->"Units".
 
 ===============================================================================
@@ -276,40 +278,40 @@ specified in D.4: one CP row, COA Datapoint "Income (Loss) before Transfers".
    the "Income (Loss) before Transfers" section is empty/absent per the D.4 PATCH above).
    No DPG row for this section.
 
-   CONTINUE CAPTURING AFTER "Change in net position":
-   Do NOT stop parsing the instant "Change in net position" is printed. Continue reading
-   every subsequent printed row and classify each normally as DP or CP (per Section E/F),
-   appending them to this same "Change in Net Position" section array in the order printed,
-   UNTIL you reach the GENERALIZED STOP ROW (defined below). Everything printed between
-   "Change in net position" and the stop row belongs in this section's output.
+   *** DO NOT STOP AT "CHANGE IN NET POSITION" — INCLUDE ROLL-FORWARD ***
+   Continue reading EVERY subsequent printed row and append to this section in printed order.
+   Row order (emit in this EXACT sequence):
 
-   GENERALIZED STOP ROW:
-   The table ends at the first row whose label contains "beginning" / "starting" / "start"
-   (case-insensitive, whole word) in connection with net position, fund net position, members'
-   equity, or an equivalent equity/balance rollforward concept — e.g. "Net position at
-   beginning of year", "Beginning net position", "Fund net position, starting balance",
-   "Members' Equity — Beginning of year". This stop row itself, and every row after it
-   (the matching ending-balance row, restatements, prior period adjustments, reconciliation
-   footnotes, etc.), are EXCLUDED from output — extraction stops there, permanently.
+   - CP "Change in net position" → COA Datapoint "Changes in Net Position"
+       Carry all N printed column values.
 
-   If "Change in net position" is immediately followed by a beginning-balance row (no rows
-   in between), the section simply contains the single CP row as before — this is the common
-   case and nothing changes for it.
-   ROWS TO IGNORE / STOP CONDITION:
-  Rows are excluded starting from the GENERALIZED STOP ROW defined in Section D.6 — the
-  first row after "Change in net position" whose label combines "beginning"/"starting"/"start"
-  with net position / fund net position / members' equity / an equivalent balance-rollforward
-  concept. That row and everything after it are excluded, including (non-exhaustive):
-  - "Net position at beginning of year" / "Net position, beginning of year"
-  - "Members' Equity — Beginning of year"
-  - The corresponding "...end of year" / "...end of period" row
-  - "Restatement" / "Prior period adjustment"
-  - "Change in net position of business-type activities"
-  - "Adjustments to reflect the consolidation of internal service fund activities"
-  - Any reconciliation or footnote rows after the stop row
+   - CP "Net position - beginning" (or "Net position at beginning of year",
+       "Beginning net position", "Members' Equity — Beginning of year", etc.)
+       → COA Datapoint "Net Position - Beginning of Year"
+       This is an ANCHOR CP row (reported opening balance, not a sum of DP rows above).
+       Carry all N printed column values.
 
-  Any row printed BETWEEN "Change in net position" and the stop row is NOT ignored — it is
-  captured normally into the "Change in Net Position" section per D.6.
+   - DP restatement/prior-period-adjustment/accounting-principle line(s) (CONDITIONAL):
+       Each synonym row printed between beginning and the as-restated subtotal.
+       ("Restatement", "Prior period adjustment", "Correction of an error",
+        "Change in accounting principle", "Cumulative effect of adoption of GASB <nn>",
+        "Adjustments to reflect the consolidation of internal service fund activities")
+       → COA Datapoint "Restatement / Prior Period Adjustment"
+       OMIT this row type entirely if none are printed.
+
+   - CP "Net position - beginning, as restated" (CONDITIONAL)
+       → COA Datapoint "Net Position - Beginning of Year (As Restated)"
+       Emit ONLY if explicitly printed in the PDF.
+
+   - CP "Net position - ending" (or "Net position at end of year", "Ending net position",
+       "Members' Equity — End of year", etc.)
+       → COA Datapoint "Net Position - End of Year"
+       THE LAST ROW OF THE ENTIRE SECTIONS OUTPUT.
+       Carry all N printed column values.
+
+   Caption recognition is MEANING-based (case-insensitive; ignore trailing colons/footnote marks).
+   ROLL-FORWARD IDENTITY CHECK (used by downstream Python; do NOT write into Total Check Status):
+   For each column: Ending == (Beginning as Restated if printed else Beginning) + Change.
 
 ===============================================================================
 E. HIERARCHY FLATTENING (PARENT->CHILD PREFIXING)
@@ -424,7 +426,48 @@ G2A) ELIMINATION ROW DETECTION:
 G3) ALIGNMENT REPAIR:
   If a SUM column value does not equal the sum of its addend columns (after accounting for
   parenthesized negatives), do NOT alter values. Report as-is. Total Check will flag it.
+===============================================================================
+G3.4  MANDATORY: DIGIT-DROP DETECTION & REPAIR (CRITICAL — RUN ON EVERY CP ROW)
+===============================================================================
+A digit-drop occurs when a PDF text extractor silently drops a character from
+a number (e.g., "16,760,001" → "1,676,001"). The LLM must NOT accept a
+malformed CP token without arithmetic validation.
 
+STEP 1 — PRE-ACCEPTANCE SANITY BOUND (run before column assignment):
+  For every token T on a CP / Total row assigned to column C:
+    floor_estimate = 0.80 × sum(all DP values seen above in column C)
+    ceil_estimate  = 1.20 × sum(all DP values seen above in column C)
+    If T < floor_estimate OR T > ceil_estimate:
+      Mark T as SUSPECT → proceed to STEP 2.
+    Else: accept T as-is.
+
+STEP 2 — DIGIT-DROP REPAIR ATTEMPT (only for SUSPECT tokens):
+  Generate candidates by inserting a single digit (0–9) at every
+  character position in T.
+    - If exactly one candidate matches sum(DP[C]) within $1 → ACCEPT
+      that candidate. Replace T with the repaired value.
+    - If zero or multiple candidates match → keep original T but log it.
+
+STEP 3 — MANDATORY TOTAL RECONCILIATION (G3.3 equivalent):
+  After all rows in a section are assigned:
+    For each column C: verify sum(DP[C]) ≈ CP[C].
+    If mismatch exceeds $1 AND digit-drop repair in STEP 2 was not yet
+    applied → re-run STEP 2 now.
+
+STEP 4 — EXTRACTION WARNING (if repair fails):
+  If a SUSPECT token could not be repaired, add to Metadata:
+    "Extraction Warnings": [
+      "Digit-drop suspected: Col=<ColName>, Row=<RowLabel>,
+       raw=<T>, expected=<sum(DP[C])>"
+    ]
+  Still output the original raw token T — never silently substitute
+  an unverified guess.
+
+ABSOLUTE RULES:
+  - Never accept a CP token on a Total row without running STEP 1.
+  - Never skip this check even if token count = N.
+  - The repair in STEP 2 is arithmetic-confirmed only; never guess.
+===============================================================================
 G4) No duplication: each value appears in exactly one cell.
 
 G5) DPG rows: all column values = null (JSON null). Never assign numeric values to DPG rows.
@@ -446,6 +489,7 @@ I. JSON OUTPUT FORMAT
     "FYE": "<exact fiscal year end from PDF>",
     "Page No": "<filename-derived page numbers>",
     "Currency reported": "USD ($)",
+    "Reported in Thousand": "Yes|No",
     "Unit": "<Thousands|Millions|Units>"
   },
   "Reporting Columns": [
@@ -457,34 +501,40 @@ I. JSON OUTPUT FORMAT
   ],
   "Sections": {
     "Operating Revenues": [
-      {"COA Flag": "DPG", "PROP_IS Items": "Operating Revenues", "COA Datapoint": "Operating Revenues", "Total Check Status": "", <all cols>: null},
-      {"COA Flag": "DP",  "PROP_IS Items": "<line item>", "COA Datapoint": "<matched>", "Total Check Status": "", <col values>},
-      {"COA Flag": "CP",  "PROP_IS Items": "<total label>", "COA Datapoint": "Total Operating Revenues", "Total Check Status": "", <col values>}
+      {"COA Flag": "DPG", "Row Items": "Operating Revenues", "COA Datapoint": "Operating Revenues", "Total Check Status": "", <all cols>: null},
+      {"COA Flag": "DP",  "Row Items": "<line item>", "COA Datapoint": "<matched>", "Total Check Status": "", <col values>},
+      {"COA Flag": "CP",  "Row Items": "<total label>", "COA Datapoint": "Total Operating Revenues", "Total Check Status": "", <col values>}
     ],
     "Operating Expenses": [
-      {"COA Flag": "DPG", "PROP_IS Items": "Operating Expenses", "COA Datapoint": "Operating Expenses", "Total Check Status": "", <all cols>: null},
-      {"COA Flag": "DP",  "PROP_IS Items": "<line item>", "COA Datapoint": "<matched>", "Total Check Status": "", <col values>},
-      {"COA Flag": "CP",  "PROP_IS Items": "<total operating expenses label>", "COA Datapoint": "Total Operating Expenses", "Total Check Status": "", <col values>},
-      {"COA Flag": "CP",  "PROP_IS Items": "<operating income (loss) label>", "COA Datapoint": "Operating Income (Loss)", "Total Check Status": "", <col values>}
+      {"COA Flag": "DPG", "Row Items": "Operating Expenses", "COA Datapoint": "Operating Expenses", "Total Check Status": "", <all cols>: null},
+      {"COA Flag": "DP",  "Row Items": "<line item>", "COA Datapoint": "<matched>", "Total Check Status": "", <col values>},
+      {"COA Flag": "CP",  "Row Items": "<total operating expenses label>", "COA Datapoint": "Total Operating Expenses", "Total Check Status": "", <col values>},
+      {"COA Flag": "CP",  "Row Items": "<operating income (loss) label>", "COA Datapoint": "Operating Income (Loss)", "Total Check Status": "", <col values>}
     ],
     "Nonoperating Revenues (Expenses)": [
-      {"COA Flag": "DPG", "PROP_IS Items": "Nonoperating Revenues (Expenses)", "COA Datapoint": "Nonoperating Revenues/Expense", "Total Check Status": "", <all cols>: null},
-      {"COA Flag": "DP",  "PROP_IS Items": "<line item>", "COA Datapoint": "<matched>", "Total Check Status": "", <col values>},
-      {"COA Flag": "CP",  "PROP_IS Items": "<total nonoperating label>", "COA Datapoint": "Total Nonoperating Revenues/Expense", "Total Check Status": "", <col values>}
+      {"COA Flag": "DPG", "Row Items": "Nonoperating Revenues (Expenses)", "COA Datapoint": "Nonoperating Revenues/Expense", "Total Check Status": "", <all cols>: null},
+      {"COA Flag": "DP",  "Row Items": "<line item>", "COA Datapoint": "<matched>", "Total Check Status": "", <col values>},
+      {"COA Flag": "CP",  "Row Items": "<total nonoperating label>", "COA Datapoint": "Total Nonoperating Revenues/Expense", "Total Check Status": "", <col values>}
     ],
     "Income (Loss) before Transfers": [
-      {"COA Flag": "CP",  "PROP_IS Items": "<income before transfers label>", "COA Datapoint": "Income (Loss) before Transfers", "Total Check Status": "", <col values>}
+      {"COA Flag": "CP",  "Row Items": "<income before transfers label>", "COA Datapoint": "Income (Loss) before Transfers", "Total Check Status": "", <col values>}
     ],
     "Contributions and Transfers": [
-      {"COA Flag": "DPG", "PROP_IS Items": "Contributions and Transfers", "COA Datapoint": "Contributions and Transfers", "Total Check Status": "", <all cols>: null},
-      {"COA Flag": "DP",  "PROP_IS Items": "<line item>", "COA Datapoint": "<matched>", "Total Check Status": "", <col values>},
-      {"COA Flag": "CP",  "PROP_IS Items": "<total contributions label if present>", "COA Datapoint": "", "Total Check Status": "", <col values>}
+      {"COA Flag": "DPG", "Row Items": "Contributions and Transfers", "COA Datapoint": "Contributions and Transfers", "Total Check Status": "", <all cols>: null},
+      {"COA Flag": "DP",  "Row Items": "<line item>", "COA Datapoint": "<matched>", "Total Check Status": "", <col values>},
+      {"COA Flag": "CP",  "Row Items": "<total contributions label if present>", "COA Datapoint": "", "Total Check Status": "", <col values>}
     ],
     "Change in Net Position": [
-      {"COA Flag": "CP",  "PROP_IS Items": "<change in net position label>", "COA Datapoint": "Change In Net Position", "Total Check Status": "", <col values>}
+      {"COA Flag": "CP", "Row Items": "<change in net position label>",         "COA Datapoint": "Changes in Net Position",                     "Total Check Status": "", <col values>},
+      {"COA Flag": "CP", "Row Items": "<net position beginning label>",          "COA Datapoint": "Net Position - Beginning of Year",            "Total Check Status": "", <col values>},
+      {"COA Flag": "DP", "Row Items": "<restatement label>",                     "COA Datapoint": "Restatement / Prior Period Adjustment",        "Total Check Status": "", <col values>},
+      {"COA Flag": "CP", "Row Items": "<net position beginning restated label>", "COA Datapoint": "Net Position - Beginning of Year (As Restated)","Total Check Status": "", <col values>},
+      {"COA Flag": "CP", "Row Items": "<net position ending label>",             "COA Datapoint": "Net Position - End of Year",                  "Total Check Status": "", <col values>}
     ]
   }
 }
+NOTE: Restatement DP and "as restated" CP rows are CONDITIONAL — omit if not printed.
+"Net position - ending" is always the LAST row of the entire JSON output.
 
 *** SECTION-ABSENCE OVERRIDE OF THE SCHEMA ABOVE ***
 The "Contributions and Transfers" block shown above is the SHAPE to use ONLY when the PDF
@@ -564,13 +614,14 @@ L. FINAL SELF-CHECK BEFORE OUTPUT
   separate post-nonoperating subtotal), then "Income (Loss) before Transfers" MUST be []
   — do NOT duplicate the "Operating income (loss)" row into this section. Re-emitting the same
   PDF line under two different section/COA-Datapoint labels is a scoring error, not a feature.
-- "Change in net position" is CP and is the FIRST row in its section — but the section is no
-  longer guaranteed to be a single row. Continue appending subsequent printed rows to this
-  section (classified as DP/CP per normal rules) until the GENERALIZED STOP ROW is reached
-  (a beginning/starting balance row tied to net position, fund net position, or members'
-  equity — see D.6). That stop row and everything after it (ending balance, restatements,
-  reconciliation footnotes) are excluded from output. STOP HERE — nothing after the stop row
-  is emitted.
+- "Change in net position" is CP and is the FIRST row of the "Change in Net Position" section.
+  The section continues with the full net-position roll-forward:
+    CP "Change in net position" → CP "Net position - beginning" → DP restatement(s) if any →
+    CP "Net position - beginning, as restated" if printed → CP "Net position - ending" (LAST).
+  "Net position - ending" is the LAST row of the entire JSON output.
+  "Net position - beginning" is an ANCHOR CP (opening balance); leave Total Check blank.
+  Roll-forward identity: Ending == (Restated Beginning if printed else Beginning) + Change.
+  All Total Check Status cells = "" — downstream Python validates.
 - Column names and count N fixed once; never change mid-statement.
 - Every data row has exactly N column keys matching Reporting Columns strings.
 - Every row has "Total Check Status" set to "" (empty string), with NO

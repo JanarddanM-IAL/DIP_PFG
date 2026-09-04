@@ -8,39 +8,102 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 import shutil
 import copy
-from total_check_engine import run_total_check  # ← runs CP-vs-DP arithmetic, fills real PASS/FAIL
+from compact_schema import STATEMENT_SUFFIX_ALTERNATION
+
+# ── Coordinate support ────────────────────────────────────────────────────────
+_COORD_SUFFIX = "_coord"
+
+def _is_coord_key(key: str) -> bool:
+    return key.endswith(_COORD_SUFFIX)
+
+def _parent_of_coord(coord_key: str) -> str:
+    return coord_key[: -len(_COORD_SUFFIX)]
+
+def _coord_key_of(col: str) -> str:
+    return col + _COORD_SUFFIX
+
+def _serialise_coord(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return str(value)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+try:
+    from total_check_engine import run_total_check
+except ImportError:
+    def run_total_check(data, stmt_type):
+        return data
 
 CHECK_STATUS_COL = "Total Check Status"
+ROW_PAGE_NO_COL  = "Row Page No"
 
-# Infers the RULES dict key (e.g. "_GOV_BS") from a JSON filename stem like
-# "DYER_COUNTY_2024_GOV_BS_p12-13". Mirrors the statement-type vocabulary
-# already used by _STMT_CSV_RE / STMT_ORDER further down this file.
+# ── Column normalisation ──────────────────────────────────────────────────────
+# Maps every statement-specific "* Items" key to the canonical "Row Items".
+# This ensures all 15 sheets share one consistent label column name.
+COLUMN_RENAME_MAP: dict[str, str] = {
+    "SOA Items":            "Row Items",
+    "GOV_BS Items":         "Row Items",
+    "GOV_IS Items":         "Row Items",
+    "PROP_SNP Items":       "Row Items",
+    "PROP_IS Items":        "Row Items",
+    "PROP_CFS Items":       "Row Items",
+    "DSR Items":            "Row Items",
+    "TAX_BASE Items":       "Row Items",
+    "Pension Items":        "Row Items",
+    "OPEB Items":           "Row Items",
+    "CAPITAL_ASSETS Items": "Row Items",   # safety alias
+    "Finding":              "Row Items",   # FAQS sheet
+    "Overview Item":        "Row Items",   # OVERVIEW sheet
+}
+
+# Columns that duplicate the Section column and must be suppressed entirely.
+COLUMNS_TO_DROP: set[str] = {
+    "Pension Plan Name",
+    "OPEB Plan Name",
+}
+
+# Reverse map: canonical name → original JSON key (first registered wins).
+_RENAME_REVERSE: dict[str, str] = {}
+for _src, _dst in COLUMN_RENAME_MAP.items():
+    if _dst not in _RENAME_REVERSE:
+        _RENAME_REVERSE[_dst] = _src
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SELF_CHECKED_STMT_TYPES: set[str] = {
+    "_CAPITAL_ASSETS",
+    "_TAX_BASE",
+    "_OVERVIEW",
+    "_PEN",
+    "_OPEB",
+    "_FAQS",
+}
+
 _STMT_JSON_RE = re.compile(
-    r"^(.+?)_(SNP|SOA|GOV_BS|GOV_IS|PROP_SNP|PROP_IS|PROP_CFS|DSR|DEBT)"
+    rf"^(.+?)_({STATEMENT_SUFFIX_ALTERNATION})"
     r"(?:_Comp)?_p[\d\-]+$",
     re.IGNORECASE,
 )
 
 
 def infer_stmt_type(json_stem: str) -> str:
-    """Return the RULES dict key (e.g. '_GOV_BS') for a JSON filename stem,
-    or '' if no recognised statement-type token is found."""
     m = _STMT_JSON_RE.match(json_stem)
     if m:
         return "_" + m.group(2).upper()
     return ""
 
+
 METADATA_COLUMNS = {
-    "Statement", "Issuer Name", "FYE", "Page No", "Currency reported", "Section",
+    "Statement", "Issuer Name", "FYE", "Page No", "Currency reported",
+    "Reported in Thousand", "Section",
 }
 
 NON_NUMERIC_ITEM_COLUMNS = {
-    "COA Flag", "Line Items", "SNP Items", "SOA Items",
-    "Balance Sheet Items", "Row Items", "COA Datapoint",
-    "GOV_BS Items", "GOV_IS Items",
-    "PROP_SNP Items", "PROP_IS Items",
-    "PROP_CFS Items", "DSR Items", "DEBT Items",
-    "Fund Items", "Cash Flow Items",
+    "COA Flag",
+    "Row Items",
+    "COA Datapoint",
 }
 
 
@@ -86,7 +149,7 @@ def is_numeric_reporting_column(col: str, csv_rows: list[dict]) -> bool:
 
 
 def get_row_label(row: dict) -> str:
-    for key in ["Row Items", "Line Items", "SNP Items", "SOA Items", "Balance Sheet Items"]:
+    for key in ["Row Items"]:
         v = row.get(key)
         if v:
             return str(v).strip()
@@ -96,13 +159,40 @@ def get_row_label(row: dict) -> str:
 def normalize_value(value):
     if value is None:
         return ""
-    if isinstance(value, (dict, list)):
+    if isinstance(value, dict):
+        return _serialise_coord(value)
+    if isinstance(value, list):
         return json.dumps(value, ensure_ascii=False)
     return value
 
 
-def discover_dynamic_columns(sections: dict) -> list[str]:
-    discovered = OrderedDict()
+def _apply_column_renames(normal_cols: list[str]) -> list[str]:
+    """
+    1. Drop columns in COLUMNS_TO_DROP (Pension/OPEB Plan Name — duplicates Section).
+    2. Rename columns via COLUMN_RENAME_MAP (e.g. "Pension Items" → "Row Items").
+    3. De-duplicate while preserving first-seen order.
+    """
+    seen:   set[str]  = set()
+    result: list[str] = []
+    for col in normal_cols:
+        if col in COLUMNS_TO_DROP:
+            continue
+        canonical = COLUMN_RENAME_MAP.get(col, col)
+        if canonical not in seen:
+            seen.add(canonical)
+            result.append(canonical)
+    return result
+
+
+def discover_dynamic_columns(sections: dict) -> tuple[list[str], list[str]]:
+    """
+    Walk all section rows and return two lists:
+      1. normal_cols  — every key that is NOT a _coord key, in discovery order
+      2. coord_cols   — every _coord key found, in discovery order
+    """
+    normal_cols: OrderedDict[str, bool] = OrderedDict()
+    coord_cols:  OrderedDict[str, bool] = OrderedDict()
+
     for _, items in sections.items():
         if not isinstance(items, list):
             continue
@@ -110,20 +200,59 @@ def discover_dynamic_columns(sections: dict) -> list[str]:
             if not isinstance(item, dict):
                 continue
             for key in item.keys():
-                if key not in discovered:
-                    discovered[key] = True
-    return list(discovered.keys())
+                if _is_coord_key(key):
+                    coord_cols[key] = True
+                else:
+                    normal_cols[key] = True
+
+    return list(normal_cols.keys()), list(coord_cols.keys())
 
 
-def order_item_columns(dynamic_item_columns: list[str]) -> list[str]:
-    priority = ["COA Flag", "Row Items", "Line Items", "SNP Items", "SOA Items", "Balance Sheet Items"]
-    filtered = [c for c in dynamic_item_columns if c != CHECK_STATUS_COL]
-    ordered  = [c for c in priority if c in filtered]
-    ordered += [c for c in filtered if c not in ordered]
+def order_item_columns(
+    normal_item_columns: list[str],
+    coord_item_columns:  list[str],
+) -> list[str]:
+    """
+    Build the final ordered column list:
+      • Priority label columns ALWAYS first, in this fixed sequence:
+          COA Flag  →  Row Items  →  COA Datapoint
+        COA Datapoint is ALWAYS emitted as column J (after the 7 PRIORITY_COLS
+        metadata columns in A–G + COA Flag in H + Row Items in I).
+        It is injected even when absent from the JSON data so that every sheet
+        has a consistent column J = "COA Datapoint".
+      • Then each reporting column immediately followed by its _coord sibling.
+      • Total Check Status is always last.
+    """
+    # Fixed label columns — order determines Excel column positions H, I, J.
+    # COA Datapoint is ALWAYS included (injected if missing from data) so it
+    # lands in column J on every sheet without exception.
+    priority = [
+        "COA Flag",       # col H
+        "Row Items",      # col I
+        "COA Datapoint",  # col J  ← always present, always here
+    ]
+
+    coord_set = set(coord_item_columns)
+
+    filtered = [c for c in normal_item_columns if c != CHECK_STATUS_COL]
+
+    # Always place all priority columns first — inject any that are absent from
+    # the discovered data so column J is never skipped.
+    ordered   = list(priority)                                    # always all 3
+    remaining = [c for c in filtered if c not in set(priority)]  # reporting cols
+
+    for col in remaining:
+        ordered.append(col)
+        coord_key = _coord_key_of(col)
+        if coord_key in coord_set:
+            ordered.append(coord_key)
+
+    already_added = set(ordered)
+    for ck in coord_item_columns:
+        if ck not in already_added:
+            ordered.append(ck)
+
     return ordered
-
-
-import copy  # ← add this import near the top of jsonToCsv.py, with the other imports
 
 
 def run_json_to_csv_pipeline(json_path: str, csv_path: str) -> bool:
@@ -142,13 +271,6 @@ def run_json_to_csv_pipeline(json_path: str, csv_path: str) -> bool:
     if not isinstance(sections, dict) or not sections:
         raise ValueError("Invalid or empty 'Sections' found in JSON")
 
-    # ── Run the arithmetic engine on a COPY, for CSV purposes only ───────
-    # "Total Check Status" is CSV-only output. The on-disk JSON is never
-    # mutated or rewritten here — it stays exactly as the LLM/pipeline
-    # produced it. run_total_check() is run against a deepcopy so its
-    # in-place row mutations can't leak back into `data`.
-
-    # ── Infer statement type up front (needed for BOTH repair + total check) ──
     stmt_type = infer_stmt_type(json_path.stem)
     if not stmt_type:
         print(f" [WARN] Could not infer statement type from filename "
@@ -158,9 +280,6 @@ def run_json_to_csv_pipeline(json_path: str, csv_path: str) -> bool:
               flush=True)
         checked_sections = sections
     else:
-        # ── 1. Column-shift repair runs on the REAL `data` so fixes
-        #      persist back to the on-disk JSON (this is intentional —
-        #      it's a data-correctness fix, not a derived metric). ──
         try:
             from column_shift_repair import repair_column_shifts
             repair_column_shifts(data, stmt_type)
@@ -170,7 +289,6 @@ def run_json_to_csv_pipeline(json_path: str, csv_path: str) -> bool:
         except Exception as e:
             print(f" [WARN] column_shift_repair failed: {e}", flush=True)
 
-        # ── 2. Persist repaired JSON back to disk (only if any repair fired) ──
         if data.get("_column_shift_repairs"):
             json_path.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2),
@@ -179,31 +297,51 @@ def run_json_to_csv_pipeline(json_path: str, csv_path: str) -> bool:
             print(f"   [REPAIR] {len(data['_column_shift_repairs'])} "
                   f"column-shift fix(es) written back to {json_path.name}",
                   flush=True)
-            # Refresh `sections` reference so downstream CSV build sees the swap
             sections = data.get("Sections", {})
 
-        # ── 3. Total Check still runs on a deepcopy so its CSV-only
-        #      "Total Check Status" mutations don't leak into the JSON. ──
-        checked_data = run_total_check(copy.deepcopy(data), stmt_type)
-        checked_sections = checked_data.get("Sections", {})
+        if stmt_type in _SELF_CHECKED_STMT_TYPES:
+            print(f"   [CHECK] {stmt_type.lstrip('_')} - Total Check Status kept "
+                  f"as extracted (no total_check_engine rules for this type)",
+                  flush=True)
+            checked_sections = sections
+        else:
+            checked_data     = run_total_check(copy.deepcopy(data), stmt_type)
+            checked_sections = checked_data.get("Sections", {})
 
+    statement             = metadata.get("Statement", "")
+    issuer_name           = metadata.get("Issuer Name", "")
+    fye                   = metadata.get("FYE", "")
+    page_no               = metadata.get("Page No", "")
+    currency_reported     = metadata.get("Currency reported", "")
+    reported_in_thousand  = metadata.get("Reported in Thousand", "No")
 
-    statement         = metadata.get("Statement", "")
-    issuer_name       = metadata.get("Issuer Name", "")
-    fye               = metadata.get("FYE", "")
-    page_no           = metadata.get("Page No", "")
-    currency_reported = metadata.get("Currency reported", "")
+    # ── Discover columns (coords separated from normals) ─────────────────
+    normal_cols, coord_cols = discover_dynamic_columns(checked_sections)
 
-    # Discover columns from the checked sections (Total Check Status is
-    # added by the engine, so this still picks it up correctly for the
-    # CSV header) — but fall back to the original sections shape either way.
-    dynamic_item_columns = discover_dynamic_columns(checked_sections)
-    ordered_item_columns = order_item_columns(dynamic_item_columns)
+    # Rename statement-specific "* Items" → "Row Items" and drop duplicate
+    # plan-name columns (Pension/OPEB Plan Name == Section).
+    normal_cols = _apply_column_renames(normal_cols)
 
-    base_fieldnames = [
-        "Statement", "Issuer Name", "FYE", "Page No", "Currency reported", "Section",
-    ] + ordered_item_columns + [CHECK_STATUS_COL]
+    ordered_item_columns = order_item_columns(normal_cols, coord_cols)
 
+    # ── Resolve the "Page No" name collision ─────────────────────────────
+    output_item_columns = [
+        ROW_PAGE_NO_COL if c == "Page No" else c
+        for c in ordered_item_columns
+    ]
+    if ROW_PAGE_NO_COL in output_item_columns:
+        print(f"   [COLS] per-row page column renamed "
+              f"\"Page No\" -> \"{ROW_PAGE_NO_COL}\" to protect the metadata "
+              f"Page No identifier", flush=True)
+
+    base_fieldnames = (
+        ["Statement", "Issuer Name", "FYE", "Page No", "Currency reported",
+         "Reported in Thousand", "Section"]
+        + output_item_columns
+        + [CHECK_STATUS_COL]
+    )
+
+    # ── Build CSV rows ────────────────────────────────────────────────────
     csv_rows = []
     for section_name, items in checked_sections.items():
         if not isinstance(items, list):
@@ -212,15 +350,32 @@ def run_json_to_csv_pipeline(json_path: str, csv_path: str) -> bool:
             if not isinstance(item, dict):
                 continue
             row = {
-                "Statement":         statement,
-                "Issuer Name":       issuer_name,
-                "FYE":               fye,
-                "Page No":           page_no,
-                "Currency reported": currency_reported,
-                "Section":           section_name,
+                "Statement":            statement,
+                "Issuer Name":          issuer_name,
+                "FYE":                  fye,
+                "Page No":              page_no,
+                "Currency reported":    currency_reported,
+                "Reported in Thousand": reported_in_thousand,
+                "Section":              section_name,
             }
-            for col in ordered_item_columns:
-                row[col] = normalize_value(item.get(col))
+            for src_col, out_col in zip(ordered_item_columns, output_item_columns):
+                if _is_coord_key(src_col):
+                    raw = item.get(src_col)
+                    row[out_col] = _serialise_coord(raw)
+                else:
+                    # src_col is already the CANONICAL name (after _apply_column_renames).
+                    # Look up the value using both the canonical name and any original
+                    # JSON key that maps to it, so we find the value regardless of
+                    # which key name the LLM used in the JSON.
+                    raw = item.get(src_col)
+                    if raw is None:
+                        # Try original key names that map to this canonical name
+                        for orig_key, canonical in COLUMN_RENAME_MAP.items():
+                            if canonical == src_col:
+                                raw = item.get(orig_key)
+                                if raw is not None:
+                                    break
+                    row[out_col] = normalize_value(raw)
             row[CHECK_STATUS_COL] = normalize_value(item.get(CHECK_STATUS_COL))
             csv_rows.append(row)
 
@@ -233,8 +388,6 @@ def run_json_to_csv_pipeline(json_path: str, csv_path: str) -> bool:
         writer.writeheader()
         writer.writerows(csv_rows)
 
-    #print(f" Dynamic CSV saved at: {csv_path}", flush=True)
-
     ACCEPTABLE = {"", "PASS", "Skipped - no membership rule defined",
                   "Skipped - no rule defined"}
     all_pass = all(
@@ -243,15 +396,15 @@ def run_json_to_csv_pipeline(json_path: str, csv_path: str) -> bool:
         if str(row.get("COA Flag", "")).strip().upper() == "CP"
     )
 
-    #print(f" Validation result  : {'ALL PASS' if all_pass else 'FAIL(S) DETECTED'}", flush=True)
     return all_pass
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED REGEX / CONSTANTS FOR MERGE FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
 _STMT_CSV_RE = re.compile(
-    r"^(.+?)_(SNP|SOA|GOV_BS|GOV_IS|PROP_SNP|PROP_IS|PROP_CFS|DSR|DEBT)"
+    rf"^(.+?)_({STATEMENT_SUFFIX_ALTERNATION})"
     r"(?:_Comp)?_p[\d\-]+\.csv$",
     re.IGNORECASE,
 )
@@ -259,14 +412,26 @@ _STMT_CSV_RE = re.compile(
 _ALL_CSV_RE = re.compile(r"_All\.csv$", re.IGNORECASE)
 
 STMT_ORDER = {
-    "SNP": 0, "SOA": 1, "GOV_BS": 2, "GOV_IS": 3,
-    "PROP_SNP": 4, "PROP_IS": 5, "PROP_CFS": 6,
-    "DEBT": 7, "DSR": 8,
+    "OVERVIEW":        0,
+    "SNP":             1,
+    "SOA":             2,
+    "GOV_BS":          3,
+    "GOV_IS":          4,
+    "PROP_SNP":        5,
+    "PROP_IS":         6,
+    "PROP_CFS":        7,
+    "CAPITAL_ASSETS":  8,
+    "DEBT":            9,
+    "DSR":            10,
+    "TAX_BASE":       11,
+    "PEN":            12,
+    "OPEB":           13,
+    "FAQS":           14,
 }
 
 PRIORITY_COLS = [
     "Statement", "Issuer Name", "FYE", "Page No",
-    "Currency reported", "Section",
+    "Currency reported", "Reported in Thousand", "Section",
 ]
 
 
@@ -275,10 +440,6 @@ PRIORITY_COLS = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 def merge_all_csvs(folder: str, output_folder: str | None = None) -> list[str]:
-    """
-    Merge individual statement CSVs into one _All.csv per issuer.
-    Scans subfolders recursively.
-    """
     folder = Path(folder)
     if output_folder is None:
         output_folder = folder
@@ -320,16 +481,16 @@ def merge_all_csvs(folder: str, output_folder: str | None = None) -> list[str]:
         print(f"\n  Merging: {base_name}")
 
         all_columns = OrderedDict()
-        all_rows = []
+        all_rows    = []
 
         for csv_file in csv_files:
-            stmt_m = _STMT_CSV_RE.match(csv_file.name)
+            stmt_m    = _STMT_CSV_RE.match(csv_file.name)
             stmt_type = stmt_m.group(2).upper() if stmt_m else "?"
 
             with open(csv_file, "r", encoding="utf-8-sig", errors="replace") as fh:
-                reader = csv.DictReader(fh)
+                reader    = csv.DictReader(fh)
                 fieldnames = list(reader.fieldnames or [])
-                rows = list(reader)
+                rows      = list(reader)
 
             for col in fieldnames:
                 if col not in all_columns:
@@ -362,36 +523,19 @@ def merge_all_csvs(folder: str, output_folder: str | None = None) -> list[str]:
 
     print(f"\n  Done. {len(created)} merged file(s) created.")
     return created
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MERGE CSVs INSIDE ONE DEAL FOLDER → EXCEL (sheet per statement type)
 # THEN DELETE INDIVIDUAL CSVs
 # ─────────────────────────────────────────────────────────────────────────────
 
 def merge_deal_csvs_to_excel(deal_folder: str, deal_name: str) -> str:
-    """
-    Merge all statement CSVs inside a single deal folder into one Excel
-    workbook with one sheet per statement type, then delete individual CSVs.
-
-    Output: <deal_folder>/<deal_name>_All_Statements.xlsx
-
-    Parameters
-    ----------
-    deal_folder : str
-        Path to the deal subfolder (e.g. 04_Validated_output/LG_CIT_AK_600023935_2022/)
-    deal_name : str
-        Base name of the deal (e.g. LG_CIT_AK_600023935_2022)
-
-    Returns
-    -------
-    str
-        Path to the created Excel file, or "" if no CSVs found.
-    """
     deal_folder = Path(deal_folder)
     output_path = deal_folder / f"{deal_name}_All_Statements.xlsx"
 
-    # ── Find all statement CSVs in this folder ───────────────────────────
     csv_files_by_type: dict[str, list[Path]] = {}
-    all_csv_files: list[Path] = []
+    all_csv_files:     list[Path]            = []
 
     for f in sorted(deal_folder.glob("*.csv")):
         if not f.is_file():
@@ -400,11 +544,9 @@ def merge_deal_csvs_to_excel(deal_folder: str, deal_name: str) -> str:
             continue
         if f.name.startswith("_"):
             continue
-
         m = _STMT_CSV_RE.match(f.name)
         if not m:
             continue
-
         stmt_type = m.group(2).upper()
         csv_files_by_type.setdefault(stmt_type, []).append(f)
         all_csv_files.append(f)
@@ -413,26 +555,28 @@ def merge_deal_csvs_to_excel(deal_folder: str, deal_name: str) -> str:
         print(f"    No statement CSVs found in: {deal_folder}")
         return ""
 
-    # ── Create Excel workbook ────────────────────────────────────────────
     wb = openpyxl.Workbook()
-    wb.remove(wb.active)  # remove default empty sheet
+    wb.remove(wb.active)
 
     ordered_types = sorted(
         csv_files_by_type.keys(),
         key=lambda t: STMT_ORDER.get(t, 99),
     )
 
+    grey_fill  = openpyxl.styles.PatternFill("solid", fgColor="D9D9D9")
+    coord_font = openpyxl.styles.Font(color="808080", italic=True, size=8)
+
     for stmt_type in ordered_types:
         csv_files = sorted(csv_files_by_type[stmt_type])
 
         all_columns = OrderedDict()
-        all_rows = []
+        all_rows    = []
 
         for csv_file in csv_files:
             with open(csv_file, "r", encoding="utf-8-sig", errors="replace") as fh:
-                reader = csv.DictReader(fh)
+                reader     = csv.DictReader(fh)
                 fieldnames = list(reader.fieldnames or [])
-                rows = list(reader)
+                rows       = list(reader)
 
             for col in fieldnames:
                 if col not in all_columns:
@@ -443,7 +587,6 @@ def merge_deal_csvs_to_excel(deal_folder: str, deal_name: str) -> str:
         if not all_rows:
             continue
 
-        # ── Build final column order ─────────────────────────────────
         final_columns = []
         for col in PRIORITY_COLS:
             if col in all_columns:
@@ -452,29 +595,34 @@ def merge_deal_csvs_to_excel(deal_folder: str, deal_name: str) -> str:
             if col not in final_columns:
                 final_columns.append(col)
 
-        # ── Write to sheet ───────────────────────────────────────────
         ws = wb.create_sheet(title=stmt_type)
 
-        # Header row (bold)
         for col_idx, col_name in enumerate(final_columns, start=1):
-            cell = ws.cell(row=1, column=col_idx, value=col_name)
+            cell      = ws.cell(row=1, column=col_idx, value=col_name)
             cell.font = openpyxl.styles.Font(bold=True)
+            if _is_coord_key(col_name):
+                cell.fill = grey_fill
+                cell.font = openpyxl.styles.Font(bold=True, color="505050", size=8)
 
-        # Data rows
         for row_idx, row_data in enumerate(all_rows, start=2):
             for col_idx, col_name in enumerate(final_columns, start=1):
                 value = row_data.get(col_name, "")
-                ws.cell(row=row_idx, column=col_idx, value=value)
+                cell  = ws.cell(row=row_idx, column=col_idx, value=value)
+                if _is_coord_key(col_name) and value:
+                    cell.font = coord_font
+                    cell.fill = openpyxl.styles.PatternFill("solid", fgColor="F5F5F5")
 
-        # Auto-width (sample first 50 rows)
         for col_idx, col_name in enumerate(final_columns, start=1):
             max_len = len(col_name)
             for row_data in all_rows[:50]:
                 cell_val = str(row_data.get(col_name, ""))
-                max_len = max(max_len, len(cell_val))
-            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 40)
+                max_len  = max(max_len, len(cell_val))
+            if _is_coord_key(col_name):
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 35)
+                ws.column_dimensions[get_column_letter(col_idx)].hidden = True
+            else:
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 40)
 
-    # ── Save ─────────────────────────────────────────────────────────────
     if not wb.sheetnames:
         print(f"    No data sheets created — skipping Excel save for {deal_name}")
         return ""
@@ -482,7 +630,6 @@ def merge_deal_csvs_to_excel(deal_folder: str, deal_name: str) -> str:
     wb.save(str(output_path))
     print(f"    ✅ {output_path.name}")
 
-    # ── Delete individual CSVs ───────────────────────────────────────────
     deleted = 0
     for csv_file in all_csv_files:
         try:
@@ -491,34 +638,14 @@ def merge_deal_csvs_to_excel(deal_folder: str, deal_name: str) -> str:
         except Exception as e:
             print(f"    [WARN] Could not delete {csv_file.name}: {e}")
 
-    # if deleted:
-    #     print(f"    🗑  Deleted {deleted} individual CSV(s)")
-
     return str(output_path)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MERGE ALL CSVs INTO ONE EXCEL — SHEET PER STATEMENT TYPE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def merge_csvs_to_excel(folder: str, output_path: str | None = None) -> str:
-    """
-    Merge all statement CSVs into one Excel workbook with one sheet
-    per statement type (SNP, SOA, GOV_BS, GOV_IS, PROP_SNP, PROP_IS,
-    PROP_CFS, DSR, DEBT).
-
-    Parameters
-    ----------
-    folder : str
-        Root folder containing per-PDF subfolders with individual CSV files.
-    output_path : str, optional
-        Full path for the output .xlsx file.
-        Defaults to <folder>/All_Statements.xlsx
-
-    Returns
-    -------
-    str
-        Path to the created Excel file, or "" if no CSVs found.
-    """
     folder = Path(folder)
 
     if output_path is None:
@@ -528,7 +655,6 @@ def merge_csvs_to_excel(folder: str, output_path: str | None = None) -> str:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ── Group CSVs by statement type ─────────────────────────────────────
     stmt_groups: dict[str, list[Path]] = {}
 
     for f in sorted(folder.rglob("*.csv")):
@@ -536,14 +662,11 @@ def merge_csvs_to_excel(folder: str, output_path: str | None = None) -> str:
             continue
         if _ALL_CSV_RE.search(f.name):
             continue
-        # Skip summary / merged files
         if f.name.startswith("_"):
             continue
-
         m = _STMT_CSV_RE.match(f.name)
         if not m:
             continue
-
         stmt_type = m.group(2).upper()
         if stmt_type not in stmt_groups:
             stmt_groups[stmt_type] = []
@@ -553,30 +676,25 @@ def merge_csvs_to_excel(folder: str, output_path: str | None = None) -> str:
         print(f"  No statement CSVs found in: {folder}")
         return ""
 
-    # ── Create Excel workbook ────────────────────────────────────────────
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)  # remove default empty sheet
+    wb           = openpyxl.Workbook()
+    grey_fill    = openpyxl.styles.PatternFill("solid", fgColor="D9D9D9")
+    coord_font   = openpyxl.styles.Font(color="808080", italic=True, size=8)
+    wb.remove(wb.active)
 
-    # Process sheets in defined order
-    ordered_types = sorted(
-        stmt_groups.keys(),
-        key=lambda t: STMT_ORDER.get(t, 99)
-    )
+    ordered_types = sorted(stmt_groups.keys(), key=lambda t: STMT_ORDER.get(t, 99))
 
     for stmt_type in ordered_types:
         csv_files = sorted(stmt_groups[stmt_type])
-
         print(f"\n  Sheet: {stmt_type}  ({len(csv_files)} CSV file(s))")
 
-        # ── Collect all rows + discover all columns ──────────────────
         all_columns = OrderedDict()
-        all_rows = []
+        all_rows    = []
 
         for csv_file in csv_files:
             with open(csv_file, "r", encoding="utf-8-sig", errors="replace") as fh:
-                reader = csv.DictReader(fh)
+                reader     = csv.DictReader(fh)
                 fieldnames = list(reader.fieldnames or [])
-                rows = list(reader)
+                rows       = list(reader)
 
             for col in fieldnames:
                 if col not in all_columns:
@@ -589,7 +707,6 @@ def merge_csvs_to_excel(folder: str, output_path: str | None = None) -> str:
             print(f"    ⚠ No rows — skipping sheet")
             continue
 
-        # ── Build final column order ─────────────────────────────────
         final_columns = []
         for col in PRIORITY_COLS:
             if col in all_columns:
@@ -598,48 +715,51 @@ def merge_csvs_to_excel(folder: str, output_path: str | None = None) -> str:
             if col not in final_columns:
                 final_columns.append(col)
 
-        # ── Write to sheet ───────────────────────────────────────────
         ws = wb.create_sheet(title=stmt_type)
 
-        # Header row (bold)
         for col_idx, col_name in enumerate(final_columns, start=1):
-            cell = ws.cell(row=1, column=col_idx, value=col_name)
+            cell      = ws.cell(row=1, column=col_idx, value=col_name)
             cell.font = openpyxl.styles.Font(bold=True)
+            if _is_coord_key(col_name):
+                cell.fill = grey_fill
+                cell.font = openpyxl.styles.Font(bold=True, color="505050", size=8)
 
-        # Data rows
         for row_idx, row_data in enumerate(all_rows, start=2):
             for col_idx, col_name in enumerate(final_columns, start=1):
                 value = row_data.get(col_name, "")
-                ws.cell(row=row_idx, column=col_idx, value=value)
+                cell  = ws.cell(row=row_idx, column=col_idx, value=value)
+                if _is_coord_key(col_name) and value:
+                    cell.font = coord_font
+                    cell.fill = openpyxl.styles.PatternFill("solid", fgColor="F5F5F5")
 
-        # Auto-width (approximate, sample first 50 rows)
         for col_idx, col_name in enumerate(final_columns, start=1):
             max_len = len(col_name)
             for row_data in all_rows[:50]:
                 cell_val = str(row_data.get(col_name, ""))
-                max_len = max(max_len, len(cell_val))
-            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 40)
+                max_len  = max(max_len, len(cell_val))
+            if _is_coord_key(col_name):
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 35)
+            else:
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 40)
 
-        print(f"    → Sheet '{stmt_type}' : {len(all_rows)} rows, {len(final_columns)} columns")
+        print(f"    → Sheet '{stmt_type}': {len(all_rows)} rows, {len(final_columns)} columns")
 
-    # ── Save ─────────────────────────────────────────────────────────────
     if not wb.sheetnames:
         print(f"  No data sheets created — skipping Excel save")
         return ""
 
     wb.save(str(output_path))
     print(f"\n  ✅ Excel saved: {output_path}")
-    print(f"     Sheets: {', '.join(ordered_types)}")
-
     return str(output_path)
 
 
-
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI / STANDALONE
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    DEAL_FOLDER = r"D:\S2_Khushbu\AI Projects\Financial Data Extraction\MDB_multipleAI\04_Validated_Output\NP_CA_822421813_2025_NON-LG"
+    DEAL_FOLDER = r"C:\Users\sbusr1\Downloads\Json\Json"
 
-    # Manual-validation root = sibling of 04_Validated_Output
     MANUAL_VALIDATION_ROOT = (
         Path(DEAL_FOLDER).parent.parent / "05_Manual_Validation_Required"
     )
@@ -664,7 +784,7 @@ if __name__ == "__main__":
     print(f"{'='*70}\n")
 
     success, failed = 0, 0
-    failed_tables: list[str] = []   # ← tracks which tables failed validation
+    failed_tables: list[str] = []
 
     for jf in json_files:
         csv_path = deal_path / (jf.stem + ".csv")
@@ -679,7 +799,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"    [ERROR] {e}\n")
             failed += 1
-            failed_tables.append(jf.stem)  # exceptions = also needs manual check
+            failed_tables.append(jf.stem)
 
     print(f"\n  JSON → CSV : {success} succeeded, {failed} failed")
     if failed_tables:
@@ -695,14 +815,10 @@ if __name__ == "__main__":
     else:
         print(f"\n  [WARN] No Excel created")
 
-    # ─────────────────────────────────────────────────────────────────
-    # MOVE TO 05_Manual_Validation_Required IF ANY FAIL
-    # ─────────────────────────────────────────────────────────────────
     if failed_tables:
         MANUAL_VALIDATION_ROOT.mkdir(parents=True, exist_ok=True)
         target_dir = MANUAL_VALIDATION_ROOT / deal_name
 
-        # If target already exists, remove it so move() doesn't fail
         if target_dir.exists():
             shutil.rmtree(target_dir)
 

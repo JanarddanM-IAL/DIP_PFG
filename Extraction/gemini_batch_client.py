@@ -16,6 +16,9 @@ _TERMINAL = {"JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED",
 # Batch = 50% of standard rates  (input, output) per 1M tokens
 # Source: ai.google.dev/gemini-api/docs/pricing (verified July 2026)
 GEMINI_BATCH_RATES = {
+        # Standard: $1.50 / $9.00  →  batch: $0.75 / $4.50
+    "gemini-3.6-flash":              (0.75,  3.75),
+
     # Standard: $1.50 / $9.00  →  batch: $0.75 / $4.50
     "gemini-3.5-flash":              (0.75,  4.50),
 
@@ -36,6 +39,7 @@ GEMINI_STANDARD_RATES = {
     "gemini-2.5-flash":              (0.30,  2.50),
     "gemini-2.5-pro":                (1.25, 10.00),
     "gemini-3.5-flash":              (1.50,  9.00),
+    "gemini-3.6-flash":              (1.50,  7.50),
     "gemini-3.1-flash-lite-preview": (0.25,  1.50),
 }
 

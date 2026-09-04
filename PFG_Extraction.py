@@ -60,6 +60,7 @@ from db import Database, build_in_clause
 try:
     from pipeline import (  # type: ignore  # resolved at runtime via sys.path -> Extraction/
         run_extraction,
+        run_extraction_batch,
         process_one_deal,
         load_xlsx_as_pipe_text,
         get_base_pdf_name,
@@ -128,12 +129,20 @@ _DISPLAY_STAGES = [
 # =========================================================
 # --- LLM / engine knobs (defaults mirror the project's extraction command line) ---
 PROVIDER          = "gemini"            # openai | gemini | claude
-MODEL             = "gemini-3.5-flash"
+MODEL             = "gemini-3.6-flash"
 TIER              = "paid"              # free | paid  (claude is always paid)
 MAX_TOKENS        = 65536
 USE_LLM_ID        = True                # LLM-guided page identification before slicing
-ID_MODEL          = "gemini-3.5-flash"  # model used for page identification
+ID_MODEL          = "gemini-3.6-flash"  # model used for page identification
 REPORTING_COLUMNS = None
+
+# Batch API for normalization: ~50% cheaper per token, async submit+poll. Mirrors
+# the standalone CLI's --batch flag and REQUIRES TIER="paid".
+#   NOTE: batch PAGE IDENTIFICATION is Claude-only — pipeline.run_extraction_batch
+#   delegates to the sync run_extraction for any non-Claude ID_MODEL. With the
+#   Gemini ID_MODEL above, page ID stays synchronous and only normalization is
+#   batched. Set ID_MODEL to a Claude model to batch page ID as well.
+USE_BATCH         = True
 
 # --- engine resource folders (verified to exist inside Extraction/) ---
 PROMPTS_FOLDER     = _ENGINE_DIR / "prompts"
@@ -329,12 +338,21 @@ def process_one_row(db, db_row, coa_text, store=None):
         # the same source folder.
         shutil.copy2(str(src_pdf), str(tmp_dir / src_pdf.name))
 
-        extracted = run_extraction(
-            str(tmp_dir),
-            prompts_folder = str(PROMPTS_FOLDER),
-            use_llm_id     = USE_LLM_ID,
-            id_model       = ID_MODEL,
-        )
+        # Page identification + slicing. run_extraction_batch self-falls-back to
+        # the sync run_extraction unless ID_MODEL is a Claude model (see USE_BATCH).
+        if USE_BATCH:
+            extracted = run_extraction_batch(
+                str(tmp_dir),
+                prompts_folder = str(PROMPTS_FOLDER),
+                id_model       = ID_MODEL,
+            )
+        else:
+            extracted = run_extraction(
+                str(tmp_dir),
+                prompts_folder = str(PROMPTS_FOLDER),
+                use_llm_id     = USE_LLM_ID,
+                id_model       = ID_MODEL,
+            )
         if not extracted:
             print(f"[WARN] Id={row_id}: no extractable tables produced")
             finalize_extraction(db, row_id, 0, 0, 0,
@@ -358,6 +376,7 @@ def process_one_row(db, db_row, coa_text, store=None):
             coa_mapping_folder = str(COA_MAPPING_FOLDER),
             client             = _make_client(),
             sector             = sector,
+            batch              = USE_BATCH,
         )
 
         # Unexpected engine failure with nothing produced -> hard fail.

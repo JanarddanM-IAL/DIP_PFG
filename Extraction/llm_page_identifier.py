@@ -57,6 +57,7 @@ _DSR_YEAR_ROW_RE = re.compile(
     r"|^\s*(20[2-9]\d)(?:\s*[-–]\s*20[2-9]\d)?\s*$",
     re.MULTILINE,
 )
+
 _PROP_SNP_VAL_TITLE_RE = re.compile(
     r"\bbalance\s+sheets?\b"
     r"|\bstatement\s+of\s+(?:fund\s+)?net\s+(?:position|assets)\b"
@@ -128,6 +129,20 @@ _TABLE_KEY_TO_SUFFIX = {
     "PROP_IS":  "_PROP_IS",
     "PROP_CFS": "_PROP_CFS",
 }
+
+# Targets of the THIRD identification call (Notes / RSI / Statistical content).
+# These live OUTSIDE the basic financial statements, so Main_Tables_Prompt.txt
+# (which applies REJECT-F to Notes pages) can never find them — exactly the same
+# reason DSR/DEBT needed their own call and their own prompt.
+_NOTES_TABLE_KEY_TO_SUFFIX = {
+    "OVERVIEW":       "_OVERVIEW",
+    "CAPITAL_ASSETS": "_CAPITAL_ASSETS",
+    "TAX_BASE":       "_TAX_BASE",
+    "PEN":            "_PEN",
+    "OPEB":           "_OPEB",
+    "FAQS":           "_FAQS",
+}
+_NOTES_TABLE_KEYS = list(_NOTES_TABLE_KEY_TO_SUFFIX)
 _DEBT_ROW_RE = re.compile(
     r"^\s*(?:General\s+obligation\s+bonds?|Revenue\s+bonds?|Special\s+assessment"
     r"|Notes?\s+payable|Lease\s+(?:liability|financed)|SBITA\s+liabilit"
@@ -298,7 +313,8 @@ def _collapse_char_spacing(text: str) -> str:
 # TEXT EXTRACTION HELPERS  (Claude text-based path)
 # ════════════════════════════════════════════════════════════════════════
 
-_MAX_CHARS_PER_PAGE = 2000
+_MAX_CHARS_PER_PAGE = 1500
+_MAX_TOTAL_CHARS    = 280_000
 
 
 def _extract_pdf_as_paged_text(pdf_path: str) -> tuple[str, int]:
@@ -330,9 +346,21 @@ def _extract_pdf_as_paged_text(pdf_path: str) -> tuple[str, int]:
                 if len(text) > _MAX_CHARS_PER_PAGE:
                     text = text[:_MAX_CHARS_PER_PAGE] + "\n...[truncated]"
 
-                pages_out.append(
-                    f"<<<PAGE {i + 1}>>>\n{text}\n<<<END PAGE {i + 1}>>>"
-                )
+                page_block = f"<<<PAGE {i + 1}>>>\n{text}\n<<<END PAGE {i + 1}>>>"
+
+                # ── Total budget cap: stop adding pages if we'd exceed limit ──
+                current_total = sum(len(p) for p in pages_out)
+                if current_total + len(page_block) > _MAX_TOTAL_CHARS:
+                    pages_out.append(
+                        f"<<<PAGE {i + 1}>>>\n...[remaining pages omitted — "
+                        f"document too large, first {i + 1} pages shown]"
+                        f"\n<<<END PAGE {i + 1}>>>"
+                    )
+                    print(f"  [ID] Text truncated at page {i + 1}/{total} "
+                          f"to stay within context limit")
+                    break
+
+                pages_out.append(page_block)
     except Exception as e:
         raise RuntimeError(f"Text extraction failed for {pdf_path}: {e}")
 
@@ -638,7 +666,9 @@ def _call_gemini(client, pdf_bytes: bytes, model: str, prompt: str,
         except Exception as e:
             print(f"  [ID] Gemini attempt {attempt + 1} failed: {e}")
             if attempt < 2:
-                time.sleep(2 ** attempt)
+                wait = 30 * (attempt + 1)  # 30s, 60s
+                print(f"  [ID] Gemini 503 — retrying in {wait}s ...")
+                time.sleep(wait)
 
     raise RuntimeError("Gemini: all retries exhausted")
 
@@ -679,18 +709,17 @@ def cleanup_gemini_id_caches():
 # ════════════════════════════════════════════════════════════════════════
 
 def _call_openai(pdf_bytes: bytes, model: str, prompt: str,
-                 max_tokens: int = 8192) -> str:
+                 max_tokens: int = 8192,
+                 pdf_path: str | None = None) -> str:
     """
-    Call OpenAI with the PDF encoded as base64.
+    Call OpenAI for page identification.
 
-    Caching: OpenAI caches identical message prefixes automatically.
-    The static instruction prompt is always the system message; the
-    per-PDF PDF binary is the user message.  After the first call,
-    the system prompt prefix is cached and subsequent calls pay ~50%
-    of the input-token price for that prefix.
-
-    Cache hits appear as usage.prompt_tokens_details.cached_tokens > 0.
-    No extra API calls or objects are needed.
+    Strategy (mirrors Claude text path to avoid context limit):
+      - Extract text via pdfplumber (truncated per page) instead of
+        sending the full PDF as base64 — a large CAFR as base64 can
+        exceed 2M tokens, well over gpt-5.5's 922k limit.
+      - Falls back to base64 only if text extraction fails AND the
+        estimated token count is within the model's context window.
     """
     import openai
     import base64
@@ -708,47 +737,57 @@ def _call_openai(pdf_bytes: bytes, model: str, prompt: str,
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
 
-    client  = openai.OpenAI(api_key=api_key)
-    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+    client = openai.OpenAI(api_key=api_key)
+    is_reasoning = model.lower().startswith(("gpt-5", "o1", "o3", "o4"))
+
+    # ── Prefer text extraction (same as Claude path) ──────────────────
+    user_text = None
+    if pdf_path and os.path.isfile(pdf_path):
+        try:
+            paged_text, total_pages = _extract_pdf_as_paged_text(pdf_path)
+            user_text = _build_user_content_from_paged_text(paged_text, total_pages)
+            print(f"  [ID-OPENAI] Using text extraction ({total_pages} pages)")
+        except Exception as e:
+            print(f"  [ID-OPENAI] Text extraction failed ({e}), falling back to base64")
+
+    if user_text is None:
+        # ── Fallback: base64 — guard against context overflow ─────────
+        estimated_tokens = len(pdf_bytes) * 4 // 3 // 4  # base64 chars / ~4 chars per token
+        if estimated_tokens > 800_000:
+            raise RuntimeError(
+                f"PDF too large for base64 encoding (~{estimated_tokens:,} tokens estimated). "
+                f"Ensure pdf_path is passed so text extraction can be used instead."
+            )
+        pdf_b64   = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+        user_text = (
+            "The following is a base64-encoded PDF of a government "
+            "financial report. Read it carefully and answer the task.\n\n"
+            f"[PDF BASE64 START]\n{pdf_b64}\n[PDF BASE64 END]"
+        )
+        print(f"  [ID-OPENAI] Using base64 fallback (~{estimated_tokens:,} tokens)")
 
     for attempt in range(3):
         try:
-            response = client.chat.completions.create(
+            call_kwargs = dict(
                 model=model,
-                max_tokens=max_tokens,
-                temperature=0.0,
+                max_completion_tokens=max_tokens,
                 messages=[
-                    # ── STATIC system prompt (same for all PDFs) ─────────
-                    # OpenAI automatically caches identical system prefixes.
-                    # No cache_control parameter needed — it's implicit.
-                    {
-                        "role": "system",
-                        "content": prompt,
-                    },
-                    # ── PER-PDF user message (unique, never cached) ───────
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "The following is a base64-encoded PDF of a government "
-                                    "financial report. Read it carefully and answer the task.\n\n"
-                                    f"[PDF BASE64 START]\n{pdf_b64}\n[PDF BASE64 END]"
-                                ),
-                            }
-                        ],
-                    },
+                    {"role": "system", "content": prompt},
+                    {"role": "user",   "content": user_text},
                 ],
             )
+            if not is_reasoning:
+                call_kwargs["temperature"] = 0.0
+
+            response = client.chat.completions.create(**call_kwargs)
 
             # ── Log cache performance ──────────────────────────────────
             try:
-                usage       = response.usage
-                details     = getattr(usage, "prompt_tokens_details", None)
-                cached_tok  = getattr(details, "cached_tokens", 0) or 0
-                input_tok   = getattr(usage, "prompt_tokens",     0) or 0
-                output_tok  = getattr(usage, "completion_tokens", 0) or 0
+                usage      = response.usage
+                details    = getattr(usage, "prompt_tokens_details", None)
+                cached_tok = getattr(details, "cached_tokens", 0) or 0
+                input_tok  = getattr(usage, "prompt_tokens",     0) or 0
+                output_tok = getattr(usage, "completion_tokens", 0) or 0
 
                 if cached_tok > 0:
                     print(f"  [ID-CACHE] OpenAI HIT  — "
@@ -774,7 +813,6 @@ def _call_openai(pdf_bytes: bytes, model: str, prompt: str,
 
     raise RuntimeError("OpenAI: all retries exhausted")
 
-
 # ════════════════════════════════════════════════════════════════════════
 # DISPATCH
 # ════════════════════════════════════════════════════════════════════════
@@ -794,8 +832,7 @@ def _dispatch_llm_call(pdf_bytes: bytes, model: str, prompt: str,
         return _call_claude(pdf_bytes, model, prompt, max_tokens,
                             pdf_path=pdf_path)
 
-    return _call_openai(pdf_bytes, model, prompt, max_tokens)
-
+    return _call_openai(pdf_bytes, model, prompt, max_tokens, pdf_path=pdf_path)
 
 def _parse_json_from_raw(raw: str) -> dict:
     """Strip markdown fences and parse JSON."""
@@ -805,7 +842,6 @@ def _parse_json_from_raw(raw: str) -> dict:
     else:
         raw = re.sub(r"^```(?:json)?\s*", "", raw).strip()
     return json.loads(raw)
-
 
 # ════════════════════════════════════════════════════════════════════════
 # STRUCTURAL BODY VALIDATORS
@@ -1078,6 +1114,574 @@ def _validate_debt_pages(pdf_path: str, llm_pages: list) -> list:
     return validated
 
 
+# ════════════════════════════════════════════════════════════════════════
+# NOTES / RSI / STATISTICAL PAGE VALIDATORS
+# (OVERVIEW, CAPITAL_ASSETS, TAX_BASE, PEN, OPEB, FAQS)
+# ════════════════════════════════════════════════════════════════════════
+
+def _page_has_capital_assets_table(text: str) -> bool:
+    """
+    Capital-asset roll-forward. Discriminated from the DEBT roll-forward by its
+    ROW content (asset classes) and by the ABSENCE of a "Due Within One Year"
+    column — DEBT always has one, CAPITAL_ASSETS never does.
+    """
+    if not text:
+        return False
+    text = _collapse_char_spacing(text)
+
+    has_asset_group = bool(re.search(
+        r"\bcapital\s+assets?,?\s+(?:not\s+)?being\s+(?:depreciated|amortized)\b"
+        r"|\b(?:less:?\s+)?accumulated\s+(?:depreciation|amortization)\b"
+        r"|\bnondepreciable\s+capital\s+assets\b"
+        r"|\bconstruction\s+in\s+progress\b"
+        r"|\bcapital\s+assets?,?\s+net\b",
+        text, re.IGNORECASE,
+    ))
+    if not has_asset_group:
+        # Fall back to a co-occurrence of concrete asset classes.
+        has_land = bool(re.search(r"\bland\b", text, re.IGNORECASE))
+        class_hits = len(re.findall(
+            r"\bbuildings?\b|\binfrastructure\b|\bmachinery\b|\bequipment\b"
+            r"|\bimprovements?\b|\bright[\s-]?to[\s-]?use\b|\bSBITA\b",
+            text, re.IGNORECASE,
+        ))
+        if not (has_land and class_hits >= 2):
+            return False
+
+    has_rollforward_cols = bool(re.search(
+        r"\bbeginning\s+balance\b|\brestated\s+balance\b"
+        r"|\bbalance\s+(?:at\s+)?(?:beginning|oct|october|jul|july|jan|january|sep|september)\b",
+        text, re.IGNORECASE,
+    )) and bool(re.search(
+        r"\bending\s+balance\b|\bbalance\s+(?:at\s+)?end\b",
+        text, re.IGNORECASE,
+    ))
+    if not has_rollforward_cols:
+        # Some issuers print columns as bare "Beginning / Increases / Decreases / Ending"
+        # (no "Balance" word at all — e.g. Pinellas County FL FY2025 p89).
+        # Accept when we have a beginning/opening term AND an ending/closing term
+        # AND at least one additions/deletions synonym.
+        has_opening = bool(re.search(
+            r"\bbeginning\b|\bBalance\b|\bOpening\b|\bRestated\b",
+            text, re.IGNORECASE,
+        ))
+        has_closing = bool(re.search(
+            r"\bending\b|\bBalance\b|\bclosing\b",
+            text, re.IGNORECASE,
+        ))
+        has_change_cols = bool(re.search(
+            r"\badditions?\b|\bincreases?\b|\bacquisitions?\b",
+            text, re.IGNORECASE,
+        )) and bool(re.search(
+            r"\bdeletions?\b|\breductions?\b|\bretirements?\b|\bdisposals?\b"
+            r"|\bdecreases?\b",
+            text, re.IGNORECASE,
+        ))
+        if not (has_opening and has_closing and has_change_cols):
+            return False
+
+    # DISCRIMINATOR: a "Due Within One Year" column makes this the DEBT schedule.
+    if re.search(r"\bdue\s+within\s+one\s+year\b|\bcurrent\s+portion\b",
+                 text, re.IGNORECASE):
+        return False
+
+    has_amounts = len(re.findall(r"\b\d{1,3}(?:,\d{3})+\b", text)) >= 4
+    return has_amounts
+def _reconstruct_rotated_text(text: str) -> str:
+    """
+    Reconstruct text from a physically rotated (landscape) page.
+
+    Handles §0B.2 Pattern 1 (single-char-per-line stream): collapse
+    consecutive single/double-character lines into words, then append
+    any longer lines that were already readable.
+
+    Pattern 2 and 3 are handled downstream by the normal regexes once
+    the char stream is collapsed.
+    """
+    lines = text.splitlines()
+    result_parts: list[str] = []
+    run: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            # flush current run on blank line
+            if run:
+                result_parts.append("".join(run))
+                run = []
+            result_parts.append("")
+            continue
+        if len(stripped) <= 2:
+            run.append(stripped)
+        else:
+            if run:
+                result_parts.append("".join(run))
+                run = []
+            result_parts.append(stripped)
+
+    if run:
+        result_parts.append("".join(run))
+
+    return "\n".join(result_parts)
+
+
+def _is_likely_rotated_page(text: str) -> bool:
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) < 10:
+        return False
+    # Pattern 1: single/double-char lines dominate (strict single-char stream)
+    single = sum(1 for l in lines if len(l.strip()) <= 2)
+    if single >= 15 and single / len(lines) >= 0.35:
+        return True
+    # Pattern 2: short-token lines dominate (3-4 char clusters from pdfplumber)
+    # e.g. "Ass  ess  ed  Val  ue" — wider clusters but still garbled
+    short_token_lines = 0
+    for l in lines:
+        tokens = l.strip().split()
+        if len(tokens) >= 3:
+            short = sum(1 for t in tokens if len(t) <= 4)
+            if short / len(tokens) >= 0.65:
+                short_token_lines += 1
+    if short_token_lines >= 10 and short_token_lines / len(lines) >= 0.35:
+        return True
+    return False
+
+def _page_has_tax_base_schedule(text: str) -> bool:
+    """
+    Returns True when the page contains genuine TAX_BASE content.
+
+    Handles six distinct page types that appear across real ACFRs:
+
+    TYPE 1  Schedule A title page  — "Assessed Value and Estimated Actual
+                                      Value of Taxable Property"
+    TYPE 2  Schedule A right-half  — "Taxable Assessed Value" column header
+                                      + dollar amounts (no schedule title)
+    TYPE 3  Schedule B title page  — "Direct and Overlapping Property Tax
+                                      Rates" (millage values, often no $)
+    TYPE 4  Schedule B right-half  — "Fiscal Year" + year-number row
+                                      + millage-scale decimals (no title)
+    TYPE 5  Schedule C title page  — "Property Tax Levies and Collections"
+    TYPE 6  Notes property-tax page — "NOTE N - Property Taxes" or similar
+                                      + any tax calendar / millage trigger
+
+    ROTATED PAGES (§0B.2): before any pattern matching, if the extracted
+    text looks like a Pattern-1 single-char-per-line stream, reconstruct
+    it and evaluate the reconstructed text with ALL normal rules.  Rotation
+    alone is NEVER a reason to return False.
+    """
+    if not text:
+        return False
+
+    text = _collapse_char_spacing(text)
+
+    # ── §0B.2 ROTATED-PAGE HANDLING ───────────────────────────────────
+    # If the page appears to be landscape-rotated (Pattern 1 stream),
+    # reconstruct it and REPLACE the working text before any matching.
+    # We keep the original text as a fallback so that if reconstruction
+    # produces an empty result we still try the raw text.
+    if _is_likely_rotated_page(text):
+        reconstructed = _reconstruct_rotated_text(text)
+        if reconstructed.strip():
+            # Evaluate BOTH the reconstructed and raw text; accept if
+            # either triggers a match (guards against partial reconstruction).
+            return (
+                _page_has_tax_base_schedule_inner(reconstructed)
+                or _page_has_tax_base_schedule_inner(text)
+            )
+        # Reconstruction produced nothing useful — fall through with raw text.
+
+    return _page_has_tax_base_schedule_inner(text)
+
+def _page_has_tax_base_schedule_inner(text: str) -> bool:
+    """
+    Core matching logic for _page_has_tax_base_schedule.
+    Called once for normal pages and (up to) twice for rotated pages
+    (reconstructed text first, raw text as fallback).
+    """
+    # ── TYPE 1 — Schedule A title page ───────────────────────────────
+    if re.search(
+        r"assessed\s+value\s+and\s+estimated\s+actual\s+value"
+        r"|estimated\s+actual\s+value\s+of\s+taxable\s+property",
+        text, re.IGNORECASE,
+    ):
+        # Title present — accept unconditionally (amounts may be on
+        # the right-half continuation page).
+        return True
+
+    # ── TYPE 2 — Schedule A right-half (horizontal column overflow) ──
+    if re.search(r"taxable\s+assessed\s+value", text, re.IGNORECASE):
+        amounts = len(re.findall(r"\b\d{1,3}(?:,\d{3})+\b", text))
+        if amounts >= 5:
+            return True
+
+    # ── TYPE 3 — Schedule B title page ───────────────────────────────
+    if re.search(
+        r"direct\s+and\s+overlapping\s+propert(?:y|ies)\s+tax\s+rates",
+        text, re.IGNORECASE,
+    ):
+        return True
+
+    # ── TYPE 4 — Schedule B right-half (horizontal column overflow) ──
+    if re.search(r"\bfiscal\s+year\b", text, re.IGNORECASE):
+        year_hits    = re.findall(r"\b20[1-3]\d\b", text)
+        millage_hits = re.findall(r"\b\d{1,2}\.\d{3}\b", text)
+        if len(year_hits) >= 4 and len(millage_hits) >= 5:
+            return True
+
+    # ── TYPE 5 — Schedule C title page ───────────────────────────────
+    if re.search(
+        r"propert(?:y|ies)\s+tax\s+levies\s+and\s+collections"
+        r"|tax\s+levies\s+and\s+collections",
+        text, re.IGNORECASE,
+    ):
+        amounts = len(re.findall(r"\b\d{1,3}(?:,\d{3})+\b", text))
+        years   = set(re.findall(r"\b(?:19|20)\d{2}\b", text))
+        if amounts >= 5 or len(years) >= 4:
+            return True
+
+    # ── TYPE 6 — Notes property-tax disclosure page ───────────────────
+    has_tax_note_heading = bool(re.search(
+        r"note\s+\d+\s*[-–—]\s*property\s+tax"
+        r"|\bproperty\s+taxes\b",
+        text, re.IGNORECASE,
+    ))
+    has_tax_detail = bool(re.search(
+        r"lien\s+date"
+        r"|levy\s+date"
+        r"|become\s+due\s+and\s+payable"
+        r"|delinquent\s+on"
+        r"|discounts?\s+are\s+allowed"
+        r"|ad\s+valorem\s+tax\s+millage"
+        r"|\d+\s+mills\b"
+        r"|millage\s+rate"
+        r"|tax\s+lien\s+date"
+        r"|october\s+1"
+        r"|november\s+1"
+        r"|april\s+1",
+        text, re.IGNORECASE,
+    ))
+    if has_tax_note_heading and has_tax_detail:
+        return True
+
+    # ── Fallback content check ────────────────────────────────────────
+    content_hit = bool(re.search(
+        r"total\s+taxable\s+assessed\s+value"
+        r"|total\s+direct\s+tax\s+rate"
+        r"|collections?\s+within\s+the\s+fiscal\s+year\s+of\s+the\s+levy"
+        r"|percentage\s+of\s+levy"
+        r"|collections?\s+to\s+date"
+        r"|total\s+tax\s+levy",
+        text, re.IGNORECASE,
+    ))
+    if content_hit:
+        years   = set(re.findall(r"\b(?:19|20)\d{2}\b", text))
+        amounts = len(re.findall(r"\b\d{1,3}(?:,\d{3})+\b", text))
+        if len(years) >= 4 and amounts >= 5:
+            return True
+        if amounts >= 5:
+            return True
+
+    # ── GARBLED / PARTIALLY-ROTATED FALLBACK ─────────────────────────
+    # When pdfplumber extracts a landscape/rotated page with wider token
+    # clusters (not caught by Pattern 1 rotation), the text contains
+    # recognisable tax keywords but amounts are scattered or absent.
+    # Accept if we see at least 2 strong tax-base signals even without
+    # the normal amount/year density requirements.
+    garbled_tax_signals = 0
+    garbled_tax_patterns = [
+        r"assessed\s*value",
+        r"taxable\s*(?:assessed|value|property)",
+        r"estimated\s*actual\s*value",
+        r"direct\s*(?:and\s*overlapping)?\s*(?:property\s*)?tax\s*rate",
+        r"tax\s*levies?\s*(?:and\s*collections?)?",
+        r"overlapping\s*(?:tax\s*)?rate",
+        r"millage",
+        r"ad\s*valorem",
+        r"property\s*tax\s*(?:rate|levy|lien|calendar)",
+        r"total\s*(?:taxable|direct)\s*(?:assessed\s*)?(?:value|rate)",
+        r"net\s*assessed\s*value",
+        r"assessed\s*val",        # catches "Ass essed Val ue" partially collapsed
+        r"taxval",                 # catches "TaxVal" fused token
+    ]
+    for pat in garbled_tax_patterns:
+        if re.search(pat, text, re.IGNORECASE):
+            garbled_tax_signals += 1
+    if garbled_tax_signals >= 2:
+        return True
+
+    return False
+
+def _page_has_pension_note(text: str) -> bool:
+    """
+    Defined BENEFIT pension disclosure. A page whose only pension content is a
+    defined-contribution / deferred-compensation plan does NOT qualify.
+    """
+    if not text:
+        return False
+    text = _collapse_char_spacing(text)
+
+    db_hit = bool(re.search(
+        r"\bnet\s+pension\s+(?:liability|asset)\b"
+        r"|\btotal\s+pension\s+liability\b"
+        r"|\bpension\s+plan\s+fiduciary\s+net\s+position\b"
+        r"|\bproportionate\s+share\s+of\s+the\s+net\s+pension\b"
+        r"|\bchanges\s+in\s+(?:the\s+)?(?:net|total)\s+pension\s+liability\b"
+        r"|\bdefined\s+benefit\s+pension\b"
+        r"|\bschedule\s+of\s+contributions\b"
+        r"|\bactuarially\s+determined\s+contribution\b",
+        text, re.IGNORECASE,
+    ))
+    if not db_hit:
+        return False
+
+    # Exclude a page that is purely a DC / 457 / 403(b) description.
+    dc_only = bool(re.search(
+        r"\bdefined\s+contribution\b|\bdeferred\s+compensation\b"
+        r"|\b457\b|\b403\(b\)\b|\b401\(a\)\b",
+        text, re.IGNORECASE,
+    ))
+    if dc_only and not re.search(
+        r"\bnet\s+pension\s+(?:liability|asset)\b|\btotal\s+pension\s+liability\b"
+        r"|\bproportionate\s+share\b|\bactuarial\b",
+        text, re.IGNORECASE,
+    ):
+        return False
+
+    return True
+
+
+def _page_has_opeb_note(text: str) -> bool:
+    if not text:
+        return False
+    text = _collapse_char_spacing(text)
+    return bool(re.search(
+        r"\bother\s+post[\s-]?employment\s+benefits?\b"
+        r"|\bOPEB\b"
+        r"|\bpostemployment\s+healthcare\s+benefits?\b"
+        r"|\bretiree\s+health(?:care)?\s+(?:plan|benefits?)\b"
+        r"|\bhealthcare\s+cost\s+trend\s+rate\b",
+        text, re.IGNORECASE,
+    ))
+
+
+def _page_has_activity_split_note(text: str) -> bool:
+    """
+    The Long-Term Liabilities note page that splits the net pension / OPEB
+    liability between Governmental and Business-type activities. Required by the
+    PEN/OPEB 5.D activity-proportion calculation, so it is attached to BOTH keys.
+    """
+    if not text:
+        return False
+    text = _collapse_char_spacing(text)
+    has_activity = bool(re.search(
+        r"governmental\s+activit", text, re.IGNORECASE
+    )) and bool(re.search(
+        r"business[\s-]?type\s+activit", text, re.IGNORECASE
+    ))
+    has_plan_liability = bool(re.search(
+        r"\bnet\s+pension\s+(?:liability|asset)\b"
+        r"|\bnet\s+OPEB\s+(?:liability|asset)\b"
+        r"|\btotal\s+OPEB\s+liability\b",
+        text, re.IGNORECASE,
+    ))
+    return has_activity and has_plan_liability
+
+
+def _page_has_overview_profile(text: str) -> bool:
+    if not text:
+        return False
+    text = _collapse_char_spacing(text)
+    return bool(re.search(
+        r"\bletter\s+of\s+transmittal\b"
+        r"|\bprofile\s+of\s+the\s+(?:government|county|city|district)\b"
+        r"|\bthe\s+reporting\s+entity\b"
+        r"|\breporting\s+entity\b"
+        r"|\bdemographic\s+and\s+economic\s+statistics\b"
+        r"|\bwas\s+(?:incorporated|chartered|established|created)\s+in\b"
+        r"|\bsquare\s+miles\b",
+        text, re.IGNORECASE,
+    ))
+
+
+def _page_has_faq_evidence(text: str) -> bool:
+    if not text:
+        return False
+    text = _collapse_char_spacing(text)
+    return bool(re.search(
+        r"\bindependent\s+auditor.{0,3}s\s+report\b"
+        r"|\bcommitments\s+and\s+contingenc"
+        r"|\bcontingent\s+liabilit"
+        r"|\blitigation\b"
+        r"|\bsubsequent\s+events?\b"
+        r"|\bgoing\s+concern\b"
+        r"|\brisk\s+management\b"
+        r"|\bself[\s-]?insurance\b"
+        r"|\bclaims\s+and\s+judgments\b"
+        r"|\bschedule\s+of\s+findings\s+and\s+questioned\s+costs\b"
+        r"|\bpollution\s+remediation\b"
+        r"|\bconsent\s+decree\b"
+        r"|\blandfill\s+(?:closure|postclosure)\b"
+        r"|\brate\s+covenant\b|\bdebt\s+service\s+coverage\b"
+        r"|\bpledged[\s-]?revenue\b",
+        text, re.IGNORECASE,
+    ))
+
+
+# Key → structural validator. OVERVIEW and FAQS are narrative targets whose
+# validators are deliberately broad, so they are used for RECOVERY only (never
+# to remove an LLM-supplied page).
+_NOTES_VALIDATORS = {
+    "CAPITAL_ASSETS": _page_has_capital_assets_table,
+    "TAX_BASE":       _page_has_tax_base_schedule,
+    "PEN":            _page_has_pension_note,
+    "OPEB":           _page_has_opeb_note,
+    "OVERVIEW":       _page_has_overview_profile,
+    "FAQS":           _page_has_faq_evidence,
+}
+
+# Keys whose LLM pages may be REMOVED when the validator disagrees. Narrative
+# keys are excluded — a transmittal-letter or contingency page has no reliable
+# structural fingerprint, so removing it would lose real evidence.
+_NOTES_PRUNABLE_KEYS = {"CAPITAL_ASSETS"}
+
+
+def _validate_notes_pages(pdf_path: str, normalized: dict) -> dict:
+    """
+    Structurally confirm the LLM's Notes/RSI/Statistical page picks.
+
+    For _NOTES_PRUNABLE_KEYS: drop pages the validator rejects.
+    For every other notes key: keep the LLM's pages as-is (log only).
+    """
+    for key in _NOTES_TABLE_KEYS:
+        pages = normalized.get(key) or []
+        if not pages:
+            continue
+        validator = _NOTES_VALIDATORS.get(key)
+        if validator is None:
+            continue
+
+        kept = []
+        for p in sorted(set(pages)):
+            if validator(_get_page_text(pdf_path, p)):
+                kept.append(p)
+            elif key in _NOTES_PRUNABLE_KEYS:
+                print(f"  [VAL] {key} p{p} REMOVED — no genuine {key} table found")
+            else:
+                kept.append(p)
+                print(f"  [VAL] {key} p{p} kept (unconfirmed — narrative target)")
+        normalized[key] = kept
+    return normalized
+
+
+def _full_scan_notes_tables(pdf_path: str, keys: list[str] | None = None) -> dict:
+    """
+    Whole-document structural fallback, mirroring _full_scan_dsr_debt(). Used for
+    any notes key the LLM returned empty.
+    """
+    keys = keys or _NOTES_TABLE_KEYS
+    try:
+        import pdfplumber
+        with pdfplumber.open(pdf_path) as pdf:
+            total = len(pdf.pages)
+    except Exception:
+        try:
+            from pypdf import PdfReader
+            total = len(PdfReader(pdf_path).pages)
+        except Exception:
+            return {k: [] for k in keys}
+
+    found: dict[str, list[int]] = {k: [] for k in keys}
+    for p in range(1, total + 1):
+        text = _get_page_text(pdf_path, p)
+        if not text:
+            continue
+        for k in keys:
+            validator = _NOTES_VALIDATORS.get(k)
+            if validator and validator(text):
+                found[k].append(p)
+    return found
+
+
+def _attach_activity_split_pages(pdf_path: str, normalized: dict) -> dict:
+    """
+    The Long-Term Liabilities activity-split page is REQUIRED by the PEN/OPEB
+    5.D proportion calculation but is primarily a DEBT page, so the LLM often
+    omits it. Recover it from the already-identified DEBT pages and attach it to
+    PEN and OPEB.
+    """
+    debt_pages = normalized.get("DEBT") or []
+    if not debt_pages:
+        return normalized
+
+    split_pages = [
+        p for p in debt_pages
+        if _page_has_activity_split_note(_get_page_text(pdf_path, p))
+    ]
+    if not split_pages:
+        return normalized
+
+    for key in ("PEN", "OPEB"):
+        if not normalized.get(key):
+            continue
+        before = set(normalized[key])
+        merged = sorted(before | set(split_pages))
+        added = [p for p in merged if p not in before]
+        if added:
+            print(f"  [VAL] {key} ATTACHED activity-split page(s) {added} "
+                  f"from DEBT — required for the 5.D proportion calculation")
+        normalized[key] = merged
+    return normalized
+
+
+# Statement keys supplying the numeric operands the [CALC] findings need:
+#   FAQ-7  DSCR      → PROP_IS  (operating income, depreciation & amortization,
+#                                interest/investment income, interest expense)
+#                      PROP_CFS (principal paid on capital debt)
+#   FAQ-9  % of rev  → GOV_IS   (total governmental funds revenue)
+#                      PROP_IS  (business-type revenue)
+#   FAQ-10 CU test   → SOA      (each component unit's change in net position)
+#                      GOV_IS   (General Fund net change)
+_FAQ_OPERAND_KEYS = ("PROP_IS", "PROP_CFS", "GOV_IS", "SOA")
+
+
+def _attach_faq_operand_pages(normalized: dict) -> dict:
+    """
+    FAQ-7, FAQ-9, and FAQ-10 are [CALC] findings: their Yes/No answers are
+    derived from figures printed on the MAIN FINANCIAL STATEMENTS, not on the
+    narrative evidence pages the notes scan returns. Union those statement pages
+    into the FAQS slice so the operands are physically present in the PDF the
+    extractor receives.
+
+    The FAQS key is unioned even when the notes scan found no narrative evidence:
+    all 17 findings are always emitted, and the three [CALC] findings still need
+    their operands to answer "No" defensibly.
+    """
+    if "FAQS" not in normalized:
+        return normalized
+
+    operand_pages: set[int] = set()
+    contributing: list[str] = []
+    for key in _FAQ_OPERAND_KEYS:
+        pages = normalized.get(key) or []
+        if pages:
+            operand_pages.update(pages)
+            contributing.append(f"{key}={sorted(set(pages))}")
+
+    if not operand_pages:
+        print("  [VAL] FAQS — no statement pages available to attach; "
+              "the FAQ-7/9/10 operands will be unavailable")
+        return normalized
+
+    before = set(normalized.get("FAQS") or [])
+    merged = sorted(before | operand_pages)
+    added  = [p for p in merged if p not in before]
+    if added:
+        print(f"  [VAL] FAQS ATTACHED operand page(s) {added} for the [CALC] "
+              f"findings (FAQ-7/9/10) from {', '.join(contributing)}")
+    normalized["FAQS"] = merged
+    return normalized
+
+
 def _recover_missed_dsr_pages(pdf_path: str, validated_dsr: list,
                                validated_debt: list,
                                scan_range_extra: int = 25) -> list:
@@ -1183,6 +1787,20 @@ def _load_main_tables_prompt(prompt_dir: str | None = None) -> str:
         if p.exists():
             return p.read_text(encoding="utf-8")
     raise FileNotFoundError(f"Main tables prompt not found. Searched: {candidates}")
+
+
+def _load_notes_tables_prompt(prompt_dir: str | None = None) -> str:
+    script_dir = Path(__file__).parent
+    candidates = [
+        script_dir / "prompts" / "Notes_Tables_Prompt.txt",
+        Path("prompts") / "Notes_Tables_Prompt.txt",
+    ]
+    if prompt_dir:
+        candidates.insert(0, Path(prompt_dir) / "Notes_Tables_Prompt.txt")
+    for p in candidates:
+        if p.exists():
+            return p.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"Notes tables prompt not found. Searched: {candidates}")
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1448,6 +2066,18 @@ def _validate_nonlg_pages(pdf_path: str, normalized: dict) -> dict:
 
         for idx, p in enumerate(pages):
             text = _get_page_text(pdf_path, p)
+
+            # ── Column-continuation: keep if it immediately follows a
+            #    validated page (wide multi-column statements span N+1, N+2…)
+            if idx > 0 and p == pages[idx - 1] + 1 and (pages[idx - 1] in valid_pages):
+                # Still reject if the page is clearly excluded content
+                if text and _nonlg_excluded(text):
+                    print(f"  [VAL] {key} p{p} REMOVED — excluded (continuation)")
+                    continue
+                valid_pages.append(p)
+                print(f"  [VAL] {key} p{p} KEPT — column continuation of p{pages[idx - 1]}")
+                continue
+
             if not text or _nonlg_excluded(text):
                 print(f"  [VAL] {key} p{p} REMOVED — excluded")
                 continue
@@ -1456,6 +2086,7 @@ def _validate_nonlg_pages(pdf_path: str, normalized: dict) -> dict:
                 valid_pages.append(p)
                 continue
 
+            # UK Changes-in-Reserves immediately follows a validated IS page
             if key == "PROP_IS" and idx > 0:
                 prev_p = pages[idx - 1]
                 if p == prev_p + 1 and prev_p in valid_pages:
@@ -1470,7 +2101,6 @@ def _validate_nonlg_pages(pdf_path: str, normalized: dict) -> dict:
         validated[key] = valid_pages
 
     return validated
-
 
 def _keep_first_cluster(normalized: dict, max_gap: int = 5) -> dict:
     all_pages = sorted(set(
@@ -1490,7 +2120,13 @@ def _keep_first_cluster(normalized: dict, max_gap: int = 5) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════
-# TWO FOCUSED LLM CALLS
+# THREE FOCUSED LLM CALLS
+#   1. DSR + DEBT          → DSR_DEBT_Prompt.txt    (note roll-forwards)
+#   2. Main statements      → Main_Tables_Prompt.txt (titled statements)
+#   3. Notes/RSI/Statistical→ Notes_Tables_Prompt.txt (OVERVIEW, CAPITAL_ASSETS,
+#                                                     TAX_BASE, PEN, OPEB, FAQS)
+# Each prompt is static so every provider can cache it, and each call can be
+# skipped independently when a sector does not need those tables.
 # ════════════════════════════════════════════════════════════════════════
 
 def _identify_dsr_debt_only(gemini_client, pdf_bytes: bytes, model: str,
@@ -1560,6 +2196,60 @@ def _identify_main_tables(gemini_client, pdf_bytes: bytes, model: str,
     except Exception as e:
         print(f"  [ID] Main tables call failed ({e}) — returning empty")
         return {}
+
+
+def _identify_notes_tables(gemini_client, pdf_bytes: bytes, model: str,
+                            prompt_dir: str | None = None,
+                            pdf_path: str | None = None,
+                            allowed_suffixes: set[str] | None = None) -> dict:
+    """
+    Call 3: identify the Notes / RSI / Statistical-Section targets —
+    OVERVIEW, CAPITAL_ASSETS, TAX_BASE, PEN, OPEB, FAQS.
+
+    A separate call (rather than folding these into Main_Tables_Prompt.txt) for
+    the same reasons DSR/DEBT are separate:
+      • Main_Tables applies REJECT-F to Notes/RSI/Statistical pages, which is
+        exactly where all six of these targets live — the two rule sets
+        contradict each other.
+      • The static prompt stays cacheable per provider.
+      • The whole call can be skipped for sectors that don't need these tables.
+
+    Unlike the other two calls, keys here may legitimately OVERLAP (the same page
+    can be both a PEN and an OPEB page), so no de-overlap is performed.
+    """
+    prompt_text = _load_notes_tables_prompt(prompt_dir)
+    if pdf_path:
+        prompt_text = _build_anchored_prompt(prompt_text, pdf_path)
+
+    wanted = _NOTES_TABLE_KEYS
+    if allowed_suffixes is not None:
+        wanted = [
+            k for k, s in _NOTES_TABLE_KEY_TO_SUFFIX.items()
+            if s in allowed_suffixes
+        ]
+
+    try:
+        raw = _dispatch_llm_call(pdf_bytes, model, prompt_text,
+                                  gemini_client=gemini_client,
+                                  max_tokens=8192,
+                                  pdf_path=pdf_path)
+        result     = _parse_json_from_raw(raw)
+        normalized = {}
+        for key in wanted:
+            val = result.get(key, [])
+            if isinstance(val, int):
+                val = [val]
+            if not isinstance(val, list):
+                val = []
+            normalized[key] = sorted({
+                int(p) for p in val
+                if isinstance(p, (int, float))
+                or (isinstance(p, str) and str(p).isdigit())
+            })
+        return normalized
+    except Exception as e:
+        print(f"  [ID] Notes tables call failed ({e}) — returning empty")
+        return {k: [] for k in wanted}
 
 
 def _full_scan_dsr_debt(pdf_path: str):
@@ -1651,18 +2341,62 @@ def identify_pages_gemini(
         allowed_suffixes=allowed_suffixes,
     )
 
+    # ── CALL 3: Notes / RSI / Statistical tables ──────────────────────
+    notes_suffixes = set(_NOTES_TABLE_KEY_TO_SUFFIX.values())
+    needs_notes    = (allowed_suffixes is None) or bool(notes_suffixes & allowed_suffixes)
+
+    if needs_notes:
+        notes_result = _identify_notes_tables(
+            gemini_client, pdf_bytes, model,
+            pdf_path=pdf_path,
+            allowed_suffixes=allowed_suffixes,
+        )
+    else:
+        print("  [ID] Skipping Notes-tables call — not needed for this sector")
+        notes_result = {}
+
     # ── Merge ─────────────────────────────────────────────────────────
-    normalized = {**main_result, **dsr_debt_result}
+    normalized = {**main_result, **dsr_debt_result, **notes_result}
 
     if allowed_suffixes is not None:
         allowed_keys = {s.lstrip("_").upper() for s in allowed_suffixes}
         normalized   = {k: v for k, v in normalized.items() if k in allowed_keys}
 
+    # The NON-LG cluster heuristic collapses pages across ALL keys to a single
+    # run of consecutive pages. Notes/RSI/Statistical content sits far away from
+    # the statements (often hundreds of pages later), so it MUST be held out of
+    # that pass or it would be discarded wholesale.
+    notes_held_out = {
+        k: normalized.pop(k) for k in _NOTES_TABLE_KEYS if k in normalized
+    }
+
     if allowed_suffixes is not None and not needs_dsr_debt:
         normalized = _validate_nonlg_pages(pdf_path, normalized)
         normalized = _keep_first_cluster(normalized, max_gap=5)
 
+    normalized.update(notes_held_out)
+
     normalized = _correct_page_numbers(normalized, pdf_path)
+
+    # ── Notes-table validation, recovery, and cross-attachment ────────
+    if needs_notes:
+        normalized = _validate_notes_pages(pdf_path, normalized)
+
+        empty_notes_keys = [
+            k for k in notes_held_out
+            if not normalized.get(k)
+        ]
+        if empty_notes_keys:
+            print(f"  [VAL] LLM returned no pages for {', '.join(empty_notes_keys)} "
+                  f"— running full document scan as fallback")
+            scanned = _full_scan_notes_tables(pdf_path, empty_notes_keys)
+            for k, pages in scanned.items():
+                normalized[k] = pages
+                if pages:
+                    print(f"  [VAL] {k} RECOVERED by full scan: {pages}")
+
+        normalized = _attach_activity_split_pages(pdf_path, normalized)
+        normalized = _attach_faq_operand_pages(normalized)
 
     if not needs_dsr_debt:
         print(f"  [ID] DSR/DEBT validation skipped — not needed for this sector")
@@ -1706,3 +2440,205 @@ def identify_pages_with_fallback(
         return fallback_fn(pdf_path)
 
     return {}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# BATCH PAGE IDENTIFICATION — Claude only
+# ════════════════════════════════════════════════════════════════════════
+
+def prepare_page_id_claude_jobs(
+    pdf_path: str,
+    id_model: str,
+    allowed_suffixes: set[str] | None = None,
+    prompt_dir: str | None = None,
+) -> list[dict]:
+    """
+    Build Claude batch-API request dicts for one PDF (up to 3 calls:
+    DSR/DEBT, Main tables, Notes tables).
+
+    Returns a list of dicts each with:
+      "custom_id" — unique key: "<pdf_stem>__<call_type>"
+      "params"    — Claude messages.create payload (model, system, messages)
+    """
+    from pathlib import Path as _Path
+
+    stem = _Path(pdf_path).stem
+    paged_text, total_pages = _extract_pdf_as_paged_text(pdf_path)
+    user_content = _build_user_content_from_paged_text(paged_text, total_pages)
+
+    jobs = []
+
+    def _make_job(call_type: str, prompt_text: str, max_tokens: int) -> dict:
+        return {
+            "custom_id": f"{stem}__{call_type}",
+            "params": {
+                "model": id_model,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "system": [
+                    {
+                        "type": "text",
+                        "text": prompt_text,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                "messages": [
+                    {"role": "user", "content": user_content}
+                ],
+            },
+        }
+
+    # ── Call 1: DSR + DEBT ────────────────────────────────────────────
+    dsr_debt_keys = {"_DSR", "_DEBT"}
+    if allowed_suffixes is None or bool(dsr_debt_keys & allowed_suffixes):
+        prompt = _load_dsr_debt_prompt(prompt_dir)
+        prompt = _build_anchored_prompt(prompt, pdf_path)
+        jobs.append(_make_job("dsr_debt", prompt, 4096))
+
+    # ── Call 2: Main tables ───────────────────────────────────────────
+    prompt = _load_main_tables_prompt(prompt_dir)
+    prompt = _trim_prompt_for_sector(prompt, allowed_suffixes)
+    prompt = _build_anchored_prompt(prompt, pdf_path)
+    jobs.append(_make_job("main", prompt, 8192))
+
+    # ── Call 3: Notes / RSI / Statistical ────────────────────────────
+    notes_suffixes = set(_NOTES_TABLE_KEY_TO_SUFFIX.values())
+    if allowed_suffixes is None or bool(notes_suffixes & allowed_suffixes):
+        prompt = _load_notes_tables_prompt(prompt_dir)
+        prompt = _build_anchored_prompt(prompt, pdf_path)
+        jobs.append(_make_job("notes", prompt, 8192))
+
+    return jobs
+
+
+def process_page_id_batch_results(
+    pdf_path: str,
+    allowed_suffixes: set[str] | None,
+    raw_by_call_type: dict[str, str],
+) -> dict:
+    """
+    Post-process batch LLM responses for one PDF and return the final
+    normalised page-number map (same structure as identify_pages_gemini).
+
+    raw_by_call_type: {"dsr_debt": "<raw text>", "main": "...", "notes": "..."}
+    Missing keys (call not submitted) are treated as empty results.
+    """
+
+    # ── Parse DSR/DEBT ────────────────────────────────────────────────
+    dsr_debt_keys  = {"_DSR", "_DEBT"}
+    needs_dsr_debt = allowed_suffixes is None or bool(dsr_debt_keys & allowed_suffixes)
+
+    if needs_dsr_debt and "dsr_debt" in raw_by_call_type:
+        try:
+            result = _parse_json_from_raw(raw_by_call_type["dsr_debt"])
+            dsr_debt_result = {}
+            for key in ["DSR", "DEBT"]:
+                val = result.get(key, [])
+                dsr_debt_result[key] = [
+                    int(p) for p in val
+                    if isinstance(p, (int, float))
+                    or (isinstance(p, str) and str(p).isdigit())
+                ]
+        except Exception as e:
+            print(f"  [ID-BATCH] DSR/DEBT parse failed ({e}) — using empty")
+            dsr_debt_result = {"DSR": [], "DEBT": []}
+    else:
+        dsr_debt_result = {"DSR": [], "DEBT": []}
+
+    # ── Parse Main tables ─────────────────────────────────────────────
+    if "main" in raw_by_call_type:
+        try:
+            result = _parse_json_from_raw(raw_by_call_type["main"])
+            main_result = {}
+            for key, val in result.items():
+                key_upper = key.upper().replace("-", "_")
+                if key_upper in ("DSR", "DEBT"):
+                    continue
+                if isinstance(val, list):
+                    main_result[key_upper] = [
+                        int(p) for p in val
+                        if isinstance(p, (int, float))
+                        or (isinstance(p, str) and str(p).isdigit())
+                    ]
+                elif isinstance(val, int):
+                    main_result[key_upper] = [val]
+        except Exception as e:
+            print(f"  [ID-BATCH] Main tables parse failed ({e}) — using empty")
+            main_result = {}
+    else:
+        main_result = {}
+
+    # ── Parse Notes tables ────────────────────────────────────────────
+    notes_suffixes = set(_NOTES_TABLE_KEY_TO_SUFFIX.values())
+    needs_notes    = allowed_suffixes is None or bool(notes_suffixes & allowed_suffixes)
+
+    if needs_notes and "notes" in raw_by_call_type:
+        try:
+            result = _parse_json_from_raw(raw_by_call_type["notes"])
+            notes_result = {}
+            for key, val in result.items():
+                key_upper = key.upper().replace("-", "_")
+                if isinstance(val, list):
+                    notes_result[key_upper] = [
+                        int(p) for p in val
+                        if isinstance(p, (int, float))
+                        or (isinstance(p, str) and str(p).isdigit())
+                    ]
+                elif isinstance(val, int):
+                    notes_result[key_upper] = [val]
+        except Exception as e:
+            print(f"  [ID-BATCH] Notes tables parse failed ({e}) — using empty")
+            notes_result = {}
+    else:
+        notes_result = {}
+
+    # ── Merge + post-process (mirrors identify_pages_gemini logic) ────
+    normalized = {**main_result, **dsr_debt_result, **notes_result}
+
+    if allowed_suffixes is not None:
+        allowed_keys = {s.lstrip("_").upper() for s in allowed_suffixes}
+        normalized   = {k: v for k, v in normalized.items() if k in allowed_keys}
+
+    notes_held_out = {
+        k: normalized.pop(k) for k in _NOTES_TABLE_KEYS if k in normalized
+    }
+
+    if allowed_suffixes is not None and not needs_dsr_debt:
+        normalized = _validate_nonlg_pages(pdf_path, normalized)
+        normalized = _keep_first_cluster(normalized, max_gap=5)
+
+    normalized.update(notes_held_out)
+    normalized = _correct_page_numbers(normalized, pdf_path)
+
+    if needs_notes:
+        normalized = _validate_notes_pages(pdf_path, normalized)
+
+        empty_notes_keys = [k for k in notes_held_out if not normalized.get(k)]
+        if empty_notes_keys:
+            print(f"  [VAL-BATCH] LLM returned no pages for {', '.join(empty_notes_keys)} "
+                  f"— running full document scan as fallback")
+            scanned = _full_scan_notes_tables(pdf_path, empty_notes_keys)
+            for k, pages in scanned.items():
+                normalized[k] = pages
+                if pages:
+                    print(f"  [VAL-BATCH] {k} RECOVERED by full scan: {pages}")
+
+        normalized = _attach_activity_split_pages(pdf_path, normalized)
+        normalized = _attach_faq_operand_pages(normalized)
+
+    if not needs_dsr_debt:
+        normalized["DSR"]  = []
+        normalized["DEBT"] = []
+        return normalized
+
+    final_dsr  = normalized.get("DSR",  [])
+    final_debt = normalized.get("DEBT", [])
+
+    if not final_dsr and not final_debt:
+        print(f"  [VAL-BATCH] LLM returned no DSR/DEBT — running full document scan as fallback")
+        final_dsr, final_debt = _full_scan_dsr_debt(pdf_path)
+
+    normalized["DSR"]  = sorted(set(final_dsr))
+    normalized["DEBT"] = sorted(set(final_debt))
+
+    return normalized

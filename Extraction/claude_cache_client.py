@@ -241,6 +241,7 @@ def normalize_one_claude_cached(
     page_info: dict | None = None,
     stmt_type: str = "UNKNOWN",
     coa_map_rules: str = "",
+    indented_text: str | None = None,       # ← NEW
 ) -> dict:
     """
     Paid sync Claude normalization with prompt caching.
@@ -281,10 +282,57 @@ def normalize_one_claude_cached(
     pdf_bytes = Path(pdf_path).read_bytes()
     pdf_b64   = base64.b64encode(pdf_bytes).decode("utf-8")
 
+    # ── Build FRESH content: page reference + indented text + PDF ────────────
     page_note = _build_page_reference_block(page_info)
+
+    # Use pre-extracted indented_text if provided; fallback only if None
+    if indented_text is None:
+        try:
+            from pdf_to_indented_text import pdf_to_indented_text as _pit
+            indented_text = _pit(pdf_path)
+        except Exception:
+            indented_text = None
+
+    # Assemble user content blocks
+    user_content = []
+
+    # 1. PDF document (always first so the model sees the visual layout)
+    user_content.append(
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": pdf_b64,
+            },
+        }
+    )
+
+    # 2. Page reference note (mandatory when present)
     user_text = "Extract and normalize the attached financial statement PDF. Return JSON only."
     if page_note:
         user_text += "\n\n" + page_note
+
+    # 3. Indented text block (hierarchy-preserving extraction)
+    if indented_text:
+        user_text += (
+            "\n\n"
+            "INDENTED TEXT EXTRACTION OF THE PDF (HIERARCHY-PRESERVING):\n"
+            "The following is the financial statement text extracted with visual\n"
+            "indentation preserved. Leading spaces indicate hierarchy level:\n"
+            "  0 spaces = root level\n"
+            "  2 spaces = level-1 child\n"
+            "  4 spaces = level-2 grandchild\n"
+            "  6 spaces = total/subtotal row\n\n"
+            "USE THIS INDENTED TEXT (NOT the raw PDF) for Section E hierarchy "
+            "flattening. Trust the leading spaces -- do not override them with "
+            "semantic reasoning about label names.\n\n"
+            "--- BEGIN INDENTED TEXT ---\n"
+            + indented_text
+            + "\n--- END INDENTED TEXT ---"
+        )
+
+    user_content.append({"type": "text", "text": user_text})
 
     response = client.messages.create(
         model=model,
@@ -299,27 +347,14 @@ def normalize_one_claude_cached(
         messages=[
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": pdf_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": user_text,
-                    },
-                ],
+                "content": user_content,
             }
         ],
     )
 
     raw = _extract_text_from_message(response)
 
-    # ── Usage & cost ─────────────────────────────────────────────────────────
+    # ── Usage & cost ──────────────────────────────────────────────────────────
     usage_obj = getattr(response, "usage", None)
 
     input_tokens          = int(getattr(usage_obj, "input_tokens",                 0) or 0)
@@ -347,7 +382,7 @@ def normalize_one_claude_cached(
         "cache_read_tokens":     cache_read_tokens,
     }
 
-    # ── Multi-table delimiter detection ──────────────────────────────────────
+    # ── Multi-table delimiter detection ───────────────────────────────────────
     # Must happen BEFORE _parse_json() because a delimited response is two
     # JSON documents joined by a literal string — not valid JSON on its own.
     active_delimiter = next((d for d in _MULTI_TABLE_DELIMITERS if d in raw), None)
@@ -379,7 +414,7 @@ def normalize_one_claude_cached(
             "model":          model,
         }
 
-    # ── Normal single-table path ─────────────────────────────────────────────
+    # ── Normal single-table path ──────────────────────────────────────────────
     data = _parse_json(raw)
     data = expand_compact_json(data, stmt_type)
 

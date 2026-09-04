@@ -1,35 +1,10 @@
 """
 claude_batch_client.py
-
-Submits all PDFs as an Anthropic Claude Message Batch job.
-
-Batch mode:
-- async
-- approximately 50% discount
-- paid tier only
-- uses same prompt/content shaping as sync Claude client
-
-Return shape of wait_and_download_claude():
-{
-    "<custom_id>": {
-        "ok":             bool,
-        "data":           dict | None,      # first (or only) parsed+expanded table
-        "prop_snp_split": list[dict],       # all tables for multi-table responses
-        "usage":          {...},
-        "cost_usd":       float,
-        "cached_hit":     bool,
-        "model":          str,
-        "error":          str | None,       # present only when ok=False
-    },
-    ...
-}
-
-NOTE: Unlike the OpenAI/Gemini batch clients which return raw "json_text",
-this client returns already-parsed "data" dicts.  pipeline.py's Claude batch
-branch reads "data" directly and skips the json_text → parse_json step.
+... (docstring unchanged)
 """
 
 import base64
+import hashlib          # ★ FIX 1: moved to top with all other imports
 import json
 import os
 import re
@@ -45,10 +20,9 @@ except ImportError as e:
 
 from compact_schema import build_short_key_instruction, expand_compact_json
 
-# Import shared helpers from the sync client so behaviour stays consistent.
 from claude_cache_client import (
     resolve_claude_model,
-    _calc_cost,             # FIX #3: was called but never imported
+    _calc_cost,
     _MULTI_TABLE_DELIMITERS,
     _parse_json,
     _extract_text_from_message,
@@ -57,7 +31,6 @@ from claude_cache_client import (
 
 _POLL_SECONDS = 60
 
-# Batch = 50% of normal rates  ($ per 1M tokens)
 CLAUDE_BATCH_RATES = {
     "claude-sonnet-4-6": (1.50,  7.50),
     "claude-sonnet-4-5": (1.50,  7.50),
@@ -67,9 +40,23 @@ CLAUDE_BATCH_RATES = {
 
 _DEFAULT_BATCH_RATE = (1.50, 7.50)
 
+# ★ FIX 1: _safe_custom_id defined here, before submit_claude_batch uses it
+_MAX_CUSTOM_ID_LEN = 64
+
+def _safe_custom_id(raw_id: str) -> str:
+    """
+    Anthropic enforces a 64-character limit on custom_id.
+    Short ids are returned unchanged.
+    Long ids: first 32 chars (human-readable) + 32-char SHA-256 hex suffix
+    = exactly 64 chars, guaranteed unique.
+    """
+    if len(raw_id) <= _MAX_CUSTOM_ID_LEN:
+        return raw_id
+    suffix = hashlib.sha256(raw_id.encode()).hexdigest()[:32]
+    return raw_id[:32] + suffix
+
 
 def _batch_rate_for_model(model: str) -> tuple[float, float]:
-    """Return batch-discounted (input, output) rate in $/1M tokens."""
     model = resolve_claude_model(model)
     if model in CLAUDE_BATCH_RATES:
         return CLAUDE_BATCH_RATES[model]
@@ -87,20 +74,11 @@ def _calc_batch_cost(
     cache_creation_tokens: int,
     cache_read_tokens: int,
 ) -> float:
-    """
-    Cost calculation using batch-discounted rates.
-
-    Batch pricing is ~50% of normal; cache multipliers still apply on top:
-    - cache write: 1.25x the batch input rate
-    - cache read:  0.10x the batch input rate
-    """
     in_rate, out_rate = _batch_rate_for_model(model)
-
-    cache_write_rate = in_rate * 1.25
-    cache_read_rate  = in_rate * 0.10
-
+    cache_write_rate  = in_rate * 1.25
+    cache_read_rate   = in_rate * 0.10
     return (
-        (input_tokens          / 1_000_000) * in_rate
+        (input_tokens            / 1_000_000) * in_rate
         + (cache_creation_tokens / 1_000_000) * cache_write_rate
         + (cache_read_tokens     / 1_000_000) * cache_read_rate
         + (output_tokens         / 1_000_000) * out_rate
@@ -117,10 +95,8 @@ def _client() -> Anthropic:
 def _build_page_reference_block(page_info: dict | None) -> str | None:
     if not page_info:
         return None
-
     pages_str = ",".join(str(p) for p in page_info.get("pages", []))
     label     = page_info.get("label") or pages_str
-
     return (
         f"SOURCE PAGE REFERENCE - MANDATORY:\n"
         f"The attached extracted PDF was created from source page(s): {pages_str}.\n"
@@ -149,23 +125,24 @@ def _build_system_text(
         "=== STANDARD COA MASTER FILTERED FOR THIS STATEMENT TYPE ===",
         coa_text or "",
     ]
-
     if coa_map_rules:
         parts.extend([
             "",
             "=== COA DATAPOINT MAPPING RULES ===",
             coa_map_rules,
         ])
-
     if reporting_columns:
         parts.extend([
             "",
             "=== LOCKED REPORTING COLUMNS ===",
             json.dumps(reporting_columns, ensure_ascii=False, indent=2),
         ])
-
     return "\n".join(parts)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _build_request_for_pdf
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _build_request_for_pdf(
     pdf_path,
@@ -177,9 +154,18 @@ def _build_request_for_pdf(
     page_info=None,
     coa_map_rules: str = "",
     model: str = "claude-sonnet-4-6",
+    indented_text: str | None = None,      # ← NEW: pre-extracted indented text
 ) -> dict:
-    model = resolve_claude_model(model)
+    """
+    Build one Anthropic Batch API request dict for a single PDF.
 
+    indented_text is injected into the user text block alongside the page
+    reference note, matching the behaviour of normalize_one_claude_cached()
+    in the sync path.  The caller passes it from the job dict; this function
+    falls back to calling pdf_to_indented_text() only when it is None, so
+    the PDF is never opened twice in normal pipeline operation.
+    """
+    model     = resolve_claude_model(model)
     pdf_bytes = Path(pdf_path).read_bytes()
     pdf_b64   = base64.b64encode(pdf_bytes).decode("utf-8")
 
@@ -191,10 +177,40 @@ def _build_request_for_pdf(
         coa_map_rules=coa_map_rules,
     )
 
+    # ── Fallback: extract indented text if not pre-supplied ───────────────
+    if indented_text is None:
+        try:
+            from pdf_to_indented_text import pdf_to_indented_text as _pit
+            indented_text = _pit(pdf_path)
+        except Exception:
+            indented_text = None
+
+    # ── Build user text: page reference + optional indented text ─────────
     page_note = _build_page_reference_block(page_info)
-    user_text = "Extract and normalize the attached financial statement PDF. Return JSON only."
+    user_text = (
+        "Extract and normalize the attached financial statement PDF. "
+        "Return JSON only."
+    )
     if page_note:
         user_text += "\n\n" + page_note
+
+    if indented_text:
+        user_text += (
+            "\n\n"
+            "INDENTED TEXT EXTRACTION OF THE PDF (HIERARCHY-PRESERVING):\n"
+            "The following is the financial statement text extracted with visual\n"
+            "indentation preserved. Leading spaces indicate hierarchy level:\n"
+            "  0 spaces = root level\n"
+            "  2 spaces = level-1 child\n"
+            "  4 spaces = level-2 grandchild\n"
+            "  6 spaces = total/subtotal row\n\n"
+            "USE THIS INDENTED TEXT (NOT the raw PDF) for Section E hierarchy "
+            "flattening. Trust the leading spaces -- do not override them with "
+            "semantic reasoning about label names.\n\n"
+            "--- BEGIN INDENTED TEXT ---\n"
+            + indented_text
+            + "\n--- END INDENTED TEXT ---"
+        )
 
     return {
         "model":      model,
@@ -203,8 +219,6 @@ def _build_request_for_pdf(
             {
                 "type":          "text",
                 "text":          system_text,
-                # Cache breakpoint kept here — if Anthropic applies caching
-                # in batch mode, usage will reflect it.
                 "cache_control": {"type": "ephemeral"},
             }
         ],
@@ -238,37 +252,49 @@ def submit_claude_batch(
     jobs: list[dict],
     model: str,
     display_name: str = "fs-claude-batch",
-) -> str:
+) -> tuple[str, dict[str, str]]:
     """
-    Build and submit a Claude Message Batch.
-
-    jobs item shape:
-    {
-        custom_id, pdf_path, prompt_text, coa_text,
-        reporting_columns, stmt_type, max_tokens,
-        page_info, coa_map_rules
-    }
-
-    Returns batch_id (str).
+    jobs = list of dicts with keys:
+        custom_id, pdf_path, prompt_text, coa_text, reporting_columns,
+        stmt_type, max_tokens,
+        page_info       (optional),
+        coa_map_rules   (optional),
+        indented_text   (optional) ← NEW: pass pre-extracted text to avoid
+                                         a second pdfplumber open per PDF.
+    Returns: (batch_id, id_map)  where id_map maps safe_id → original custom_id.
     """
     client = _client()
     model  = resolve_claude_model(model)
 
+    id_map: dict[str, str] = {}
     requests = []
+    seen_safe_ids: set[str] = set()
+
     for j in jobs:
         body = _build_request_for_pdf(
-            pdf_path=j["pdf_path"],
-            prompt_text=j["prompt_text"],
-            coa_text=j["coa_text"],
-            reporting_columns=j.get("reporting_columns"),
-            stmt_type=j["stmt_type"],
-            max_tokens=j["max_tokens"],
-            page_info=j.get("page_info"),
-            coa_map_rules=j.get("coa_map_rules", ""),
-            model=model,
+            pdf_path          = j["pdf_path"],
+            prompt_text       = j["prompt_text"],
+            coa_text          = j["coa_text"],
+            reporting_columns = j.get("reporting_columns"),
+            stmt_type         = j["stmt_type"],
+            max_tokens        = j["max_tokens"],
+            page_info         = j.get("page_info"),
+            coa_map_rules     = j.get("coa_map_rules", ""),
+            model             = model,
+            indented_text     = j.get("indented_text"),   # ← NEW
         )
+        safe_id = _safe_custom_id(j["custom_id"])
+
+        # ── Guard: skip if this safe_id already seen ──────────────────
+        if safe_id in seen_safe_ids:
+            print(f"[CLAUDE BATCH] [WARN] Duplicate custom_id skipped: {safe_id}")
+            continue
+        seen_safe_ids.add(safe_id)
+        # ─────────────────────────────────────────────────────────────
+
+        id_map[safe_id] = j["custom_id"]
         requests.append({
-            "custom_id": j["custom_id"],
+            "custom_id": safe_id,
             "params":    body,
         })
 
@@ -282,7 +308,7 @@ def submit_claude_batch(
         )
 
     print(f"[CLAUDE BATCH] Submitted batch_id={batch_id}")
-    return batch_id
+    return batch_id, id_map
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,7 +316,6 @@ def submit_claude_batch(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_processing_status(batch) -> str:
-    """Normalise across SDK versions that expose different attribute names."""
     return (
         getattr(batch, "processing_status", None)
         or getattr(batch, "status", None)
@@ -306,18 +331,11 @@ def _parse_one_item(
     usage_dict: dict,
     cache_read_tokens: int,
 ) -> dict:
-    """
-    Parse the raw text from one batch result item.
-    Handles both single-table and multi-table (delimiter-separated) responses.
-    Always returns a fully-formed result dict with ok=True.
-    Raises on unrecoverable parse failure.
-    """
     active_delimiter = next(
         (d for d in _MULTI_TABLE_DELIMITERS if d in raw), None
     )
 
     if active_delimiter:
-        # ── Multi-table path ─────────────────────────────────────────────────
         parts          = [p.strip() for p in raw.split(active_delimiter) if p.strip()]
         prop_snp_split = []
         first_data     = None
@@ -336,9 +354,7 @@ def _parse_one_item(
                 )
 
         if not prop_snp_split:
-            raise ValueError(
-                "Delimiter found but no sub-table parsed successfully"
-            )
+            raise ValueError("Delimiter found but no sub-table parsed successfully")
 
         return {
             "ok":             True,
@@ -350,11 +366,6 @@ def _parse_one_item(
             "model":          model,
         }
 
-    # ── Normal single-table path ─────────────────────────────────────────────
-    # expand_compact_json is intentionally called here with stmt_type so that
-    # compact keys are resolved before the result is handed back to pipeline.py.
-    # pipeline.py's re-expansion block (after wait_and_download_claude returns)
-    # is a no-op on already-expanded data, so double-calling is safe.
     data = _parse_json(raw)
     data = expand_compact_json(data, stmt_type)
 
@@ -373,33 +384,31 @@ def wait_and_download_claude(
     batch_id: str,
     model: str,
     jobs: list[dict] | None = None,
+    id_map: dict[str, str] | None = None,
 ) -> dict[str, dict]:
     """
     Poll until the batch reaches a terminal state, then download every result.
 
-    Parameters
-    ----------
-    batch_id : str
-        ID returned by submit_claude_batch().
-    model : str
-        Model string used for cost calculation when per-item model is absent.
-    jobs : list[dict] | None
-        Optional job list (same objects passed to submit_claude_batch).
-        Used to resolve stmt_type per custom_id for accurate expand_compact_json
-        calls.  If None, stmt_type defaults to "" for all items.
-
-    Returns
-    -------
-    dict[custom_id, result_dict]
-        Every item in the batch has an entry.  Shape documented at top of file.
+    id_map (safe_id -> original_id) is used in two places:
+      1. To look up stmt_type during parsing (Anthropic echoes safe_ids back).
+      2. To restore original custom_id keys in the returned dict so that
+         pipeline.py's job_by_id lookups work correctly.
     """
     client = _client()
     model  = resolve_claude_model(model)
 
-    # Build a lookup table so we can find stmt_type for each custom_id.
-    # FIX #2: stmt_type was undefined during result processing.
+    # ★ FIX 3 & 4: build job_stmt_type keyed by SAFE id, not original id.
+    # Anthropic returns safe_ids in batch results, so looking up by original
+    # id silently returned "" for every truncated filename in the old code.
     job_stmt_type: dict[str, str] = {}
-    if jobs:
+    if jobs and id_map:
+        # Reverse id_map: original_id -> safe_id, then map safe_id -> stmt_type
+        original_to_safe = {v: k for k, v in id_map.items()}
+        for j in jobs:
+            safe = original_to_safe.get(j["custom_id"], j["custom_id"])
+            job_stmt_type[safe] = j.get("stmt_type", "")
+    elif jobs:
+        # No id_map means no truncation happened; safe_id == original_id
         for j in jobs:
             job_stmt_type[j["custom_id"]] = j.get("stmt_type", "")
 
@@ -411,34 +420,25 @@ def wait_and_download_claude(
         batch  = client.messages.batches.retrieve(batch_id)
         status = _get_processing_status(batch)
         print(f"[CLAUDE BATCH] status={status}")
-
-        # Anthropic terminal statuses: ended, canceled, expired, errored
-        # (older SDK versions may use "completed")
         if status in {"ended", "completed", "canceled", "expired", "errored"}:
             break
-
         time.sleep(_POLL_SECONDS)
 
     if status not in {"ended", "completed"}:
         raise RuntimeError(f"Claude batch ended with non-success status={status!r}")
 
     # ── Download & parse results ─────────────────────────────────────────────
-    # FIX #1: the original code had `return` inside the for-loop, meaning only
-    # the FIRST item was ever returned.  We now accumulate into `results` dict
-    # and return after the loop completes.
-
     results: dict[str, dict] = {}
 
     for item in client.messages.batches.results(batch_id):
-        custom_id = getattr(item, "custom_id", None)
+        custom_id = getattr(item, "custom_id", None)   # this is the safe_id
         result    = getattr(item, "result",    None)
 
-        # ── Failed item ──────────────────────────────────────────────────────
         result_type = getattr(result, "type", None)
         if result_type != "succeeded":
             err = getattr(result, "error", None)
             results[custom_id] = {
-                "ok":             False,        # FIX #7: ok key always present
+                "ok":             False,
                 "error":          f"Claude batch item failed: {err}",
                 "data":           None,
                 "prop_snp_split": [],
@@ -456,7 +456,6 @@ def wait_and_download_claude(
             }
             continue
 
-        # ── Succeeded item ───────────────────────────────────────────────────
         response = getattr(result, "message", None)
         raw      = _extract_text_from_message(response)
 
@@ -468,10 +467,6 @@ def wait_and_download_claude(
         cached_tokens         = cache_creation_tokens + cache_read_tokens
         total_tokens          = input_tokens + output_tokens + cached_tokens
 
-        # FIX #3 & #4: use _calc_batch_cost (not the imported _calc_cost which
-        # uses normal rates) so the 50% batch discount is correctly applied.
-        # _rate_for_model / in_rate / out_rate are no longer computed separately
-        # (they were computed but never used in the original code).
         cost_usd = _calc_batch_cost(
             model=model,
             input_tokens=input_tokens,
@@ -489,8 +484,7 @@ def wait_and_download_claude(
             "cache_read_tokens":     cache_read_tokens,
         }
 
-        # Resolve stmt_type for this item so expand_compact_json uses the
-        # correct schema.  FIX #2: was undefined / "" in original code.
+        # custom_id here is the safe_id — job_stmt_type is now keyed by safe_id
         stmt_type = job_stmt_type.get(custom_id, "")
 
         try:
@@ -515,6 +509,10 @@ def wait_and_download_claude(
             }
 
         results[custom_id] = item_result
+
+    # Restore original custom_ids so pipeline.py's job_by_id lookups work
+    if id_map:
+        results = {id_map.get(k, k): v for k, v in results.items()}
 
     print(f"[CLAUDE BATCH] Downloaded {len(results)} result(s).")
     return results

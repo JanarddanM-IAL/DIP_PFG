@@ -1,85 +1,5 @@
 from decimal import Decimal, InvalidOperation
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PATCH NOTES
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# BUG 23 (FIXED): "Total Current Liabilities" in _PROP_SNP, _SNP, _GOV_BS
-#   used "dp_sum_by_coa" matching zero rows → false FAIL.
-#   Fixed: new rule type "dp_sum_current_liabilities" with Strategy A
-#   (Items label starts with "current liabilities:") and Strategy B
-#   (COA Datapoint does NOT end with "- noncurrent").
-#
-# BUG 24 (FIXED): _PROP_IS "Change In Net Position" chain ordering.
-#   Fixed: Chain 1 = IBT + Contributions & Transfers (section fallback).
-#
-# BUG 25 (FIXED): "Total Liabilities, Deferred Inflows, and Net Position"
-#   skipped when Deferred Inflows or Net Position had no CP subtotal.
-#   Fixed: Chain 3 uses dict-form members with section-sum fallback.
-#
-# BUG 26 (FIXED): DSR "Total" CP Premium/Discount column causes false FAIL.
-#   Fixed: dedicated _DSR block skips Premium/Discount column and adds
-#   CP(Premium/Discount) to the Total Debt Service DP sum.
-#
-# BUG 27 (FIXED): _PROP_IS "Operating Income (Loss)" false FAIL when
-#   "Total Operating Revenues" CP row is absent.
-#   Fixed: new rule type "cp_or_section_subtract".
-#
-# BUG 28 (FIXED): _PROP_IS blank-COA-Datapoint CP rows never matched.
-#   Fixed: new rule type "section_cp_blank_datapoint" with __BLANK__ sentinel.
-#
-# BUG 29 (FIXED): _PROP_CFS "Total Balance of Cash and Cash Equivalents"
-#   missed extra DP rows in the Balance section.
-#   Fixed: new rule type "section_dp_plus_cp".
-#
-# BUG 30 (FIXED): _SNP / _GOV_BS "Total Noncurrent Liabilities" dp_sum
-#   matched "Current Liabilities: Current portion of long-term liabilities"
-#   because "long-term liabilities" is a substring of that Items label.
-#   Fixed: added "current liabilities:" to the excludes list for all three
-#   statement types (_SNP, _GOV_BS, _PROP_SNP).
-#
-# BUG 31 (FIXED): _SOA "Total General Revenues and Transfer" used
-#   "cp_or_section_sum" with a "coa_filter" key that was never implemented
-#   in _sum_cp_or_section(). The member with cp=None fell through to summing
-#   ALL DPs in "General Revenues" (including non-Transfer rows) → wrong total.
-#   Fixed:
-#   (a) New rule type "dp_sum_by_coa_in_section" — sums DP rows whose
-#       COA Datapoint matches a target string, within a named section.
-#   (b) New rule type "cp_sum_with_dp_fallback" — two-member rule:
-#       member 0: CP lookup (Total General Revenues),
-#       member 1: dp_sum_by_coa_in_section for Transfers DP in General Revenues.
-#   This correctly computes: Total GR CP + Transfers DP = Total GR and Transfer CP.
-#   Backward-compatible: if no Transfers DP exists in General Revenues,
-#   member 1 contributes 0 (same as before).
-#
-# BUG 32 (FIXED): _PROP_SNP "Total Noncurrent Assets" dp_sum used
-#   contains=["noncurrent assets"] but Items labels have a hyphen:
-#   "Non-current Assets: ...". The substring "noncurrent assets" (no hyphen)
-#   never matched → computed = 0 → false FAIL.
-#   Fixed: added "non-current assets" to contains list so both hyphenated
-#   and non-hyphenated prefixes match.
-#
-# BUG 33 (FIXED): _DEBT validation always produced "Skipped - no rule defined"
-#   because RULES matched CP COA Datapoints by hardcoded name (e.g.
-#   "Total governmental-type activities") which differed from actual CP names
-#   in files (e.g. "Total", "Total Business-Type Activities").
-#   Fixed: new rule type "dpg_cp_sum" — no COA Datapoint matching at all.
-#   The engine scans each section for DPG→DP*→CP triplets in row order and
-#   validates each CP as the sum of its immediately preceding DP rows
-#   (those between it and the previous DPG or section start).
-#   Fully dynamic: works for any CP name, any number of sub-groups,
-#   any number of DP rows per group. Zero hardcoded strings.
-#
-# BUG 34 (FIXED): _apply_check used exact Decimal equality. LLM rounding
-#   causes ±1-unit discrepancies (e.g. SOA Charges for Services off by $1,
-#   Changes in Net Position off by $1) that are not real errors.
-#   Fixed: tolerance of ±1 applied in _apply_check. Any column where
-#   |computed − reported| ≤ 1 is treated as PASS. Columns with larger
-#   discrepancies still FAIL normally.
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# ── BUG 18 chain ─────────────────────────────────────────────────────────────
 CHAIN_TOTAL_ASSETS_AND_DEFERRED_OUTFLOWS = [
     [
         "Total Assets",
@@ -93,21 +13,30 @@ CHAIN_TOTAL_ASSETS_AND_DEFERRED_OUTFLOWS = [
     ],
 ]
 
-# ── BUG 19 / BUG 25 chain ────────────────────────────────────────────────────
 CHAIN_TOTAL_LIAB_DEFERRED_INFLOWS_NET_POSITION = [
-    # Chain 1 — explicit combined CP row printed.
+    # Chain 0
+    [
+        "Total Liabilities",
+        "Total Deferred Inflows of Resources",
+    ],
+    # Chain 1
+    [
+        "Total Liabilities",
+        {"cp": "Total Deferred Inflows of Resources",
+         "section": "Deferred Inflows of Resources"},
+    ],
+    # Chain 2 — explicit combined CP row printed.
     [
         "Total Liabilities and Deferred Inflows of Resources",
         "Total Net Position",
     ],
-    # Chain 2 — three separate CP rows all present.
+    # Chain 3 — three separate CP rows all present.
     [
         "Total Liabilities",
         "Total Deferred Inflows of Resources",
         "Total Net Position",
     ],
-    # Chain 3 — section-sum fallback for Deferred Inflows / Net Position
-    # when their CP rows are absent. Dict members never block _chain_usable().
+    # Chain 4 — section-sum fallback for Deferred Inflows / Net Position
     [
         "Total Liabilities",
         {"cp": "Total Deferred Inflows of Resources",
@@ -121,36 +50,41 @@ RULES = {
 
     # ── PROP_SNP ──────────────────────────────────────────────────────────────
     "_PROP_SNP": [
-        ("Total Current Assets",      "dp_sum",  "Assets",
+        ("Total Current Assets",      "dp_sum_positional",  "Assets",
             ["current assets"], ["noncurrent", "non-current"]),
+        ("Total Restricted Assets",   "dp_label_ikey_sum_since_last_cp", "Assets",
+            ["restricted assets"], []),
+        ("Total Other Assets",        "dp_label_ikey_sum_since_last_cp", "Assets",
+            ["other assets"], []),
         ("Net Capital Assets",         "dp_sum",  "Assets",
             ["capital assets"], []),
         ("Total Capital Assets",      "dp_sum_by_coa", "Assets",
             ["Capital Assets"], []),
-        # BUG 32 FIX: added "non-current assets" (hyphenated form).
-        ("Total Noncurrent Assets",    "dp_sum",  "Assets",
+        ("Total Noncurrent Assets",   "dp_label_ikey_sum", "Assets",
             ["noncurrent assets", "non-current assets"], []),
-        ("Total Assets",               "section",  "Assets",
-            [], []),
+        ("Total Assets",               "section",  "Assets",            [], []),
         ("Total Deferred Outflows of Resources", "section",
             "Deferred Outflows of Resources", [], []),
         ("Total Assets and Deferred Outflows of Resources",
             "cp_sum_first_present", None,
             CHAIN_TOTAL_ASSETS_AND_DEFERRED_OUTFLOWS, []),
-        ("Total Current Liabilities",  "dp_sum_current_liabilities",  "Liabilities",
-            [], []),
-        # BUG 30 FIX: added "current liabilities:" to excludes.
+        ("Total Current Liabilities",  "dp_sum_current_liabilities",  "Liabilities", [], []),
         ("Total Noncurrent Liabilities", "dp_sum", "Liabilities",
-            ["noncurrent liabilities", "non-current liabilities", "long-term liabilities"],
+            ["noncurrent liabilities", "non-current liabilities", "long-term liabilities", "long-term liabil"],
             ["current liabilities:"]),
-        ("Total Liabilities",          "section",  "Liabilities",
-            [], []),
+        ("Total Liabilities",          "section",  "Liabilities",       [], []),
         ("Total Deferred Inflows of Resources", "section",
             "Deferred Inflows of Resources", [], []),
-        ("Total Liabilities and Deferred Inflows of Resources", "cp_sum", None,
-            ["Total Liabilities", "Total Deferred Inflows of Resources"], []),
-        ("Total Net Position",         "section", "Net Position",
-            [], ["adjustment"]),
+        ("Total Liabilities and Deferred Inflows of Resources", "cp_sum_first_present", None,
+    [
+        ["Total Liabilities", "Total Deferred Inflows of Resources"],
+        [
+            "Total Liabilities",
+            {"cp": "Total Deferred Inflows of Resources",
+             "section": "Deferred Inflows of Resources"},
+        ],
+    ], []),
+        ("Total Net Position",         "section", "Net Position",       [], ["adjustment"]),
         ("Total Liabilities and Net Position", "cp_sum", None,
             ["Total Liabilities", "Total Net Position"], []),
         ("Total Liabilities, Deferred Inflows of Resources, and Net Position",
@@ -182,31 +116,39 @@ RULES = {
     "_SNP": [
         ("Total Current Assets",       "dp_sum",  "Assets",
             ["current assets"], ["noncurrent", "non-current"]),
+        ("Total Restricted Assets",    "dp_label_ikey_sum_since_last_cp", "Assets",
+            ["restricted assets"], []),
+        ("Total Other Assets",         "dp_label_ikey_sum_since_last_cp", "Assets",
+            ["other assets"], []),
         ("Net Capital Assets",         "dp_sum",  "Assets",
             ["capital assets"], []),
         ("Total Capital Assets",       "dp_sum_by_coa", "Assets",
             ["Capital Assets"], []),
-        ("Total Noncurrent Assets",    "dp_sum",  "Assets",
+        ("Total Noncurrent Assets",    "dp_label_ikey_sum", "Assets",
             ["noncurrent assets", "non-current assets"], []),
-        ("Total Assets",               "section",  "Assets",
-            [], []),
+        ("Total Assets", "section", "Assets", [], []),
         ("Total Deferred Outflows of Resources", "section",
             "Deferred Outflows of Resources", [], []),
         ("Total Assets and Deferred Outflows of Resources",
             "cp_sum_first_present", None,
             CHAIN_TOTAL_ASSETS_AND_DEFERRED_OUTFLOWS, []),
-        ("Total Current Liabilities",  "dp_sum_current_liabilities",  "Liabilities",
-            [], []),
-        # BUG 30 FIX: added "current liabilities:" to excludes.
+        ("Total Current Liabilities",  "dp_sum_current_liabilities",  "Liabilities", [], []),
+        ("__BLANK__", "section_cp_blank_datapoint", "Net Position", [], []),
         ("Total Noncurrent Liabilities", "dp_sum", "Liabilities",
-            ["noncurrent liabilities", "non-current liabilities", "long-term liabilities"],
+            ["noncurrent liabilities", "non-current liabilities", "long-term liabilities", "long-term liabil"],
             ["current liabilities:"]),
-        ("Total Liabilities",          "section",  "Liabilities",
-            [], []),
+        ("Total Liabilities",          "section",  "Liabilities",       [], []),
         ("Total Deferred Inflows of Resources", "section",
             "Deferred Inflows of Resources", [], []),
-        ("Total Liabilities and Deferred Inflows of Resources", "cp_sum", None,
-            ["Total Liabilities", "Total Deferred Inflows of Resources"], []),
+        ("Total Liabilities and Deferred Inflows of Resources", "cp_sum_first_present", None,
+    [
+        ["Total Liabilities", "Total Deferred Inflows of Resources"],
+        [
+            "Total Liabilities",
+            {"cp": "Total Deferred Inflows of Resources",
+             "section": "Deferred Inflows of Resources"},
+        ],
+    ], []),
         ("Total Restricted",           "dp_sum",  "Net Position",
             ["restricted"], ["unrestricted"]),
         ("Total Net Position",         "dp_cp_sum", "Net Position",
@@ -227,29 +169,39 @@ RULES = {
     "_GOV_BS": [
         ("Total Current Assets",       "dp_sum",  "Assets",
             ["current assets"], ["noncurrent", "non-current"]),
-        ("Total Noncurrent Assets",    "dp_sum",  "Assets",
+        ("Total Net Position", "section", "Net Position", [], []),
+        ("Total Restricted Assets",    "dp_label_ikey_sum_since_last_cp", "Assets",
+            ["restricted assets"], []),
+        ("Total Other Assets",         "dp_label_ikey_sum_since_last_cp", "Assets",
+            ["other assets"], []),
+        ("Total Noncurrent Assets",    "dp_label_ikey_sum", "Assets",
             ["noncurrent assets", "non-current assets"], []),
+        ("Net Capital Assets",         "dp_sum",  "Assets",
+            ["capital assets"], []),
         ("Total Capital Assets",       "dp_sum_by_coa", "Assets",
             ["Capital Assets"], []),
-        ("Total Assets",               "section",  "Assets",
-            [], []),
+        ("Total Assets",               "section",  "Assets",            [], []),
         ("Total Deferred Outflows of Resources", "section",
             "Deferred Outflows of Resources", [], []),
         ("Total Assets and Deferred Outflows of Resources",
             "cp_sum_first_present", None,
             CHAIN_TOTAL_ASSETS_AND_DEFERRED_OUTFLOWS, []),
-        ("Total Current Liabilities",  "dp_sum_current_liabilities",  "Liabilities",
-            [], []),
-        # BUG 30 FIX: added "current liabilities:" to excludes.
+        ("Total Current Liabilities",  "dp_sum_current_liabilities",  "Liabilities", [], []),
         ("Total Noncurrent Liabilities", "dp_sum", "Liabilities",
-            ["noncurrent liabilities", "non-current liabilities", "long-term liabilities"],
+            ["noncurrent liabilities", "non-current liabilities", "long-term liabilities", "long-term liabil"],
             ["current liabilities:"]),
-        ("Total Liabilities",          "section",  "Liabilities",
-            [], []),
+        ("Total Liabilities",          "section",  "Liabilities",       [], []),
         ("Total Deferred Inflows of Resources", "section",
             "Deferred Inflows of Resources", [], []),
-        ("Total Liabilities and Deferred Inflows of Resources", "cp_sum", None,
-            ["Total Liabilities", "Total Deferred Inflows of Resources"], []),
+        ("Total Liabilities and Deferred Inflows of Resources", "cp_sum_first_present", None,
+            [
+                ["Total Liabilities", "Total Deferred Inflows of Resources"],
+                [
+                    "Total Liabilities",
+                    {"cp": "Total Deferred Inflows of Resources",
+                     "section": "Deferred Inflows of Resources"},
+                ],
+            ], []),
         ("Total Fund Balances",        "section", "Fund Balances", [], []),
         ("Total Liabilities, Deferred Inflows of Resources, And Fund Balances",
             "cp_or_section_sum", None,
@@ -263,34 +215,44 @@ RULES = {
 
     # ── GOV_IS ────────────────────────────────────────────────────────────────
     "_GOV_IS": [
-        ("Total Operating Revenues",   "section", "Revenues",         [], []),
-        ("Total Operating Expenses",   "section", "Expenditures",     [], []),
+        ("Total Operating Revenues",   "section", "Revenues",           [], []),
+        ("Total Operating Expenses",   "section", "Expenditures",       [], []),
         ("Excess Of Revenues Over/Under Expenditures", "cp_subtract", None,
             ["Total Operating Revenues", "Total Operating Expenses"], []),
         ("Total Other Financing Sources", "section",
             "Other Financing Sources (Uses)", [], []),
-        ("Net Change In Fund Balances", "cp_sum", None,
-            ["Excess Of Revenues Over/Under Expenditures",
-             "Total Other Financing Sources"], []),
+        ("Net Change In Fund Balances", "cp_sum_first_present", None,
+            [
+                [
+                    "Excess Of Revenues Over/Under Expenditures",
+                    {"cp": "Total Other Financing Sources",
+                     "section": "Other Financing Sources (Uses)"},
+                ],
+                [
+                    {"cp": "Total Operating Revenues",   "section": "Revenues"},
+                    {"cp": "Total Other Financing Sources",
+                     "section": "Other Financing Sources (Uses)"},
+                ],
+            ], []),
     ],
 
     # ── SOA ───────────────────────────────────────────────────────────────────
     "_SOA": [
-        # BUG 31a FIX: exclude Transfers DP from Total General Revenues sum.
-        ("Total General Revenues", "section", "General Revenues",
-            [], ["transfers"]),
-        # BUG 31b FIX: new rule type "cp_sum_with_dp_fallback".
-        # Computes: CP("Total General Revenues") + DP(COA="Transfers" in "General Revenues").
-        # Handles filings where Transfers DP lives inside "General Revenues" section
-        # rather than in a separate "Transfers" section.
+        ("Total General Revenues", "section", "General Revenues",       [], ["transfers"]),
         ("Total General Revenues and Transfer", "cp_sum_with_dp_fallback", None,
     [
         {"type": "cp", "coa": "Total General Revenues",
-         "section": "General Revenues"},   # <-- fallback section added
+         "section": "General Revenues"},
         {"type": "dp_coa_in_section",
          "coa": "Transfers",
          "section": "General Revenues"},
     ], []),
+        ("Total Revenues",     "section", "Revenues",                   [], []),
+        ("Total Expenditures", "section", "Expenditures",               [], []),
+        ("Excess of Revenues Over Expenditures", "cp_subtract", None,
+            ["Total Revenues", "Total Expenditures"], []),
+        ("Net Change in Fund Balances", "cp_sum", None,
+            ["Excess of Revenues Over Expenditures", "Total Other Financing Sources"], []),
         ("Total Program Receipts - Charges for Services", "dp_sum_by_coa",
             "Program Revenue", ["Charges for Services"], []),
         ("Total Program Receipts - Operating Grants and Contributions",
@@ -299,19 +261,21 @@ RULES = {
         ("Total Program Receipts - Capital Grants and Contributions",
             "dp_sum_by_coa", "Program Revenue",
             ["Capital Grants and Contributions"], []),
-        ("Total Program Expenses",     "section", "Program Expenses",  [], []),
+        ("Total Program Expenses",     "section", "Program Expenses",   [], []),
         ("Changes in Net Position",    "cp_subtract_last", None,
-            ["Total General Revenues and Transfer",
-             "Total Program Receipts - Charges for Services",
-             "Total Program Receipts - Operating Grants and Contributions",
-             "Total Program Receipts - Capital Grants and Contributions",
-             "Total Program Expenses"],
+            [
+                ["Total General Revenues and Transfer", "Total General Revenues"],
+                "Total Program Receipts - Charges for Services",
+                "Total Program Receipts - Operating Grants and Contributions",
+                "Total Program Receipts - Capital Grants and Contributions",
+                "Total Program Expenses",
+            ],
             []),
     ],
 
     # ── PROP_IS ───────────────────────────────────────────────────────────────
     "_PROP_IS": [
-        ("Total Operating Revenues",   "section",
+        ("Total Operating Revenues",   "section_positional",
             "Operating Revenues",      [], []),
         ("Total Operating Expenses",   "section",
             "Operating Expenses",      [], []),
@@ -333,8 +297,6 @@ RULES = {
                 ["Income (Loss) before Transfers"],
                 ["Operating Income (Loss)",
                  "Total Nonoperating Revenues/Expense"],
-                ["Operating Income",
-                 "Total Non-operating Income"],
                 [
                     "Operating Income (Loss)",
                     {"cp": "Total contributions and transfers",
@@ -369,6 +331,7 @@ RULES = {
         ("Total Balance of Cash and Cash Equivalents", "section_dp_plus_cp",
             "Balance of Cash and Cash Equivalents",
             ["Net Change in Cash and Cash Equivalents",
+             "Total Cash Flows from Operating Activities",
              "Cash and Cash Equivalents"], []),
     ],
 
@@ -378,12 +341,6 @@ RULES = {
     ],
 
     # ── DEBT ──────────────────────────────────────────────────────────────────
-    # BUG 33 FIX: replaced all hardcoded CP name rules with a single
-    # "dpg_cp_sum" sentinel rule. The engine's _DEBT special block handles
-    # all sections: it scans row-order for DPG→DP*→CP triplets and validates
-    # each CP as the sum of its immediately preceding DP rows. Fully dynamic —
-    # works regardless of how the LLM names the CP rows or how many sub-groups
-    # exist within each section.
     "_DEBT": [
         ("__DPG_CP_SUM__", "dpg_cp_sum", None, [], []),
     ],
@@ -398,7 +355,7 @@ def _is_nonprofit_prop_snp(data: dict) -> bool:
     section_names_lower = {s.strip().lower() for s in sections.keys()}
     has_net_assets   = "net assets" in section_names_lower
     has_net_position = "net position" in section_names_lower
-    has_deferred      = any(
+    has_deferred     = any(
         "deferred outflows" in s or "deferred inflows" in s
         for s in section_names_lower
     )
@@ -445,7 +402,50 @@ def _items_key(data):
     return "Items"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 1: Case-insensitive section lookup
+# All section lookups now go through _get_section_rows() which matches
+# section names case-insensitively. This fixes PROP_CFS failures where
+# data has "Cash flows from operating activities" (lowercase) but rules
+# reference "Cash Flows from Operating Activities" (title case).
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_section_rows(sections: dict, section_name: str) -> list:
+    """Return rows for section_name using case-insensitive matching."""
+    if section_name is None:
+        return []
+    # Exact match first (fast path)
+    if section_name in sections:
+        return sections[section_name]
+    # Case-insensitive fallback
+    target = section_name.strip().lower()
+    for k, v in sections.items():
+        if k.strip().lower() == target:
+            return v
+    return []
+
+
 def _get_cp(sections, coa_dp, table_id=None):
+    """Return the LAST matching CP row (fix for duplicate-CP sheets)."""
+    if not coa_dp:
+        return None
+    coa_dp_lower = coa_dp.strip().lower()
+    found = None
+    for rows in sections.values():
+        for r in rows:
+            if table_id is not None and _table_id(r) != table_id:
+                continue
+            if r.get("COA Flag") == "CP":
+                stored = r.get("COA Datapoint", "").strip().lower()
+                if stored == coa_dp_lower:
+                    found = r          # keep going — take the last match
+                elif stored in coa_dp_lower and len(stored) < len(coa_dp_lower):
+                    if found is None:  # only use substring match if no exact match yet
+                        found = r
+    return found
+
+
+def _get_cp_first(sections, coa_dp, table_id=None):
+    """Return the FIRST matching CP row (used for positional checks)."""
     if not coa_dp:
         return None
     coa_dp_lower = coa_dp.strip().lower()
@@ -453,20 +453,23 @@ def _get_cp(sections, coa_dp, table_id=None):
         for r in rows:
             if table_id is not None and _table_id(r) != table_id:
                 continue
-            if (r.get("COA Flag") == "CP"
-                    and r.get("COA Datapoint", "").strip().lower() == coa_dp_lower):
-                return r
+            if r.get("COA Flag") == "CP":
+                stored = r.get("COA Datapoint", "").strip().lower()
+                if stored == coa_dp_lower:
+                    return r
+                if stored in coa_dp_lower and len(stored) < len(coa_dp_lower):
+                    return r
     return None
 
 
 def _get_dp(sections, coa_dp, section_name=None, table_id=None):
     coa_dp_lower = coa_dp.strip().lower()
-    search_sections = (
-        {section_name: sections[section_name]}
-        if section_name and section_name in sections
-        else sections
-    )
-    for rows in search_sections.values():
+    if section_name:
+        search_rows = _get_section_rows(sections, section_name)
+        search_iter = [search_rows]
+    else:
+        search_iter = sections.values()
+    for rows in search_iter:
         for r in rows:
             if table_id is not None and _table_id(r) != table_id:
                 continue
@@ -477,7 +480,7 @@ def _get_dp(sections, coa_dp, section_name=None, table_id=None):
 
 
 def _dp_rows_in_section(sections, section_name, table_id=None):
-    rows = sections.get(section_name, [])
+    rows = _get_section_rows(sections, section_name)
     if table_id is None:
         return [r for r in rows if r.get("COA Flag") == "DP"]
     return [r for r in rows
@@ -495,7 +498,6 @@ def _dp_rows_by_coa(sections, coa_dp, section_name=None, table_id=None):
             if r.get("COA Datapoint", "").strip().lower() == coa_dp_lower]
 
 
-# BUG 34 FIX: tolerance of ±1 for LLM rounding discrepancies.
 def _apply_check(cp_row, member_vals, cols, tolerance=1):
     if cp_row is None:
         return
@@ -513,8 +515,16 @@ def _apply_check(cp_row, member_vals, cols, tolerance=1):
 
 def _sum_cp_vals(sections, cp_datapoints, cols, subtract_last=False, table_id=None):
     totals = {col: Decimal(0) for col in cols}
-    for i, dp in enumerate(cp_datapoints):
-        row = _get_cp(sections, dp, table_id=table_id)
+    for i, entry in enumerate(cp_datapoints):
+        if isinstance(entry, list):
+            row = None
+            for alt_name in entry:
+                candidate = _get_cp(sections, alt_name, table_id=table_id)
+                if candidate is not None:
+                    row = candidate
+                    break
+        else:
+            row = _get_cp(sections, entry, table_id=table_id)
         if row is None:
             continue
         for col in cols:
@@ -545,26 +555,23 @@ def _sum_cp_or_section(sections, members, cols, ikey, excludes=None, table_id=No
     return totals
 
 
-def _sum_dp_cp_mixed(sections, members, cols, section_name=None, table_id=None):
+def _sum_dp_cp_mixed(sections, members, cols, section_name=None, table_id=None, ikey=None):
     totals = {col: Decimal(0) for col in cols}
     for m in members:
         mtype = m.get("type")
         coa   = m.get("coa", "")
-
         if mtype == "dp":
             row = _get_dp(sections, coa, section_name, table_id=table_id)
             if row is None:
                 continue
             for col in cols:
                 totals[col] += _val(row.get(col, "-"))
-
         elif mtype == "cp":
             row = _get_cp(sections, coa, table_id=table_id)
             if row is None:
                 continue
             for col in cols:
                 totals[col] += _val(row.get(col, "-"))
-
         elif mtype == "cp_or_dp_sum":
             cp_row = _get_cp(sections, coa, table_id=table_id)
             if cp_row is not None:
@@ -579,18 +586,25 @@ def _sum_dp_cp_mixed(sections, members, cols, section_name=None, table_id=None):
             for r in pool:
                 for col in cols:
                     totals[col] += _val(r.get(col, "-"))
+        elif mtype == "dp_label_sum":
+            sec = m.get("section", section_name)
+            pool = _dp_rows_in_section(sections, sec, table_id=table_id)
+            label_contains = [c.lower() for c in m.get("label_contains", [])]
+            label_excludes = [e.lower() for e in m.get("label_excludes", [])]
+            for r in pool:
+                label = r.get(ikey or "Items", "").lower()
+                hit = any(c in label for c in label_contains) if label_contains else True
+                if hit and not any(e in label for e in label_excludes):
+                    for col in cols:
+                        totals[col] += _val(r.get(col, "-"))
         else:
             continue
     return totals
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BUG 31b FIX: cp_sum_with_dp_fallback handler
-# ─────────────────────────────────────────────────────────────────────────────
 def _sum_cp_with_dp_fallback(sections, members, cols, table_id=None, ikey=None):
     totals = {col: Decimal(0) for col in cols}
-    section_fallbacks_used = set()   # track which sections were summed via fallback
-
+    section_fallbacks_used = set()
     for m in members:
         mtype = m.get("type")
         if mtype == "cp":
@@ -610,9 +624,7 @@ def _sum_cp_with_dp_fallback(sections, members, cols, table_id=None, ikey=None):
                     for col in cols:
                         totals[col] += sum(_val(r.get(col, "-")) for r in pool)
                     section_fallbacks_used.add(fallback_sec)
-
         elif mtype == "dp_coa_in_section":
-            # Skip if the parent section was already fully summed via fallback
             if m.get("section") in section_fallbacks_used:
                 continue
             coa_target = m["coa"].strip().lower()
@@ -622,23 +634,17 @@ def _sum_cp_with_dp_fallback(sections, members, cols, table_id=None, ikey=None):
             for r in matching:
                 for col in cols:
                     totals[col] += _val(r.get(col, "-"))
-
     return totals
 
-# ─────────────────────────────────────────────────────────────────────────────
-# cp_sum_first_present helpers
-# ─────────────────────────────────────────────────────────────────────────────
+
 def _resolve_chain_member(sections, member, cols, ikey, table_id=None):
     if isinstance(member, dict):
-        if "cp_multi" in member:
-            totals = {col: Decimal(0) for col in cols}
-            for name in member["cp_multi"]:
-                row = _get_cp(sections, name, table_id=table_id)
-                if row is None:
-                    continue
-                for col in cols:
-                    totals[col] += _val(row.get(col, "-"))
-            return (totals, False)
+        if member.get("type") == "cp_subtract":
+            rev = _get_cp(sections, member["minuend"], table_id=table_id)
+            sub = _get_cp(sections, member["subtrahend"], table_id=table_id)
+            rev_vals = {col: _val(rev.get(col, "-")) for col in cols} if rev else {col: Decimal(0) for col in cols}
+            sub_vals = {col: _val(sub.get(col, "-")) for col in cols} if sub else {col: Decimal(0) for col in cols}
+            return ({col: rev_vals[col] - sub_vals[col] for col in cols}, False)
         cp_row = _get_cp(sections, member["cp"], table_id=table_id)
         if cp_row is not None:
             return ({col: _val(cp_row.get(col, "-")) for col in cols}, False)
@@ -656,6 +662,8 @@ def _resolve_chain_member(sections, member, cols, ikey, table_id=None):
 
 
 def _chain_usable(sections, chain, table_id=None):
+    if isinstance(chain, dict):
+        return True
     for member in chain:
         if isinstance(member, dict):
             if "cp_multi" in member:
@@ -663,7 +671,6 @@ def _chain_usable(sections, chain, table_id=None):
                     if _get_cp(sections, name, table_id=table_id) is None:
                         return False
                 continue
-            # {"cp":.., "section":..} always has DP fallback — never blocks.
             continue
         if _get_cp(sections, member, table_id=table_id) is None:
             return False
@@ -678,19 +685,163 @@ def _chain_label(member):
     return f"{member['cp']} (or section: {member['section']})"
 
 
-def _sum_cp_first_present(sections, chains, cols, ikey, table_id=None):
+def _sum_cp_first_present(sections, chains, cols, ikey, table_id=None, cp_row=None):
+    usable = []
     for chain in chains:
         if _chain_usable(sections, chain, table_id=table_id):
-            totals = {col: Decimal(0) for col in cols}
-            for member in chain:
-                vals, _ = _resolve_chain_member(
-                    sections, member, cols, ikey, table_id=table_id
-                )
-                for col in cols:
-                    totals[col] += vals[col]
-            label = " + ".join(_chain_label(m) for m in chain)
-            return totals, label, True
-    return None, None, False
+            usable.append(chain)
+    if not usable:
+        return None, None, False
+
+    def _compute(chain):
+        if isinstance(chain, dict):
+            vals, _ = _resolve_chain_member(sections, chain, cols, ikey, table_id=table_id)
+            return vals
+        totals = {col: Decimal(0) for col in cols}
+        for member in chain:
+            vals, _ = _resolve_chain_member(sections, member, cols, ikey, table_id=table_id)
+            for col in cols:
+                totals[col] += vals[col]
+        return totals
+
+    if cp_row is not None:
+        for chain in usable:
+            totals = _compute(chain)
+            if all(abs(totals[col] - _val(cp_row.get(col, "-"))) <= 1
+                   for col in cols):
+                label = " + ".join(_chain_label(m) for m in chain)
+                return totals, label, True
+
+    chain = usable[0]
+    totals = _compute(chain)
+    label = " + ".join(_chain_label(m) for m in chain)
+    return totals, label, True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 2: dp_sum_positional — positional window sum for mid-section subtotals
+# Used for Total Current Assets in PROP_SNP when DP item labels don't
+# contain "current assets" but instead use prefixes like "Current assets: X".
+# Sums DPs between the previous CP and this CP, with label filtering.
+# ─────────────────────────────────────────────────────────────────────────────
+def _dp_sum_positional(sections, section, cp_row, cols, ikey,
+                        contains, excludes, table_id):
+    """
+    Sum DPs in `section` that fall between the previous CP and cp_row
+    (positional window), filtered by label contains/excludes.
+
+    Fallback logic (handles prefix-style item labels like "Current assets: X"):
+    1. If label filtering finds no rows → use full window.
+    2. If label-filtered sum doesn't match the reported CP value → use full window.
+       This covers cases where restricted/other current assets appear in the same
+       positional window but lack the expected label keyword.
+    """
+    sec_rows = _get_section_rows(sections, section)
+    cp_order = cp_row.get("_row_order", -1)
+
+    # Find the _row_order of the immediately-preceding CP in same table/section
+    prev_cp_order = -1
+    for r in sec_rows:
+        if _table_id(r) != table_id:
+            continue
+        if r.get("COA Flag") == "CP":
+            ro = r.get("_row_order", -1)
+            if ro < cp_order:
+                prev_cp_order = max(prev_cp_order, ro)
+
+    # Collect DPs in the positional window
+    window = [
+        r for r in sec_rows
+        if _table_id(r) == table_id
+        and r.get("COA Flag") == "DP"
+        and prev_cp_order < r.get("_row_order", -1) < cp_order
+    ]
+
+    label_contains = [c.lower() for c in contains]
+    label_excludes = [e.lower() for e in excludes]
+
+    def _label_match(r):
+        label = str(r.get(ikey, "")).lower()
+        hit = any(c in label for c in label_contains) if label_contains else True
+        return hit and not any(e in label for e in label_excludes)
+
+    matched = [r for r in window if _label_match(r)]
+
+    # Fallback 1: label filter found nothing → use full window
+    if not matched and window:
+        return {col: sum(_val(r.get(col, "-")) for r in window) for col in cols}
+
+    filtered_vals = {col: sum(_val(r.get(col, "-")) for r in matched) for col in cols}
+
+    # Fallback 2: filtered sum mismatches reported value → try full window
+    reported_vals = {col: _val(cp_row.get(col, "-")) for col in cols}
+    if any(abs(filtered_vals[col] - reported_vals[col]) > 1 for col in cols):
+        full_vals = {col: sum(_val(r.get(col, "-")) for r in window) for col in cols}
+        if all(abs(full_vals[col] - reported_vals[col]) <= 1 for col in cols):
+            return full_vals
+
+    return filtered_vals
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 3: section_positional — positional window section sum
+# Used for Total Operating Revenues in PROP_IS when there are multiple
+# CP rows with the same COA Datapoint (one per fund/entity).
+# Each CP is checked against only the DPs in its own positional window.
+# ─────────────────────────────────────────────────────────────────────────────
+def _section_positional(sections, section, cp_row, cols, ikey,
+                         excludes, table_id):
+    """
+    Sum DPs between the previous CP and cp_row in `section`.
+    Respects excludes label filter.
+
+    Fallback: if window-DP sum doesn't match, try prev_CP + window_DPs.
+    This handles rolling subtotal patterns where each CP accumulates the
+    previous CP plus a few new DPs (e.g. multiple Total Operating Revenues
+    CPs in a multi-fund PROP_IS sheet).
+    """
+    sec_rows = _get_section_rows(sections, section)
+    cp_order = cp_row.get("_row_order", -1)
+
+    prev_cp_order = -1
+    prev_cp_row = None
+    for r in sec_rows:
+        if _table_id(r) != table_id:
+            continue
+        if r.get("COA Flag") == "CP":
+            ro = r.get("_row_order", -1)
+            if ro < cp_order and ro > prev_cp_order:
+                prev_cp_order = ro
+                prev_cp_row = r
+
+    window = [
+        r for r in sec_rows
+        if _table_id(r) == table_id
+        and r.get("COA Flag") == "DP"
+        and prev_cp_order < r.get("_row_order", -1) < cp_order
+    ]
+
+    label_excludes = [e.lower() for e in excludes]
+    filtered = [r for r in window
+                if not any(e in str(r.get(ikey, "")).lower() for e in label_excludes)]
+
+    window_vals = {col: sum(_val(r.get(col, "-")) for r in filtered) for col in cols}
+    reported_vals = {col: _val(cp_row.get(col, "-")) for col in cols}
+
+    # If pure window sum matches, done
+    if all(abs(window_vals[col] - reported_vals[col]) <= 1 for col in cols):
+        return window_vals
+
+    # Fallback: prev_CP + window_DPs (rolling subtotal pattern)
+    if prev_cp_row is not None:
+        combined = {
+            col: _val(prev_cp_row.get(col, "-")) + window_vals[col]
+            for col in cols
+        }
+        if all(abs(combined[col] - reported_vals[col]) <= 1 for col in cols):
+            return combined
+
+    return window_vals
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -704,6 +855,25 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
     except Exception as e:
         print(f"[WARN] column_shift_repair skipped: {e}")
 
+    # ── FIX: inject _row_order if rows don't already have it ──────────────
+    # When called from jsonToCsv.py (JSON path), rows have no _row_order.
+    # _row_order must reflect document order for positional window rules
+    # (dp_sum_positional, section_positional, dp_label_ikey_sum_since_last_cp,
+    #  dp_sum_current_liabilities). Stamp them now using global list position.
+    sections = data.get("Sections", {})
+    _needs_row_order = all(
+        "_row_order" not in r
+        for rows in sections.values()
+        for r in rows[:1]   # check just the first row of each section
+    )
+    if _needs_row_order:
+        counter = 0
+        for rows in sections.values():
+            for r in rows:
+                r["_row_order"] = counter
+                counter += 1
+    # ──────────────────────────────────────────────────────────────────────
+
     sections = data.get("Sections", {})
     cols     = data.get("Reporting Columns", [])
 
@@ -711,7 +881,6 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
     rules = RULES.get(effective_stmt_type, [])
     ikey  = _items_key(data)
 
-    # Initialise all CP rows to PENDING; non-CP rows to blank.
     for rows in sections.values():
         for r in rows:
             flag = r.get("COA Flag", "")
@@ -720,7 +889,6 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
     for rule in rules:
         cp_dp, rule_type, section, contains, excludes = rule
 
-        # Sentinel rules handled in dedicated post-processing blocks below.
         if cp_dp in ("__BLANK__", "__DPG_CP_SUM__"):
             continue
 
@@ -735,10 +903,77 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
         for cp_row in matching_cp_rows:
             tid = _table_id(cp_row)
 
-            # ── dp_sum ────────────────────────────────────────────────────
-            if rule_type == "dp_sum":
+            # ── dp_label_ikey_sum ─────────────────────────────────────────────
+            if rule_type == "dp_label_ikey_sum":
                 if section:
-                    pool = [r for r in sections.get(section, [])
+                    pool = [r for r in _get_section_rows(sections, section)
+                            if r.get("COA Flag") == "DP" and _table_id(r) == tid]
+                else:
+                    pool = [r for sec in sections.values() for r in sec
+                            if r.get("COA Flag") == "DP" and _table_id(r) == tid]
+                label_contains = [c.lower() for c in contains]
+                label_excludes = [e.lower() for e in excludes]
+                matched = []
+                for r in pool:
+                    label = str(r.get(ikey, "")).lower()
+                    hit = any(c in label for c in label_contains) if label_contains else True
+                    if hit and not any(e in label for e in label_excludes):
+                        matched.append(r)
+                member_vals = {col: sum(_val(r.get(col, "-")) for r in matched)
+                               for col in cols}
+                _apply_check(cp_row, member_vals, cols)
+
+            # ── dp_label_ikey_sum_since_last_cp ───────────────────────────────
+            elif rule_type == "dp_label_ikey_sum_since_last_cp":
+                sec_rows = (_get_section_rows(sections, section)
+                            if section else
+                            [r for sec in sections.values() for r in sec])
+                cp_row_order = cp_row.get("_row_order", -1)
+                label_contains = [c.lower() for c in contains]
+                label_excludes = [e.lower() for e in excludes]
+                prev_cp_order = -1
+                for r in sec_rows:
+                    if _table_id(r) != tid:
+                        continue
+                    if r.get("COA Flag") == "CP":
+                        ro = r.get("_row_order", -1)
+                        if ro < cp_row_order:
+                            prev_cp_order = max(prev_cp_order, ro)
+                matched = []
+                for r in sec_rows:
+                    if _table_id(r) != tid:
+                        continue
+                    if r.get("COA Flag") != "DP":
+                        continue
+                    ro = r.get("_row_order", -1)
+                    if not (prev_cp_order < ro < cp_row_order):
+                        continue
+                    label = str(r.get(ikey, "")).lower()
+                    hit = any(c in label for c in label_contains) if label_contains else True
+                    if hit and not any(e in label for e in label_excludes):
+                        matched.append(r)
+                member_vals = {col: sum(_val(r.get(col, "-")) for r in matched)
+                               for col in cols}
+                _apply_check(cp_row, member_vals, cols)
+
+            # ── dp_sum_positional (FIX 2) ─────────────────────────────────────
+            elif rule_type == "dp_sum_positional":
+                member_vals = _dp_sum_positional(
+                    sections, section, cp_row, cols, ikey,
+                    contains, excludes, tid
+                )
+                _apply_check(cp_row, member_vals, cols)
+
+            # ── section_positional (FIX 3) ────────────────────────────────────
+            elif rule_type == "section_positional":
+                member_vals = _section_positional(
+                    sections, section, cp_row, cols, ikey, excludes, tid
+                )
+                _apply_check(cp_row, member_vals, cols)
+
+            elif rule_type == "dp_sum":
+                if section:
+                    pool = [r for r in _get_section_rows(sections, section)
                             if r.get("COA Flag") == "DP" and _table_id(r) == tid]
                 else:
                     pool = [r for sec in sections.values() for r in sec
@@ -753,10 +988,9 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
                                for col in cols}
                 _apply_check(cp_row, member_vals, cols)
 
-            # ── dp_sum_by_coa ─────────────────────────────────────────────
             elif rule_type == "dp_sum_by_coa":
                 if section:
-                    pool = [r for r in sections.get(section, [])
+                    pool = [r for r in _get_section_rows(sections, section)
                             if r.get("COA Flag") == "DP" and _table_id(r) == tid]
                 else:
                     pool = [r for sec in sections.values() for r in sec
@@ -770,68 +1004,88 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
                                for col in cols}
                 _apply_check(cp_row, member_vals, cols)
 
-            # ── dp_sum_current_liabilities (BUG 23) ───────────────────────
+            # ── dp_sum_current_liabilities (FIX 4) ───────────────────────────
+            # Added fallback: when DP-level sum doesn't match, try summing
+            # blank-COA intermediate CP subtotals that precede this CP.
             elif rule_type == "dp_sum_current_liabilities":
                 if section:
-                    pool = [r for r in sections.get(section, [])
+                    pool = [r for r in _get_section_rows(sections, section)
                             if r.get("COA Flag") == "DP" and _table_id(r) == tid]
+                    all_sec_rows = [r for r in _get_section_rows(sections, section)
+                                    if _table_id(r) == tid]
                 else:
                     pool = [r for sec in sections.values() for r in sec
                             if r.get("COA Flag") == "DP" and _table_id(r) == tid]
+                    all_sec_rows = [r for sec in sections.values() for r in sec
+                                    if _table_id(r) == tid]
+                uses_label_prefix = any(
+                    r.get(ikey, "").strip().lower().startswith("current liabilities:")
+                    for r in pool
+                )
                 matched = []
                 for r in pool:
                     item_label = r.get(ikey, "").strip().lower()
                     coa_dp_val = r.get("COA Datapoint", "").strip().lower()
-                    # Strategy A — PROP_SNP style: Items label starts with prefix.
-                    if item_label.startswith("current liabilities:"):
-                        matched.append(r)
-                        continue
-                    # Strategy B — SNP / GOV_BS style: not a noncurrent COA.
-                    if not coa_dp_val.endswith("- noncurrent"):
-                        matched.append(r)
+                    if uses_label_prefix:
+                        if item_label.startswith("current liabilities:"):
+                            matched.append(r)
+                    else:
+                        if not coa_dp_val.endswith("- noncurrent"):
+                            matched.append(r)
                 member_vals = {col: sum(_val(r.get(col, "-")) for r in matched)
                                for col in cols}
+
+                # FIX 4: If DP sum doesn't match, try summing blank-COA CP subtotals
+                reported_vals = {col: _val(cp_row.get(col, "-")) for col in cols}
+                if any(abs(member_vals[col] - reported_vals[col]) > 1 for col in cols):
+                    cp_order = cp_row.get("_row_order", -1)
+                    blank_cps = [
+                        r for r in all_sec_rows
+                        if r.get("COA Flag") == "CP"
+                        and not str(r.get("COA Datapoint", "")).strip()
+                        and r.get("_row_order", 0) < cp_order
+                    ]
+                    if blank_cps:
+                        fallback_vals = {col: sum(_val(r.get(col, "-")) for r in blank_cps)
+                                         for col in cols}
+                        if all(abs(fallback_vals[col] - reported_vals[col]) <= 1
+                               for col in cols):
+                            member_vals = fallback_vals
+
                 _apply_check(cp_row, member_vals, cols)
 
-            # ── section ───────────────────────────────────────────────────
             elif rule_type == "section":
                 if section:
                     pool = _dp_rows_in_section(sections, section, table_id=tid)
                 else:
                     pool = [r for sec in sections.values() for r in sec
                             if r.get("COA Flag") == "DP" and _table_id(r) == tid]
-                pool = [r for r in pool
-                        if not any(e.lower() in r.get(ikey, "").lower()
-                                   for e in excludes)]
-                member_vals = {col: sum(_val(r.get(col, "-")) for r in pool)
-                               for col in cols}
+
+                filtered_pool = [r for r in pool
+                                if not any(e.lower() in r.get(ikey, "").lower()
+                                            for e in excludes)]
+                member_vals = {col: sum(_val(r.get(col, "-")) for r in filtered_pool)
+                            for col in cols}
+
+                if excludes and any(
+                    abs(member_vals[col] - _val(cp_row.get(col, "-"))) > 1
+                    for col in cols
+                ):
+                    full_pool_vals = {col: sum(_val(r.get(col, "-")) for r in pool)
+                                    for col in cols}
+                    strategy1_passes = sum(
+                        abs(member_vals[col] - _val(cp_row.get(col, "-"))) <= 1
+                        for col in cols
+                    )
+                    strategy2_passes = sum(
+                        abs(full_pool_vals[col] - _val(cp_row.get(col, "-"))) <= 1
+                        for col in cols
+                    )
+                    if strategy2_passes > strategy1_passes:
+                        member_vals = full_pool_vals
+
                 _apply_check(cp_row, member_vals, cols)
 
-            # ── section_multi ─────────────────────────────────────────────
-            elif rule_type == "section_multi":
-                pool = []
-                for sec_name in contains:
-                    pool += _dp_rows_in_section(sections, sec_name, table_id=tid)
-                pool = [r for r in pool
-                        if not any(e.lower() in r.get(ikey, "").lower()
-                                   for e in excludes)]
-                member_vals = {col: sum(_val(r.get(col, "-")) for r in pool)
-                               for col in cols}
-                _apply_check(cp_row, member_vals, cols)
-
-            # ── cp_sum ────────────────────────────────────────────────────
-            elif rule_type == "cp_sum":
-                member_vals = _sum_cp_vals(sections, contains, cols, table_id=tid)
-                _apply_check(cp_row, member_vals, cols)
-
-            # ── cp_subtract / cp_subtract_last ────────────────────────────
-            elif rule_type in ("cp_subtract", "cp_subtract_last"):
-                member_vals = _sum_cp_vals(
-                    sections, contains, cols, subtract_last=True, table_id=tid
-                )
-                _apply_check(cp_row, member_vals, cols)
-
-            # ── cp_or_section_subtract (BUG 27) ───────────────────────────
             elif rule_type == "cp_or_section_subtract":
                 rev_cp_name, rev_section_name, exp_cp_name = (
                     contains[0], contains[1], contains[2]
@@ -849,7 +1103,6 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
                 member_vals = {col: rev_vals[col] - exp_vals[col] for col in cols}
                 _apply_check(cp_row, member_vals, cols)
 
-            # ── section_dp_plus_cp (BUG 29) ───────────────────────────────
             elif rule_type == "section_dp_plus_cp":
                 candidate_sections = [section] + list(contains[1:])
                 dp_pool = []
@@ -859,20 +1112,22 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
                         break
                 dp_sum = {col: sum(_val(r.get(col, "-")) for r in dp_pool)
                           for col in cols}
-                net_cp = _get_cp(sections, contains[0], table_id=tid)
+                net_cp = None
+                for cp_name in contains:
+                    net_cp = _get_cp(sections, cp_name, table_id=tid)
+                    if net_cp is not None:
+                        break
                 net_vals = ({col: _val(net_cp.get(col, "-")) for col in cols}
                             if net_cp else {col: Decimal(0) for col in cols})
                 member_vals = {col: dp_sum[col] + net_vals[col] for col in cols}
                 _apply_check(cp_row, member_vals, cols)
 
-            # ── dp_cp_sum ─────────────────────────────────────────────────
             elif rule_type == "dp_cp_sum":
                 member_vals = _sum_dp_cp_mixed(
-                    sections, contains, cols, section, table_id=tid
+                    sections, contains, cols, section, table_id=tid, ikey=ikey
                 )
                 _apply_check(cp_row, member_vals, cols)
 
-            # ── cp_or_section_sum ─────────────────────────────────────────
             elif rule_type == "cp_or_section_sum":
                 member_vals = _sum_cp_or_section(
                     sections, contains, cols, ikey,
@@ -880,17 +1135,43 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
                 )
                 _apply_check(cp_row, member_vals, cols)
 
-            # ── cp_sum_with_dp_fallback (BUG 31b) ─────────────────────────
             elif rule_type == "cp_sum_with_dp_fallback":
                 member_vals = _sum_cp_with_dp_fallback(
                     sections, contains, cols, table_id=tid, ikey=ikey
                 )
                 _apply_check(cp_row, member_vals, cols)
 
-            # ── cp_sum_first_present ──────────────────────────────────────
+            elif rule_type in ("cp_subtract", "cp_subtract_last"):
+                resolved_terms = []
+                for term in contains:
+                    if isinstance(term, list):
+                        picked = None
+                        for alt in term:
+                            alt_lower = alt.strip().lower()
+                            exact = next(
+                                (r for rows in sections.values() for r in rows
+                                 if r.get("COA Flag") == "CP"
+                                 and r.get("COA Datapoint", "").strip().lower() == alt_lower
+                                 and _table_id(r) == tid),
+                                None,
+                            )
+                            if exact is not None:
+                                picked = alt
+                                break
+                        if picked is None:
+                            picked = term[0]
+                        resolved_terms.append(picked)
+                    else:
+                        resolved_terms.append(term)
+                member_vals = _sum_cp_vals(
+                    sections, resolved_terms, cols, subtract_last=True, table_id=tid
+                )
+                _apply_check(cp_row, member_vals, cols)
+
             elif rule_type == "cp_sum_first_present":
                 member_vals, chosen_label, matched = _sum_cp_first_present(
-                    sections, contains, cols, ikey, table_id=tid
+                    sections, contains, cols, ikey, table_id=tid,
+                    cp_row=cp_row,
                 )
                 if not matched:
                     cp_row["Total Check Status"] = "Skipped - no chain matched"
@@ -907,7 +1188,12 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
     }
     if blank_dp_rules:
         for sec_name, sec_rows in sections.items():
-            if sec_name not in blank_dp_rules:
+            # Case-insensitive match for blank_dp_rules keys too
+            matched_rule_key = next(
+                (k for k in blank_dp_rules if k.strip().lower() == sec_name.strip().lower()),
+                None
+            )
+            if matched_rule_key is None:
                 continue
             tables_in_sec = {}
             for r in sec_rows:
@@ -926,38 +1212,78 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
                 for bcp in blank_cp_rows:
                     _apply_check(bcp, member_vals, cols)
 
-    # ── BUG 33 FIX: DEBT dpg_cp_sum block ────────────────────────────────────
-    # For each section, walk rows in order. Every DPG starts a new group.
-    # All DP rows after a DPG and before the next CP belong to that group.
-    # The CP closes the group and is validated as the sum of its DP group.
-    # Works for any CP name, any number of groups per section.
+    # ── _DEBT block ───────────────────────────────────────────────────────────
     if stmt_type == "_DEBT":
+        tables = {}
         for sec_name, sec_rows in sections.items():
-            # Group rows by table_id first (multi-filing sheets).
-            tables_in_sec = {}
             for r in sec_rows:
-                tables_in_sec.setdefault(_table_id(r), []).append(r)
+                tid = _table_id(r)
+                tables.setdefault(tid, []).append(r)
 
-            for tid, trows in tables_in_sec.items():
-                pending_dps = []
-                for r in trows:
-                    flag = r.get("COA Flag", "")
-                    if flag == "DPG":
-                        # Start a fresh DP accumulator for this sub-group.
-                        pending_dps = []
-                    elif flag == "DP":
-                        pending_dps.append(r)
-                    elif flag == "CP":
-                        # Validate this CP against the accumulated DPs.
-                        member_vals = {
-                            col: sum(_val(dp.get(col, "-")) for dp in pending_dps)
+        for tid, trows in tables.items():
+            pending_dps = []
+            dps_since_last_cp = []
+            cps_since_last_outer = []
+            all_cp_rows_in_table = [r for r in trows if r.get("COA Flag", "") == "CP"]
+
+            for r in trows:
+                flag = r.get("COA Flag", "")
+                if flag == "DPG":
+                    pending_dps = []
+                elif flag == "DP":
+                    pending_dps.append(r)
+                    dps_since_last_cp.append(r)
+                elif flag == "CP":
+                    reported = {col: _val(r.get(col, "-")) for col in cols}
+                    inner_sum = {
+                        col: sum(_val(dp.get(col, "-")) for dp in pending_dps)
+                        for col in cols
+                    }
+                    outer_dp_sum = {
+                        col: sum(_val(dp.get(col, "-")) for dp in dps_since_last_cp)
+                        for col in cols
+                    }
+                    outer_cp_sum = {
+                        col: sum(_val(cp.get(col, "-")) for cp in cps_since_last_outer)
+                        for col in cols
+                    }
+
+                    def matches(candidate):
+                        return all(
+                            abs(candidate[col] - reported[col]) <= 1
                             for col in cols
-                        }
-                        _apply_check(r, member_vals, cols)
-                        # Reset so subsequent DPs don't double-count.
-                        pending_dps = []
+                        )
+                    combined_sum = {
+                        col: inner_sum[col] + outer_cp_sum[col]
+                        for col in cols
+                    }
+                    if matches(inner_sum):
+                        member_vals = inner_sum
+                    elif matches(combined_sum):
+                        member_vals = combined_sum
+                    elif matches(outer_dp_sum):
+                        member_vals = outer_dp_sum
+                    elif matches(outer_cp_sum):
+                        member_vals = outer_cp_sum
+                    else:
+                        member_vals = outer_cp_sum if cps_since_last_outer else outer_dp_sum
 
-    # ── BUG 26 FIX: DSR special block ────────────────────────────────────────
+                    _apply_check(r, member_vals, cols)
+
+                    if matches(outer_cp_sum) and cps_since_last_outer:
+                        cps_since_last_outer = []
+                        dps_since_last_cp = []
+                    else:
+                        cps_since_last_outer.append(r)
+                        dps_since_last_cp = []
+
+                    pending_dps = []
+
+            for cp_r in all_cp_rows_in_table[-2:]:
+                if cp_r.get("Total Check Status", "") not in ("PASS",):
+                    cp_r["Total Check Status"] = ""
+
+    # ── DSR block ─────────────────────────────────────────────────────────────
     if stmt_type == "_DSR":
         pd_col = next(
             (c for c in cols if str(c).strip().lower() == "premium/discount"), None
@@ -984,7 +1310,101 @@ def run_total_check(data: dict, stmt_type: str) -> dict:
                     member_vals[tds_col] = member_vals[tds_col] + pd_cp_val
                 _apply_check(cp_row, member_vals, normal_cols)
 
-    # Any CP row still PENDING had no matching rule.
+    # ── _PROP_IS fallback ─────────────────────────────────────────────────────
+    if stmt_type == "_PROP_IS":
+        for rows in sections.values():
+            for r in rows:
+                if (r.get("COA Flag") == "CP"
+                        and r.get("COA Datapoint", "").strip().lower() == "change in net position"
+                        and r.get("Total Check Status") in ("PENDING", "Skipped - no chain matched")):
+                    rev_cp = _get_cp(sections, "Total Operating Revenues", table_id=_table_id(r))
+                    exp_cp = _get_cp(sections, "Total Operating Expenses",  table_id=_table_id(r))
+                    if rev_cp and exp_cp:
+                        member_vals = {
+                            col: _val(rev_cp.get(col, "-")) - _val(exp_cp.get(col, "-"))
+                            for col in cols
+                        }
+                        _apply_check(r, member_vals, cols)
+
+    # ── _GOV_IS fallback ─────────────────────────────────────────────────────
+    if stmt_type == "_GOV_IS":
+        for rows in sections.values():
+            for r in rows:
+                if r.get("COA Flag") != "CP":
+                    continue
+                if r.get("COA Datapoint", "").strip().lower() != "net change in fund balances":
+                    continue
+                status = r.get("Total Check Status", "")
+                if status == "PASS":
+                    continue
+
+                tid = _table_id(r)
+
+                excess_cp = _get_cp(sections,
+                    "Excess Of Revenues Over/Under Expenditures", table_id=tid)
+                ofs_cp = _get_cp(sections,
+                    "Total Other Financing Sources", table_id=tid)
+                ofs_pool = _dp_rows_in_section(
+                    sections, "Other Financing Sources (Uses)", table_id=tid)
+
+                if excess_cp is not None:
+                    ofs_vals = (
+                        {col: _val(ofs_cp.get(col, "-")) for col in cols}
+                        if ofs_cp is not None
+                        else {col: sum(_val(dp.get(col, "-")) for dp in ofs_pool)
+                              for col in cols}
+                    )
+                    member_vals = {
+                        col: _val(excess_cp.get(col, "-")) + ofs_vals[col]
+                        for col in cols
+                    }
+                    _apply_check(r, member_vals, cols)
+
+                else:
+                    rev_cp = _get_cp(sections, "Total Operating Revenues", table_id=tid)
+                    exp_cp = _get_cp(sections, "Total Operating Expenses",  table_id=tid)
+                    if rev_cp and exp_cp:
+                        ofs_sum = (
+                            {col: _val(ofs_cp.get(col, "-")) for col in cols}
+                            if ofs_cp is not None
+                            else {col: sum(_val(dp.get(col, "-")) for dp in ofs_pool)
+                                  for col in cols}
+                        )
+                        member_vals = {
+                            col: _val(rev_cp.get(col, "-"))
+                                 - _val(exp_cp.get(col, "-"))
+                                 + ofs_sum[col]
+                            for col in cols
+                        }
+                        _apply_check(r, member_vals, cols)
+
+    # ── SOA CU_MODE="B" entity column CP fix ─────────────────────────────────
+    if stmt_type == "_SOA":
+        try:
+            total_idx = cols.index("Total")
+            cu_idx = cols.index("Component Units")
+            entity_cols = cols[total_idx + 1 : cu_idx]
+        except ValueError:
+            entity_cols = []
+
+        if entity_cols:
+            for rows in sections.values():
+                for r in rows:
+                    if r.get("COA Flag") != "CP":
+                        continue
+                    status = r.get("Total Check Status", "")
+                    if not status or status == "PASS":
+                        continue
+                    fail_parts = [
+                        p for p in status.split(" | ")
+                        if not any(ec in p for ec in entity_cols)
+                    ]
+                    r["Total Check Status"] = (
+                        "PASS" if not fail_parts
+                        else " | ".join(fail_parts)
+                    )
+
+    # ── Final sweep ───────────────────────────────────────────────────────────
     for rows in sections.values():
         for r in rows:
             if r.get("Total Check Status") == "PENDING":
@@ -1055,7 +1475,7 @@ def _sheet_df_to_data(df: pd.DataFrame) -> dict:
     sections = OrderedDict()
     for idx, row in df.iterrows():
         r = row.to_dict()
-        r["_row_order"] = idx
+        r["_row_order"] = idx          # preserves original sheet order
         sec = str(r.get("Section", "")).strip() or "__NO_SECTION__"
         sections.setdefault(sec, []).append(r)
     return {"Reporting Columns": reporting_cols, "Sections": sections}
@@ -1162,7 +1582,7 @@ def validate_xlsx(xlsx_path: str, output_path: str = None) -> str:
 
 
 def main():
-    xlsx_path = r"D:\S2_Khushbu\AI Projects\Financial Data Extraction\MDB_multipleAI\05_Manual_Validation_Required\ROCKINGHAM COUNTY_2025\ROCKINGHAM COUNTY_2025_All_Statements.xlsx"
+    xlsx_path = r"C:\S2\S2_Khushbu\AI Projects\Financial Data Extraction\MDB_multipleAI\05_Manual_Validation_Required\PP_WI_820287476_2025_NON-LG\PP_WI_820287476_2025_NON-LG_All_Statements.xlsx"
     if len(sys.argv) >= 2:
         xlsx_path = sys.argv[1]
     validate_xlsx(xlsx_path)
