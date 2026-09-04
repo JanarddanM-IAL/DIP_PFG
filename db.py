@@ -84,7 +84,13 @@ def get_db_connection() -> "pyodbc.Connection":
     Returns a live pyodbc.Connection. Raises RuntimeError if required
     configuration is missing.
     """
-    load_dotenv()
+    # override=True makes the .env file authoritative over any value already in the
+    # OS environment. Without it, a stale GEMINI_API_KEY / ANTHROPIC_API_KEY left in
+    # the machine's user environment (Windows HKCU\Environment) shadows the correct
+    # key in .env — the app then sends the stale key and Gemini rejects it as
+    # "API key not valid" even though .env has the right one. DB creds happened to
+    # work only because they were NOT also present in the OS environment.
+    load_dotenv(override=True)
 
     driver   = os.getenv("DB_DRIVER", "ODBC Driver 17 for SQL Server")
     server   = os.getenv("DB_SERVER")

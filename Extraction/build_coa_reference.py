@@ -4,8 +4,10 @@ build_coa_reference.py — generate the static COA reference parquet tables from
 standard COA master.
 
 Reads  : Extraction/Master/standard_coa_master.xlsx
-Writes : parquet/CoaDetails.parquet      (352 rows, exploded per statement type)
-         parquet/TemplateType.parquet    (9 statement types)
+Writes : parquet/CoaDetails.parquet      (exploded per statement type)
+         parquet/TemplateType.parquet    (15 statement types — every sheet the engine
+                                          emits, incl. the 4 narrative ones which have
+                                          no COA datapoints and so no CoaDetails rows)
          parquet/DataType.parquet         (unchanged reference: int/bool/float)
          parquet/DisplayNameInfo.parquet  (unchanged reference: DPG/DP/CP)
          parquet/{RawData,Category,UnitMaster,MetaData}.parquet  (empty scaffolds
@@ -27,7 +29,8 @@ from pathlib import Path
 import openpyxl
 import polars as pl
 
-from parquet_ingest import PARQUET_DIR   # single source of truth for the parquet location
+from parquet_ingest import PARQUET_DIR, RAWDATA_SCHEMA   # single source of truth for
+                                                         # the parquet location + schema
 
 ENGINE_DIR = Path(__file__).resolve().parent          # the Extraction/ folder (this file lives here)
 MASTER     = ENGINE_DIR / "Master" / "standard_coa_master.xlsx"
@@ -38,18 +41,33 @@ COAID_DEFAULT     = 1
 DATATYPE_DEFAULT  = 3            # float
 FLAG_TO_DNI       = {"DPG": 1, "DP": 2, "CP": 3}   # -> DisplayNameInfoId
 
-# The 9 statement/sheet types in canonical output-sheet order (jsonToCsv.STMT_ORDER + 1).
-# (code, friendly name) — TemplateTypeID is the 1-based position in this list.
+# Every statement/sheet type the extraction engine emits, in canonical output-sheet
+# order (jsonToCsv.STMT_ORDER + 1). (code, friendly name) — TemplateTypeID is the
+# 1-based position in this list.
+#
+# APPEND-ONLY: ids 1-9 are already referenced by ingested RawData / CoaDetails rows,
+# so new codes go at the END and never in the middle. A code must be listed here for
+# its rows to be storable at all, because an UNMAPPED RawData row records
+# TemplateTypeId in place of COAHeaderID (see parquet_ingest module docstring) — that
+# is why the 4 narrative sheets are included even though they carry no COA datapoints
+# and therefore contribute 0 CoaDetails rows.
 TEMPLATE_TYPES = [
-    ("SNP",      "Statement of Net Position"),
-    ("SOA",      "Statement of Activities"),
-    ("GOV_BS",   "Balance Sheet - Governmental Funds"),
-    ("GOV_IS",   "Statement of Revenues, Expenditures and Changes in Fund Balances - Governmental Funds"),
-    ("PROP_SNP", "Statement of Fund Net Position - Proprietary Funds"),
-    ("PROP_IS",  "Statement of Revenues, Expenses and Changes in Fund Net Position - Proprietary Funds"),
-    ("PROP_CFS", "Statement of Cash Flows - Proprietary Funds"),
-    ("DEBT",     "Long-term & Short-term Debt Schedule"),
-    ("DSR",      "Debt Service Requirements"),
+    ("SNP",            "Statement of Net Position"),
+    ("SOA",            "Statement of Activities"),
+    ("GOV_BS",         "Balance Sheet - Governmental Funds"),
+    ("GOV_IS",         "Statement of Revenues, Expenditures and Changes in Fund Balances - Governmental Funds"),
+    ("PROP_SNP",       "Statement of Fund Net Position - Proprietary Funds"),
+    ("PROP_IS",        "Statement of Revenues, Expenses and Changes in Fund Net Position - Proprietary Funds"),
+    ("PROP_CFS",       "Statement of Cash Flows - Proprietary Funds"),
+    ("DEBT",           "Long-term & Short-term Debt Schedule"),
+    ("DSR",            "Debt Service Requirements"),
+    # --- appended 2026-09-04 (ids 10-15); do not reorder the entries above ---
+    ("CAPITAL_ASSETS", "Capital Assets Schedule"),
+    ("TAX_BASE",       "Tax Base Schedule"),
+    ("OVERVIEW",       "Issuer Overview"),
+    ("PEN",            "Pension Disclosures"),
+    ("OPEB",           "OPEB Disclosures"),
+    ("FAQS",           "Frequently Asked Questions"),
 ]
 CODE_TO_TID = {code: i for i, (code, _name) in enumerate(TEMPLATE_TYPES, start=1)}
 
@@ -174,14 +192,9 @@ def main() -> int:
     )
 
     # ---- Empty scaffolds (populated by the later ingestion phase) ----
-    raw_data = pl.DataFrame(schema={
-        "DataId": pl.Int64, "CategoryID": pl.Int64, "COAHeaderID": pl.Int64,
-        "MetaDataID": pl.Int64, "ProcessingId": pl.Int64, "Quardinate": pl.Utf8,
-        "PageNo": pl.Utf8, "PdfDataPpointName": pl.Utf8, "Value": pl.Utf8,
-        "UnitId": pl.Int64, "DataDisplaySequence": pl.Int64,
-        "InsertedOn": pl.Datetime("us"), "InsertedBy": pl.Utf8, "ModifiedBy": pl.Utf8,
-        "ModifiedOn": pl.Datetime("us"), "IsActive": pl.Int64,
-    })
+    # Schema is owned by parquet_ingest.RAWDATA_SCHEMA — import it rather than
+    # restating the columns, so the scaffold can never drift from what ingestion writes.
+    raw_data = pl.DataFrame(schema=RAWDATA_SCHEMA)
     category = pl.DataFrame(schema={"CategoryID": pl.Int64, "CategoryName": pl.Utf8})
     unit_master = pl.DataFrame(schema={"UnitID": pl.Int64, "Name": pl.Utf8, "IsActive": pl.Int64})
     meta_data = pl.DataFrame(schema={"MetaDataID": pl.Int64, "MetadataName": pl.Utf8, "Value": pl.Utf8})

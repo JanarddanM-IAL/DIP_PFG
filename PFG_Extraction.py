@@ -402,8 +402,11 @@ def process_one_row(db, db_row, coa_text, store=None):
             try:
                 st = store.ingest_deal(processing_id, outcome["json_files"])
                 store.flush()
+                # 'unmapped'/'ambiguous' items are STORED (COAHeaderID blank +
+                # TemplateTypeId + GroupName); only 'dropped' produced no rows.
                 print(f"[PARQUET] Id={row_id} pid={processing_id}: {st['rows']} RawData row(s) "
-                      f"({st['mapped_items']} items mapped, {st['skipped_items']} skipped)")
+                      f"({st['mapped_items']} mapped, {st['unmapped_items']} unmapped, "
+                      f"{st['ambiguous_items']} ambiguous, {st['skipped_items']} dropped)")
             except Exception as e:
                 print(f"[PARQUET] Id={row_id}: ingestion failed (non-fatal): "
                       f"{type(e).__name__}: {e}")

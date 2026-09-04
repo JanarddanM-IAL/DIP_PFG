@@ -14,23 +14,41 @@ RawData columns (see parquet-schema/RawData.xlsx):
     COAHeaderID         -> CoaDetails (matched by COA Datapoint + DPG context)
     MetaDataID          -> MetaData  (FYE value; upserted)
     ProcessingId        = TProcessStatus.ProcessingId (parquet<->DB link)
-    Quardinate          null (reserved)
+    Quardinate          compact JSON of this cell's bounding box, taken from the item's
+                        "<Reporting Column>_coord" sibling key — so the box belongs to
+                        THIS row's CategoryID (e.g. an SNP row whose CategoryID is
+                        "Governmental Activities" gets "Governmental Activities_coord").
+                        Null when the engine emitted no box for that cell.
+    ReportedInThousand  null (reserved — the JSONs do not report a scale indicator yet)
     PageNo              Metadata "Page No"
     PdfDataPpointName   the sheet's raw item-column value (Row Items / SOA Items / ...)
+    TemplateTypeId      -> TemplateType, but ONLY for rows with no COA mapping
+    GroupName           the JSON section key, ONLY for rows with no COA mapping
     Value               the actual value of that Reporting Column (raw string)
     UnitId              -> UnitMaster (Currency reported; upserted)
     DataDisplaySequence per-ProcessingId display order; SAME for every Reporting
                         Column (CategoryID) of one source datapoint row
     InsertedOn/By, ModifiedBy/On, IsActive   defaults
 
+MAPPED vs UNMAPPED rows (the COAHeaderID / TemplateTypeId+GroupName split):
+  * MAPPED   — the datapoint resolved to a CoaDetails row:
+               COAHeaderID = that row, TemplateTypeId = null, GroupName = null.
+               The statement and group are recoverable by walking
+               CoaDetails.TemplateTypeId / .ParentID.
+  * UNMAPPED — the datapoint has no (or no unambiguous) CoaDetails row:
+               COAHeaderID = null, TemplateTypeId = the sheet's TemplateType id,
+               GroupName = the JSON section key. The value is still stored and
+               still attributed to the right statement and group; only the COA
+               standardization is missing.
+
 Rules:
   * DPG rows are NOT stored (they hold no numeric value; their name is recoverable
     via CoaDetails.ParentID).
-  * A datapoint that cannot be matched in CoaDetails (e.g. DEBT/DSR — no COA-master
-    coverage yet, or an unknown datapoint) is skipped and reported in the stats.
   * Re-ingesting a ProcessingId REPLACES its existing RawData rows (idempotent).
   * SKIP_EMPTY_VALUES (default True): a Reporting Column whose value is blank / "-"
     produces no RawData row. Set False to store the full grid (blank cells as null).
+  * A row is dropped outright ONLY when the filename matches no known statement code
+    (so not even TemplateTypeId could be recorded) or its COA Datapoint is blank.
 """
 
 import json
@@ -66,17 +84,42 @@ def _atomic_write_parquet(df: "pl.DataFrame", path: Path) -> None:
 SKIP_EMPTY_VALUES = True
 _EMPTY_TOKENS = {"", "-", "–", "—"}
 
+# _resolve() outcomes. MAPPED -> COAHeaderID is set; the other two mean the row is
+# stored UNMAPPED (COAHeaderID null + TemplateTypeId + GroupName).
+#   AMBIGUOUS = the name exists in CoaDetails but under several groups and no group
+#               context picked one -> deliberately not guessed.
+#   UNMAPPED  = the name isn't in CoaDetails for this template at all.
+R_MAPPED    = "mapped"
+R_AMBIGUOUS = "ambiguous"
+R_UNMAPPED  = "unmapped"
+
 # Canonical statement/sheet order (matches jsonToCsv.STMT_ORDER) for stable
-# DataDisplaySequence across a deal's statements.
-_STMT_ORDER = ["SNP", "SOA", "GOV_BS", "GOV_IS", "PROP_SNP", "PROP_IS", "PROP_CFS", "DEBT", "DSR"]
-# Longest-first so PROP_SNP matches before SNP, etc.
-_STMT_CODES = ["PROP_SNP", "PROP_IS", "PROP_CFS", "GOV_BS", "GOV_IS", "SNP", "SOA", "DSR", "DEBT"]
+# DataDisplaySequence across a deal's statements. All 15 sheets the engine emits are
+# listed: the 7 COA-mapped core statements, DEBT/DSR/CAPITAL_ASSETS/TAX_BASE, and the
+# 4 narrative sheets. A code MUST appear here (and in TemplateType) for its rows to be
+# storable — an unmapped row records TemplateTypeId, so an unknown code stores nothing.
+_STMT_ORDER = ["SNP", "SOA", "GOV_BS", "GOV_IS", "PROP_SNP", "PROP_IS", "PROP_CFS",
+               "DEBT", "DSR", "CAPITAL_ASSETS", "TAX_BASE",
+               "OVERVIEW", "PEN", "OPEB", "FAQS"]
+# Longest-first so PROP_SNP matches before SNP, etc. This ordering is LOAD-BEARING:
+# the codes become a regex alternation, and `_SNP_p54-55` is a suffix of
+# `_PROP_SNP_p54-55`, so a shorter code placed first would win and mis-detect the sheet.
+_STMT_CODES = ["CAPITAL_ASSETS", "PROP_SNP", "PROP_CFS", "PROP_IS", "GOV_BS", "GOV_IS",
+               "TAX_BASE", "OVERVIEW", "SNP", "SOA", "DSR", "DEBT", "OPEB", "PEN", "FAQS"]
 _STMT_RE = re.compile(r"_(" + "|".join(_STMT_CODES) + r")(?:_Comp)?_p[\d\-]+$", re.IGNORECASE)
 
+# Column order matches parquet-schema/RawData.xlsx exactly: ReportedInThousand sits
+# between Quardinate and PageNo; TemplateTypeId + GroupName between PdfDataPpointName
+# and Value. This dict is the SOLE source of the written columns — flush() builds the
+# frame by iterating it — so a column absent here is not written blank, it is not
+# written at all (and is stripped from any hand-placed file on the next flush).
 RAWDATA_SCHEMA = {
     "DataId": pl.Int64, "CategoryID": pl.Int64, "COAHeaderID": pl.Int64,
     "MetaDataID": pl.Int64, "ProcessingId": pl.Int64, "Quardinate": pl.Utf8,
-    "PageNo": pl.Utf8, "PdfDataPpointName": pl.Utf8, "Value": pl.Utf8,
+    "ReportedInThousand": pl.Utf8,
+    "PageNo": pl.Utf8, "PdfDataPpointName": pl.Utf8,
+    "TemplateTypeId": pl.Int64, "GroupName": pl.Utf8,
+    "Value": pl.Utf8,
     "UnitId": pl.Int64, "DataDisplaySequence": pl.Int64,
     "InsertedOn": pl.Datetime("us"), "InsertedBy": pl.Utf8, "ModifiedBy": pl.Utf8,
     "ModifiedOn": pl.Datetime("us"), "IsActive": pl.Int64,
@@ -101,6 +144,30 @@ def _norm(s) -> str:
     if s is None:
         return ""
     return re.sub(r"\s+", " ", str(s).replace("_", " ")).strip().lower()
+
+
+# Suffix the engine appends to a Reporting Column name to carry that cell's bounding
+# box, e.g. "Governmental Activities" -> "Governmental Activities_coord".
+COORD_SUFFIX = "_coord"
+
+
+def _coord_str(v):
+    """Serialize one `<column>_coord` payload for the RawData.Quardinate column.
+
+    The engine emits a dict — {"page": 39, "x0": .., "y0": .., "x1": .., "y1": ..} —
+    which is stored as compact JSON so it round-trips exactly (Quardinate is Utf8).
+    Anything unexpected is kept as its string form rather than dropped; a missing or
+    empty coord yields None so the column stays null for cells the engine could not
+    locate (it does not emit a box for every value).
+    """
+    if v is None or v == "" or v == {} or v == []:
+        return None
+    if isinstance(v, (dict, list)):
+        try:
+            return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+        except Exception:
+            return str(v)
+    return str(v)
 
 
 class ParquetStore:
@@ -169,24 +236,57 @@ class ParquetStore:
             pass
         return None
 
-    def _resolve(self, tid, datapoint, parent_dpg):
-        """Match a JSON datapoint to a CoaDetails COAHeaderID. Tries, in order:
-        exact (template, datapoint, parent-DPG) triple, normalized triple, exact
-        (template, datapoint) pair, normalized pair. Returns the first candidate
-        (COADisplaySequence order); reuse is allowed (many raw rows -> one datapoint)."""
-        if tid is None or datapoint is None:
-            return None
-        ndp, npar = _norm(datapoint), _norm(parent_dpg)
+    def _resolve(self, tid, datapoint, parent_dpg, section=None):
+        """Match a JSON datapoint to a CoaDetails COAHeaderID.
+
+        Returns ``(coa_id, status)`` with status one of R_MAPPED / R_AMBIGUOUS /
+        R_UNMAPPED. Tries, in order:
+
+          1. the DPG-context triple (exact, then normalized);
+          2. the SECTION-key triple (exact, then normalized) — the JSON section name
+             is the group whenever a sheet emits no DPG row (CAPITAL_ASSETS) or emits
+             one that isn't a CoaDetails group (DEBT's 'Housing Finance Authority'
+             inside section 'Component Units'). Section keys normalize onto the
+             master's group names, so this recovers the right group rather than
+             guessing;
+          3. the bare (template, datapoint) pair — ONLY when it is unique.
+
+        A pair with several candidates is NEVER guessed: it returns
+        (None, R_AMBIGUOUS) so ingest_deal stores the row unmapped (COAHeaderID blank
+        + TemplateTypeId + GroupName). Silently taking the first candidate is what
+        filed every CAPITAL_ASSETS row under 'Governmental Activities'.
+
+        Reuse is still allowed on a hit: many raw PDF rows legitimately share one
+        standardized datapoint, so candidates are not consumed.
+        """
+        if tid is None or datapoint is None or not str(datapoint).strip():
+            return None, R_UNMAPPED
+        ndp = _norm(datapoint)
+
+        # 1 + 2: group context, DPG first then the section key.
+        for group in (parent_dpg, section):
+            if group is None or not str(group).strip():
+                continue
+            for bucket, key in (
+                (self.by_triple,   (tid, datapoint, group)),
+                (self.by_triple_n, (tid, ndp, _norm(group))),
+            ):
+                cands = bucket.get(key)
+                if cands:
+                    return cands[0], R_MAPPED
+
+        # 3: name-only, accepted only when unambiguous.
+        ambiguous = False
         for bucket, key in (
-            (self.by_triple,   (tid, datapoint, parent_dpg)),
-            (self.by_triple_n, (tid, ndp, npar)),
-            (self.by_pair,     (tid, datapoint)),
-            (self.by_pair_n,   (tid, ndp)),
+            (self.by_pair,   (tid, datapoint)),
+            (self.by_pair_n, (tid, ndp)),
         ):
             cands = bucket.get(key)
             if cands:
-                return cands[0]
-        return None
+                if len(cands) == 1:
+                    return cands[0], R_MAPPED
+                ambiguous = True
+        return None, (R_AMBIGUOUS if ambiguous else R_UNMAPPED)
 
     # ---- main entry ----
     def ingest_deal(self, processing_id, json_files) -> dict:
@@ -200,8 +300,9 @@ class ParquetStore:
         files = sorted((Path(f) for f in json_files),
                        key=lambda p: (order.get(detect_stmt_code(p.stem) or "", 99), p.name))
 
-        stats = {"rows": 0, "mapped_items": 0, "skipped_items": 0,
-                 "files": 0, "unmapped": []}
+        stats = {"rows": 0, "mapped_items": 0, "unmapped_items": 0,
+                 "ambiguous_items": 0, "skipped_items": 0,
+                 "files": 0, "unmapped": [], "ambiguous": []}
         disp_seq = 0
 
         for p in files:
@@ -224,7 +325,7 @@ class ParquetStore:
             excl = set(rc) | {"COA Flag", "COA Datapoint", "Total Check Status"}
 
             cur_dpg = None
-            for _sname, items in secs.items():
+            for sname, items in secs.items():
                 if not isinstance(items, list):
                     continue
                 for it in items:
@@ -235,34 +336,53 @@ class ParquetStore:
                     if flag == "DPG":
                         cur_dpg = datapoint
                         continue                      # DPG rows are not stored
-                    coa_id = self._resolve(tid, datapoint, cur_dpg)
-                    if coa_id is None:
+                    coa_id, status = self._resolve(tid, datapoint, cur_dpg, sname)
+
+                    # A row with no COA mapping is still STORED (COAHeaderID blank,
+                    # TemplateTypeId + GroupName instead). It is dropped ONLY when
+                    # there is no template to record it against — an unrecognised
+                    # filename — since then nothing about it would be recoverable.
+                    if coa_id is None and tid is None:
                         stats["skipped_items"] += 1
                         if datapoint:
                             stats["unmapped"].append(f"{code}:{datapoint}")
                         continue
-                    item_cols = [k for k in it.keys() if k not in excl]
+                    item_cols = [k for k in it.keys()
+                                 if k not in excl and not str(k).endswith("_coord")]
                     pdf_name = it.get(item_cols[0]) if item_cols else None
 
                     # Build this datapoint's Reporting-Column rows first so an
-                    # all-blank row does not consume a DataDisplaySequence.
+                    # all-blank row does not consume a DataDisplaySequence. Each
+                    # column also carries its own bounding box under
+                    # "<column>_coord" -> that row's Quardinate.
                     cols = []
                     for col in rc:
                         val = it.get(col)
                         if SKIP_EMPTY_VALUES and _is_empty(val):
                             continue
-                        cols.append((col, val))
+                        cols.append((col, val, _coord_str(it.get(col + COORD_SUFFIX))))
                     if not cols:
                         continue
 
                     disp_seq += 1
-                    stats["mapped_items"] += 1
-                    for col, val in cols:
+                    if coa_id is None:
+                        stats["unmapped_items" if status == R_UNMAPPED
+                              else "ambiguous_items"] += 1
+                        bucket = ("unmapped" if status == R_UNMAPPED else "ambiguous")
+                        stats[bucket].append(f"{code}:{datapoint}")
+                    else:
+                        stats["mapped_items"] += 1
+                    for col, val, coord in cols:
                         # NAME-keyed pending record; ids resolved in flush().
+                        # COAHeaderID and TemplateTypeId+GroupName are mutually
+                        # exclusive — see the module docstring.
                         self._pending.append({
                             "processing_id": processing_id,
                             "category_name": col,
                             "coa_id": coa_id,
+                            "quardinate": coord,
+                            "template_type_id": (tid if coa_id is None else None),
+                            "group_name": (str(sname) if coa_id is None else None),
                             "fye_value": fye_val,
                             "unit_name": unit_name,
                             "page_no": (str(page_no) if page_no is not None else None),
@@ -345,9 +465,16 @@ class ParquetStore:
                         "COAHeaderID": rec["coa_id"],
                         "MetaDataID": meta_id(rec["fye_value"]),
                         "ProcessingId": rec["processing_id"],
-                        "Quardinate": None,
+                        "Quardinate": rec["quardinate"],
+                        # RESERVED — always null for now. The JSONs are expected to
+                        # start reporting a scale indicator (cf. Metadata "Unit"), at
+                        # which point this is populated here. Declared in
+                        # RAWDATA_SCHEMA so the column exists (blank) meanwhile.
+                        "ReportedInThousand": None,
                         "PageNo": rec["page_no"],
                         "PdfDataPpointName": rec["pdf_name"],
+                        "TemplateTypeId": rec["template_type_id"],
+                        "GroupName": rec["group_name"],
                         "Value": rec["value"],
                         "UnitId": unit_id(rec["unit_name"]),
                         "DataDisplaySequence": rec["disp_seq"],
@@ -399,9 +526,11 @@ if __name__ == "__main__":
     store = ParquetStore()
     st = store.ingest_deal(pid, jsons)
     store.flush()
-    print(f"[INGEST] done: {st['rows']} RawData rows, {st['mapped_items']} items mapped, "
-          f"{st['skipped_items']} items skipped, files={st['files']}")
-    if st["unmapped"]:
-        from collections import Counter
-        print("[INGEST] unmapped datapoints (top 15):",
-              dict(Counter(st["unmapped"]).most_common(15)))
+    print(f"[INGEST] done: {st['rows']} RawData rows, files={st['files']} | "
+          f"mapped={st['mapped_items']} unmapped={st['unmapped_items']} "
+          f"ambiguous={st['ambiguous_items']} dropped={st['skipped_items']}")
+    from collections import Counter
+    for label in ("unmapped", "ambiguous"):
+        if st[label]:
+            print(f"[INGEST] {label} datapoints (top 15):",
+                  dict(Counter(st[label]).most_common(15)))
