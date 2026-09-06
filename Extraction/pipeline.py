@@ -103,13 +103,26 @@ def start_pipeline_logging(log_dir=None):
     """Attach a LogWriter so intercepted print() output is captured to the
     processing-log parquet. `log_dir` lets a caller (PFG_Extraction) inject its
     centralized log location; None → LogWriter's standalone default. Idempotent;
-    returns the active writer (or None if log_writer is unavailable)."""
+    returns the active writer (or None if log_writer is unavailable).
+
+    `log_writer` is imported LAZILY here, and this is the FIRST pipeline function
+    the DB workflow calls — before run_extraction/process_one_deal have had a
+    chance to re-assert sys.path. Under Dagster that made the import the earliest
+    casualty of a clobbered sys.path, and because the failure was swallowed
+    silently the whole run produced NO processing log with nothing to say why.
+    Hence the path assertion, and the warning below."""
     global _pipeline_log_writer
+    _ensure_engine_on_path()
     if _pipeline_log_writer is None:
         try:
             from log_writer import LogWriter
             _pipeline_log_writer = LogWriter(log_dir)
-        except Exception:
+        except Exception as exc:
+            # Never fatal — extraction must still run without its log. But say so:
+            # a missing processing log used to be indistinguishable from a quiet run.
+            _original_print(
+                f"[WARN] processing log DISABLED — could not start log_writer: "
+                f"{type(exc).__name__}: {exc}", flush=True)
             _pipeline_log_writer = None
     return _pipeline_log_writer
 
@@ -1726,6 +1739,9 @@ def run_normalization_batch(
     NOTE: "Total Check Status" is intentionally NOT computed during JSON
     parsing/saving. It is CSV-only output computed by run_json_to_csv_pipeline().
     """
+    # Runtime entry point — this function lazily imports the provider batch
+    # clients further down, so assert sys.path before any of them fire.
+    _ensure_engine_on_path()
     os.makedirs(output_folder, exist_ok=True)
     os.makedirs(manual_output, exist_ok=True)
 
@@ -2593,9 +2609,11 @@ def run_normalization(
     tier: str = "free",
     coa_mapping_folder: str = "",
 ) -> None:
+    # Runtime entry point — lazily imports the provider cache clients downstream.
+    _ensure_engine_on_path()
     os.makedirs(output_folder, exist_ok=True)
     os.makedirs(manual_output, exist_ok=True)
- 
+
     coa_text = load_xlsx_as_pipe_text(xlsx_path)
     print(f"\n[COA] Loaded {len(coa_text.splitlines())} rows from {xlsx_path}")
  

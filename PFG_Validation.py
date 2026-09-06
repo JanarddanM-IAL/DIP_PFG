@@ -4250,8 +4250,9 @@ def _process_validation_row(db, db_row):
           f"({state_abbr}) sector={sector} year={audit_year}")
 
     # Display log: bind these rows to this document; a new row_id auto-flushes the
-    # previous row's buffered rows.
-    udl.set_context(row_id, processing_id)
+    # previous row's buffered rows. `audit_year` is TProcessStatus.ProcessYear and
+    # selects the file this row is written to (user_display_log_<year>.parquet).
+    udl.set_context(row_id, processing_id, year=audit_year)
     udl.started("Validation")
 
     # Mark in-progress AND wipe any stale remark from a prior run (Remarks -> NULL).

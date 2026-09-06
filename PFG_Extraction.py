@@ -50,6 +50,47 @@ _ENGINE_DIR = _ROOT / "Extraction"
 sys.path.insert(0, str(_ROOT))          # shared root layer (db.py)
 sys.path.insert(0, str(_ENGINE_DIR))    # engine + parquet_ingest (takes precedence)
 
+
+def _purge_foreign_engine_modules() -> list:
+    """Evict cached sibling modules that came from a DIFFERENT engine folder.
+
+    In production every pipeline is flattened into ONE Dagster directory, so
+    `Extraction/` (PFG) and `ESG_Extraction/` (C4F) sit side by side — and they
+    share 19 module NAMES, `pipeline` and `page_extractor` among them.
+    `sys.modules` is keyed by the bare name, so whichever folder is imported
+    first in a process wins for the whole process, and a cached module is never
+    re-resolved no matter what sys.path says afterwards. Importing C4F first and
+    PFG second therefore handed PFG the ESG engine and failed with
+    `ImportError: cannot import name 'run_extraction_batch' from 'pipeline'`.
+
+    Evicting only the names this folder actually owns, and only when the cached
+    copy lives somewhere else, makes `import pipeline` below resolve against
+    Extraction/ regardless of who imported first. Nothing already holding a
+    reference to the evicted module is disturbed — a later re-import simply
+    rebuilds it from whichever folder is then first on sys.path.
+    """
+    owned = {p.stem for p in _ENGINE_DIR.glob("*.py")}
+    evicted = []
+    for name in list(sys.modules):
+        if name not in owned:
+            continue
+        f = getattr(sys.modules[name], "__file__", None)
+        if not f:
+            continue
+        try:
+            if Path(f).resolve().parent != _ENGINE_DIR.resolve():
+                del sys.modules[name]
+                evicted.append(name)
+        except OSError:
+            pass
+    return evicted
+
+
+_EVICTED = _purge_foreign_engine_modules()
+if _EVICTED:
+    print(f"[PATH] evicted {len(_EVICTED)} module(s) cached from another engine "
+          f"folder so the PFG engine is used: {sorted(_EVICTED)}")
+
 # ---------- project DB layer (shared db.py at the project root) ----------
 from db import Database, build_in_clause
 
@@ -309,8 +350,11 @@ def process_one_row(db, db_row, coa_text, store=None):
     # PDF filename that run_extraction would otherwise use); released in `finally`.
     set_log_context(processing_id)
 
-    # User-facing display log: bind these rows to this document.
-    udl.set_context(row_id, processing_id)
+    # User-facing display log: bind these rows to this document. ProcessYear
+    # selects the file (user_display_log_<year>.parquet), so all three stages of
+    # one document land in the same year's file.
+    udl.set_context(row_id, processing_id,
+                    year=getattr(db_row, "ProcessYear", None))
     udl.started("Extraction")
 
     print(f"\n[ROW] Id={row_id} ProcessingId={processing_id} | {issuer_name} "
@@ -408,13 +452,25 @@ def process_one_row(db, db_row, coa_text, store=None):
               f"data_validation={data_validation_status} completion={completion_status} "
               f"-> {outcome.get('output_folder')}")
 
-        # Display log: verdict + finish.
-        if completion_status == 1:
-            udl.check("Extraction", "Total Check", "PASSED")
+        # Display log: the EXTRACTION outcome only.
+        #
+        # The Total Check / data-validation verdict is deliberately NOT recorded
+        # here. That is the validation portion of this stage, and the user-facing
+        # log covers extraction alone — the verdict still lands in
+        # TProcessStatus.DataValidationStatus, the Remarks column, and the
+        # detailed processing log. So the terminal row keys off ExtractionStatus
+        # (did we produce JSON?), never off completion_status (which folds the
+        # validation result in and would let a Total-Check failure mark the
+        # extraction itself as failed).
+        if extraction_status == 1:
             udl.finished("Extraction")
         else:
-            udl.check("Extraction", "Total Check", "FAILED",
-                      remark or "routed to manual validation")
+            # A fixed message rather than `remark`: the two other remarks above
+            # ("Total Check failed …", "… routed to manual validation") are only
+            # reachable with extraction_status == 1, so they cannot arrive here —
+            # but stating the message literally keeps validation wording out of
+            # this log by construction rather than by that coincidence.
+            udl.failure("Extraction", "extraction produced no JSON output")
 
         # ---- RawData parquet ingestion (in addition to JSON + Excel) ----
         if store is not None and outcome.get("json_files"):

@@ -1258,8 +1258,10 @@ def run_fac_for_rows_source_only(rows: List[dict], db):
             print(f"\n--- Processing id: {processing_id} | Year={year} UEI={uei} State={state} Sector={sector} ---")
 
             # Display log: bind these rows to this document; starting a new row_id
-            # auto-flushes the previous row's buffered rows.
-            udl.set_context(row_id, processing_id)
+            # auto-flushes the previous row's buffered rows. `year` is
+            # TProcessStatus.ProcessYear and selects the file this row is written
+            # to (user_display_log_<year>.parquet).
+            udl.set_context(row_id, processing_id, year=year)
             udl.started("FAC Search")
 
             # SOURCING START → in progress, result pending (signal for the frontend)

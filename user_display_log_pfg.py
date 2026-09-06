@@ -65,6 +65,7 @@ never cost the work it was describing. Failures print one line and move on.
 from __future__ import annotations
 
 import os
+import re
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -237,8 +238,45 @@ def _schema():
     }
 
 
-def log_path() -> Path:
-    return LOG_DIR / LOG_FILENAME
+# ── Year partitioning ─────────────────────────────────────────────────────────
+# One file per TProcessStatus.ProcessYear: user_display_log_2025.parquet. The
+# year is a PER-DOCUMENT value, so it is carried on the context alongside the
+# ids and chosen when a group is flushed — every row of a document lands in that
+# document's year file, whatever calendar year the run happens in.
+#
+# A row whose ProcessYear is unknown/unusable falls back to the unpartitioned
+# LOG_FILENAME, which therefore means "process-year unknown" rather than
+# "everything"; pre-partitioning history keeps living there untouched.
+_STEM   = Path(LOG_FILENAME).stem
+_SUFFIX = Path(LOG_FILENAME).suffix or ".parquet"
+
+#: Matches a per-year file. Exactly four digits, so it can never collide with
+#: the unpartitioned name.
+_YEAR_RE = re.compile(rf"^{re.escape(_STEM)}_(\d{{4}}){re.escape(_SUFFIX)}$")
+
+
+def coerce_year(value: Any) -> int | None:
+    """A usable 4-digit process year, or None. Accepts the string form the DB
+    layer hands over ("2025"), and rejects anything out of range."""
+    y = _coerce_int(value)
+    return y if y is not None and 1900 <= y <= 2999 else None
+
+
+def log_path(year: Any = None) -> Path:
+    """The file a document with this ProcessYear writes to."""
+    y = coerce_year(year)
+    return LOG_DIR / (f"{_STEM}_{y}{_SUFFIX}" if y is not None else LOG_FILENAME)
+
+
+def log_paths() -> list[Path]:
+    """Every display-log file at this location: each year file plus the
+    unpartitioned one. This is what read_log() spans, so a reader never has to
+    know which years exist."""
+    if not LOG_DIR.is_dir():
+        return []
+    out = [p for p in sorted(LOG_DIR.glob(f"{_STEM}*{_SUFFIX}"))
+           if p.name == LOG_FILENAME or _YEAR_RE.match(p.name)]
+    return out
 
 
 def _warn(msg: str) -> None:
@@ -254,10 +292,11 @@ def _warn(msg: str) -> None:
 
 _LOCK = threading.Lock()
 _BUFFER: dict[tuple, list[dict[str, Any]]] = {}
-_CTX: dict[str, Any] = {"row_id": None, "processing_id": None}
+_CTX: dict[str, Any] = {"row_id": None, "processing_id": None, "year": None}
 
 
-def set_context(row_id: Any = None, processing_id: Any = None) -> None:
+def set_context(row_id: Any = None, processing_id: Any = None,
+                year: Any = None) -> None:
     """Whose rows these are. Call again when the ProcessingId becomes known.
 
     Both are remembered independently, so passing only processing_id keeps the
@@ -268,11 +307,18 @@ def set_context(row_id: Any = None, processing_id: Any = None) -> None:
     Moving to a DIFFERENT row_id flushes first. Without that, buffered rows from
     the previous document would be stamped with the new document's identity when
     they were finally written — silent mis-attribution.
+
+    `year` is TProcessStatus.ProcessYear and selects the file this document's
+    rows are written to (user_display_log_<year>.parquet). Like the ids it is
+    remembered independently, so a later two-argument call cannot blank it. Pass
+    it as soon as the DB row is known; a document flushed without one lands in
+    the unpartitioned file.
     """
     new_row_id = _coerce_int(row_id) if row_id is not None else None
-    if (new_row_id is not None
-            and _CTX["row_id"] is not None
-            and new_row_id != _CTX["row_id"]):
+    moved = (new_row_id is not None
+             and _CTX["row_id"] is not None
+             and new_row_id != _CTX["row_id"])
+    if moved:
         flush_all()
 
     with _LOCK:
@@ -280,6 +326,15 @@ def set_context(row_id: Any = None, processing_id: Any = None) -> None:
             _CTX["row_id"] = new_row_id
         if processing_id is not None:
             _CTX["processing_id"] = _coerce_int(processing_id)
+        # The year belongs to the DOCUMENT, so arriving at a new one drops the
+        # previous year FIRST. Without this, "remembered independently" means a
+        # document whose ProcessYear is NULL silently inherits the last
+        # document's year and is filed under it — the exact mis-attribution the
+        # row_id flush above exists to prevent.
+        if moved:
+            _CTX["year"] = None
+        if year is not None:
+            _CTX["year"] = coerce_year(year)
 
 
 def clear_context() -> None:
@@ -288,6 +343,7 @@ def clear_context() -> None:
     with _LOCK:
         _CTX["row_id"] = None
         _CTX["processing_id"] = None
+        _CTX["year"] = None
 
 
 def _coerce_int(value: Any) -> Optional[int]:
@@ -450,6 +506,10 @@ def _flush(keys: list[tuple]) -> int:
         # if the ProcessingId was resolved partway through recording the group.
         row_id = _CTX["row_id"]
         processing_id = _CTX["processing_id"]
+        # Read the year here too, for the same reason: every row of this flush
+        # must agree on which year file it belongs to, even if the context was
+        # completed partway through recording the group.
+        year = _CTX["year"]
     if not payload:
         return 0
 
@@ -469,7 +529,10 @@ def _flush(keys: list[tuple]) -> int:
                 "Time":         row["Time"],
             })
 
-    path = log_path()
+    # The document's ProcessYear picks the file; the replace-on-re-run below then
+    # operates within that year, which is correct because a document's
+    # ProcessYear does not change between runs.
+    path = log_path(year)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -554,13 +617,28 @@ def _atomic_write(frame, path: Path) -> None:
 #  READ
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def read_log():
-    """The whole display log, in display order. Empty frame if there is none."""
+def read_log(year: Any = None):
+    """The display log, in display order. Empty frame if there is none.
+
+    With no argument this spans EVERY year file plus the unpartitioned one, so
+    year partitioning is invisible to readers and read_for()/describe_for() keep
+    working unchanged. Pass `year` to read a single year's file.
+    """
     import polars as pl
-    path = log_path()
-    if not path.is_file():
-        return pl.DataFrame(schema=_schema())
-    return _sort_display(pl.read_parquet(path))
+    schema = _schema()
+    paths = [log_path(year)] if year is not None else log_paths()
+    frames = []
+    for p in paths:
+        if not p.is_file():
+            continue
+        try:
+            frames.append(_align(pl.read_parquet(p), schema))
+        except Exception as exc:
+            # One unreadable year must not hide the others.
+            _warn(f"could not read {p.name} ({exc}); skipping it")
+    if not frames:
+        return pl.DataFrame(schema=schema)
+    return _sort_display(pl.concat(frames, how="vertical"))
 
 
 def read_for(row_id: Any = None, processing_id: Any = None):
@@ -600,7 +678,12 @@ if __name__ == "__main__":
     ap.add_argument("--raw", action="store_true", help="Print the frame, not text.")
     args = ap.parse_args()
 
-    print(f"[USER-LOG] {log_path()}")
+    _files = log_paths()
+    print(f"[USER-LOG] {LOG_DIR}")
+    for _p in _files:
+        print(f"[USER-LOG]   {_p.name}")
+    if not _files:
+        print(f"[USER-LOG]   (none yet; next write -> {log_path().name})")
     if args.raw:
         print(read_for(args.id, args.processing_id))
     elif args.id or args.processing_id:
