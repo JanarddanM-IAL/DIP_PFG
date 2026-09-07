@@ -195,10 +195,10 @@ PDF_NOT_FOUND_TEXT = "PDF Not Found"
 BASE = "https://app.fac.gov"
 ADV_URL = "https://app.fac.gov/dissemination/search/advanced/"
 
-DOWNLOAD_DIR = Path(r"D:\Test Code\Public Finance\01_Metadata_update")
+DOWNLOAD_DIR = Path(r"D:\S2\Public Finance\01_Metadata_update")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-PDF_DIR = Path(r"D:\Test Code\Public Finance\02_Downloaded_Report")
+PDF_DIR = Path(r"D:\S2\Public Finance\02_Downloaded_Report")
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 
