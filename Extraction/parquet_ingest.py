@@ -19,7 +19,9 @@ RawData columns (see parquet-schema/RawData.xlsx):
                         THIS row's CategoryID (e.g. an SNP row whose CategoryID is
                         "Governmental Activities" gets "Governmental Activities_coord").
                         Null when the engine emitted no box for that cell.
-    ReportedInThousand  null (reserved — the JSONs do not report a scale indicator yet)
+    ReportedInThousand  Metadata "Reported in Thousand" ("Yes"/"No") — the scale
+                        indicator, per STATEMENT, so every row from one JSON file
+                        shares it. Null for a pre-Update-2 JSON that omits the key.
     PageNo              Metadata "Page No"
     PdfDataPpointName   the sheet's raw item-column value (Row Items / SOA Items / ...)
     TemplateTypeId      -> TemplateType, but ONLY for rows with no COA mapping
@@ -322,6 +324,12 @@ class ParquetStore:
             currency = meta.get("Currency reported")
             fye_val = fye if fye not in (None, "") else None
             unit_name = currency if currency not in (None, "") else None
+            # Scale indicator, per STATEMENT — stamped on every row from this file,
+            # like PageNo/FYE/Currency. Left NULL when the key is absent rather than
+            # defaulting to "No", so a pre-Update-2 JSON is recorded as "unknown"
+            # instead of being asserted to be in units.
+            rit = meta.get("Reported in Thousand")
+            rit = str(rit).strip() if rit not in (None, "") else None
             excl = set(rc) | {"COA Flag", "COA Datapoint", "Total Check Status"}
 
             cur_dpg = None
@@ -381,6 +389,7 @@ class ParquetStore:
                             "category_name": col,
                             "coa_id": coa_id,
                             "quardinate": coord,
+                            "reported_in_thousand": rit,
                             "template_type_id": (tid if coa_id is None else None),
                             "group_name": (str(sname) if coa_id is None else None),
                             "fye_value": fye_val,
@@ -466,11 +475,7 @@ class ParquetStore:
                         "MetaDataID": meta_id(rec["fye_value"]),
                         "ProcessingId": rec["processing_id"],
                         "Quardinate": rec["quardinate"],
-                        # RESERVED — always null for now. The JSONs are expected to
-                        # start reporting a scale indicator (cf. Metadata "Unit"), at
-                        # which point this is populated here. Declared in
-                        # RAWDATA_SCHEMA so the column exists (blank) meanwhile.
-                        "ReportedInThousand": None,
+                        "ReportedInThousand": rec["reported_in_thousand"],
                         "PageNo": rec["page_no"],
                         "PdfDataPpointName": rec["pdf_name"],
                         "TemplateTypeId": rec["template_type_id"],

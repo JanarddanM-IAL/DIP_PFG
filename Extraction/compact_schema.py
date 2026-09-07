@@ -12,13 +12,13 @@ sheet's header row. Confirmed columns per statement type:
 
     SNP       : Row Items
     DEBT      : Row Items
-    SOA       : SOA Items
-    GOV_BS    : GOV_BS Items
-    GOV_IS    : GOV_IS Items
-    PROP_SNP  : PROP_SNP Items
-    PROP_IS   : PROP_IS Items
-    PROP_CFS  : PROP_CFS Items
-    DSR       : DSR Items
+    SOA       : Row Items
+    GOV_BS    : Row Items
+    GOV_IS    : Row Items
+    PROP_SNP  : Row Items
+    PROP_IS   : Row Items
+    PROP_CFS  : Row Items
+    DSR       : Row Items
 
 IMPORTANT CORRECTION FROM AN EARLIER VERSION OF THIS FILE: an earlier draft
 assumed "Row Items" was used generically across ALL statement types, based
@@ -29,7 +29,7 @@ SECTION_ITEM_LABEL below), confirmed against real header rows from all 9
 sheets, not inferred from a partial sample. If this ever silently reverts
 to a single generic label again, COA/CSV mapping for 7 of 9 statement
 types will break, since jsonToCsv.py / downstream code expects the
-TYPE-SPECIFIC long key name (e.g. "SOA Items"), not "Row Items".
+TYPE-SPECIFIC long key name (e.g. "Row Items"), not "Row Items".
 
 The CSV/Excel "Section" column (denormalized section name per row) is a
 flattening artifact of jsonToCsv.py and is NEVER a JSON key in the LLM's
@@ -91,25 +91,20 @@ SHORT_TO_LONG: dict[str, str] = {
 # production .xlsx's sheet header row — not inferred.
 SECTION_ITEM_LABEL: dict[str, str] = {
     "_SNP":      "Row Items",
-    "_SOA":      "SOA Items",
-    "_GOV_BS":   "GOV_BS Items",
-    "_GOV_IS":   "GOV_IS Items",
-    "_PROP_SNP": "PROP_SNP Items",
-    "_PROP_IS":  "PROP_IS Items",
-    "_PROP_CFS": "PROP_CFS Items",
-    "_DSR":      "DSR Items",
+    "_SOA":      "Row Items",
+    "_GOV_BS":   "Row Items",
+    "_GOV_IS":   "Row Items",
+    "_PROP_SNP": "Row Items",
+    "_PROP_IS":  "Row Items",
+    "_PROP_CFS": "Row Items",
+    "_DSR":      "Row Items",
     "_DEBT":     "Row Items",
-
-    # ── Notes / RSI / Statistical-Section tabs ──
-    # Header names taken from the consolidated business specification (TAB 1,
-    # 9, 12, 13, 14, 15). CAPITAL_ASSETS reuses the generic "Row Items" label,
-    # matching SNP and DEBT.
-    "_OVERVIEW":       "Overview Item",
+    "_OVERVIEW":       "Row Items",
     "_CAPITAL_ASSETS": "Row Items",
-    "_TAX_BASE":       "TAX_BASE Items",
-    "_PEN":            "Pension Items",
-    "_OPEB":           "OPEB Items",
-    "_FAQS":           "Finding",
+    "_TAX_BASE":       "Row Items",
+    "_PEN":            "Row Items",
+    "_OPEB":           "Row Items",
+    "_FAQS":           "Row Items",
 }
 
 
@@ -224,6 +219,7 @@ Return VALID JSON ONLY. No markdown fences, no commentary.
   "p" -> Page No
   "c" -> Currency reported  (default "USD ($)")
   "u" -> Unit (only if the original prompt asks for it)
+  "r" -> Reported in Thousand ("Yes" or "No")
 
 ────────────── EACH ROW = JSON ARRAY (positional, NO KEYS) ──────────────
 
@@ -370,6 +366,7 @@ def expand_compact_json(data, stmt_type: str = "") -> dict:
             "FYE":               md.get("f", ""),
             "Page No":           md.get("p", ""),
             "Currency reported": md.get("c", "USD ($)"),
+            "Reported in Thousand":   md.get("r", "No"),   # ← ADD THIS
         }
         if "u" in md:
             metadata["Unit"] = md["u"]
