@@ -35,7 +35,7 @@ from filelock import FileLock
 # LogWriter(log_dir=PFG_Extraction.LOG_DIR) (see pipeline.start_pipeline_logging), which
 # derives from the single control point PFG_Extraction._DATA_ROOT. An operational log,
 # kept in its own 999_Log_Trackers folder — separate from the data parquets.
-LOG_DIR     = Path(r"C:\S2\Public Finance") / "999_Log_Trackers"
+LOG_DIR     = Path(r"D:\S2\Public Finance") / "999_Log_Trackers"
 LOG_PARQUET = LOG_DIR / "pipeline_logs.parquet"
 
 # ── Concurrency (parallel jobs append to the SAME log parquet) ───────────────

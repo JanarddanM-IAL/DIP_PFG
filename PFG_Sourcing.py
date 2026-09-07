@@ -82,7 +82,7 @@ _DISPLAY_STAGES = [
 # PARQUET LOG FILE PATH (global variable)
 # =========================================================
 
-LOG_PARQUET_PATH = Path(r"C:\S2\Public Finance\999_Log_Trackers\processing_log.parquet")
+LOG_PARQUET_PATH = Path(r"D:\S2\Public Finance\999_Log_Trackers\processing_log.parquet")
 LOG_LOCK_PATH    = LOG_PARQUET_PATH.with_suffix(".parquet.lock")   # sibling lock file
 
 
@@ -188,17 +188,17 @@ def write_log(processing_code: str, row_id: int, processing_id: int, stage: str,
 # =========================================================
 # CONFIG
 # =========================================================
-# FILE_PATH = r"C:\S2\Public Finance\PDF to be Sourced and Extracted.xlsm"
+# FILE_PATH = r"D:\S2\Public Finance\PDF to be Sourced and Extracted.xlsm"
 
 PDF_NOT_FOUND_TEXT = "PDF Not Found"
 
 BASE = "https://app.fac.gov"
 ADV_URL = "https://app.fac.gov/dissemination/search/advanced/"
 
-DOWNLOAD_DIR = Path(r"C:\Test Code\Public Finance\01_Metadata_update")
+DOWNLOAD_DIR = Path(r"D:\Test Code\Public Finance\01_Metadata_update")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-PDF_DIR = Path(r"C:\Test Code\Public Finance\02_Downloaded_Report")
+PDF_DIR = Path(r"D:\Test Code\Public Finance\02_Downloaded_Report")
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 

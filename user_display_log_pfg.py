@@ -80,7 +80,7 @@ from typing import Any, Optional
 # and uses PFG_* env-var names so the two never collide even in one process.
 
 LOG_DIR = Path(
-    os.getenv("PFG_LOG_DIR", r"C:\S2\Public Finance\999_Log_Trackers")
+    os.getenv("PFG_LOG_DIR", r"D:\S2\Public Finance\999_Log_Trackers")
 )
 LOG_FILENAME = os.getenv("PFG_USER_LOG_FILENAME", "user_display_log.parquet")
 

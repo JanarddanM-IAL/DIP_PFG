@@ -66,7 +66,7 @@ from filelock import FileLock
 # NOTE: this is the STANDALONE-run default only. The DB/Dagster workflow injects
 # the real location via ParquetStore(parquet_dir=PFG_Extraction.PARQUET_DIR), which
 # is derived from the single control point PFG_Extraction._DATA_ROOT.
-PARQUET_DIR = Path(r"C:\S2\Public Finance") / "04_Validated_output" / "Parquet"
+PARQUET_DIR = Path(r"D:\S2\Public Finance") / "04_Validated_output" / "Parquet"
 
 # ── Concurrency (parallel Dagster jobs write the SAME parquet files) ─────────
 # Mirror PFG_Sourcing/PFG_Validation: a thread lock (in-process threads) + a

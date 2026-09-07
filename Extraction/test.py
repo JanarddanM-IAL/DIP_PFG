@@ -9,7 +9,7 @@ condition is failing.
 import sys, re
 from pathlib import Path
 
-PDF = sys.argv[1] if len(sys.argv) > 1 else r"c:\S2\S2_Khushbu\AI Projects\Financial Data Extraction\MDB_multipleAI\03_Validated_Report\LG_CIT_IA_600024512_2025.pdf"
+PDF = sys.argv[1] if len(sys.argv) > 1 else r"d:\S2\S2_Khushbu\AI Projects\Financial Data Extraction\MDB_multipleAI\03_Validated_Report\LG_CIT_IA_600024512_2025.pdf"
 
 SUSPECT_PAGES = list(range(68, 79)) + [165]   # pages to dump
 

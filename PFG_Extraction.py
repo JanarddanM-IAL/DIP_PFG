@@ -200,7 +200,7 @@ COA_MAPPING_FOLDER = _ENGINE_DIR / "COA_Mapping"
 # └────────────────────────────────────────────────────────────────────────────────┘
 # The INPUT PDF is read from each row's TProcessStatus.PdfFilePath (an absolute path,
 # used verbatim); these constants only control where OUTPUT is written.
-_DATA_ROOT    = Path(r"C:\S2\Public Finance")                 # <<< the one place to change
+_DATA_ROOT    = Path(r"D:\S2\Public Finance")                 # <<< the one place to change
 OUTPUT_BASE   = _DATA_ROOT / "04_Validated_output"            # all-pass deals (JSON/Excel)
 MANUAL_OUTPUT = _DATA_ROOT / "05_Manual_Validation_Required"  # any-fail / total-check-fail deals
 PARQUET_DIR   = OUTPUT_BASE / "Parquet"                       # shared normalized store (pass & fail)

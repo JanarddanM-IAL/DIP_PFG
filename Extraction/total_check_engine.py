@@ -1582,7 +1582,7 @@ def validate_xlsx(xlsx_path: str, output_path: str = None) -> str:
 
 
 def main():
-    xlsx_path = r"C:\S2\S2_Khushbu\AI Projects\Financial Data Extraction\MDB_multipleAI\05_Manual_Validation_Required\PP_WI_820287476_2025_NON-LG\PP_WI_820287476_2025_NON-LG_All_Statements.xlsx"
+    xlsx_path = r"D:\S2\S2_Khushbu\AI Projects\Financial Data Extraction\MDB_multipleAI\05_Manual_Validation_Required\PP_WI_820287476_2025_NON-LG\PP_WI_820287476_2025_NON-LG_All_Statements.xlsx"
     if len(sys.argv) >= 2:
         xlsx_path = sys.argv[1]
     validate_xlsx(xlsx_path)

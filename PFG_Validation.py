@@ -104,12 +104,12 @@ tqdm = _TqdmShim()
 # =========================================================
 # OUTPUT DIRECTORIES  (verdict routing)
 # =========================================================
-PDF_DIR                   = Path(r"C:\Test Code\Public Finance\02_Downloaded_Report")
-VALIDATED_PDF_DIR         = Path(r"C:\Test Code\Public Finance\03_Validated_Report")
-REVIEW_PDF_DIR            = Path(r"C:\Test Code\Public Finance\04_Review_Required")
-FAILED_VALIDATION_PDF_DIR = Path(r"C:\Test Code\Public Finance\05_Manual_validation_required")
-OCR_REQUIRED_PDF_DIR      = Path(r"C:\Test Code\Public Finance\06_OCR_Required")
-PROOF_ROOT                = Path(r"C:\Test Code\Public Finance\999_Log_Trackers\Validation Proofs")
+PDF_DIR                   = Path(r"D:\Test Code\Public Finance\02_Downloaded_Report")
+VALIDATED_PDF_DIR         = Path(r"D:\Test Code\Public Finance\03_Validated_Report")
+REVIEW_PDF_DIR            = Path(r"D:\Test Code\Public Finance\04_Review_Required")
+FAILED_VALIDATION_PDF_DIR = Path(r"D:\Test Code\Public Finance\05_Manual_validation_required")
+OCR_REQUIRED_PDF_DIR      = Path(r"D:\Test Code\Public Finance\06_OCR_Required")
+PROOF_ROOT                = Path(r"D:\Test Code\Public Finance\999_Log_Trackers\Validation Proofs")
 
 for _d in (PDF_DIR, VALIDATED_PDF_DIR, REVIEW_PDF_DIR,
            FAILED_VALIDATION_PDF_DIR, OCR_REQUIRED_PDF_DIR, PROOF_ROOT):
@@ -121,7 +121,7 @@ for _d in (PDF_DIR, VALIDATED_PDF_DIR, REVIEW_PDF_DIR,
 # =========================================================
 # NOTE: new filename (v2) — the gate-based columns are incompatible with the old
 # pdfplumber-era validation_results.parquet, so we do not reuse that file.
-VALIDATION_PARQUET_PATH = Path(r"C:\Test Code\Public Finance\999_Log_Trackers\validation_results_v2.parquet")
+VALIDATION_PARQUET_PATH = Path(r"D:\Test Code\Public Finance\999_Log_Trackers\validation_results_v2.parquet")
 VALIDATION_LOCK_PATH    = VALIDATION_PARQUET_PATH.with_suffix(".parquet.lock")
 
 # Concurrency primitives (same pattern the sourcing/validation tools use).

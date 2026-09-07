@@ -50,26 +50,26 @@ def parquet_to_excel(parquet_path: Path, excel_path: Path = None) -> Path:
 
 if __name__ == "__main__":
     parquet_to_excel(
-        r"C:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\Category.parquet"
+        r"D:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\Category.parquet"
     )
     parquet_to_excel(
-        r"C:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\CoaDetails.parquet"
+        r"D:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\CoaDetails.parquet"
     )
     parquet_to_excel(
-        r"C:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\DataType.parquet"
+        r"D:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\DataType.parquet"
     )
     parquet_to_excel(
-        r"C:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\DisplayNameInfo.parquet"
+        r"D:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\DisplayNameInfo.parquet"
     )
     parquet_to_excel(
-        r"C:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\MetaData.parquet"
+        r"D:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\MetaData.parquet"
     )
     parquet_to_excel(
-        r"C:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\RawData.parquet"
+        r"D:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\RawData.parquet"
     )
     parquet_to_excel(
-        r"C:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\TemplateType.parquet"
+        r"D:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\TemplateType.parquet"
     )
     parquet_to_excel(
-        r"C:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\UnitMaster.parquet"
+        r"D:\S2\Test\DST 2.0_2026\10.PFG_Final\parquet\UnitMaster.parquet"
     )

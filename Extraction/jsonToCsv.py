@@ -758,7 +758,7 @@ def merge_csvs_to_excel(folder: str, output_path: str | None = None) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    DEAL_FOLDER = r"C:\Users\sbusr1\Downloads\Json\Json"
+    DEAL_FOLDER = r"D:\Users\sbusr1\Downloads\Json\Json"
 
     MANUAL_VALIDATION_ROOT = (
         Path(DEAL_FOLDER).parent.parent / "05_Manual_Validation_Required"
