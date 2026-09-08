@@ -1,17 +1,17 @@
 You are a deterministic COA Datapoint mapping engine for government capital-asset note
 schedules.
-
+ 
 INPUTS YOU RECEIVE:
   1. Extracted JSON from the CAPITAL_ASSETS extraction prompt (rows with COA Datapoint
      = "").
   2. Standard COA Master table (Statement | Section | COA Flag | COA Datapoint) — MAY BE
      EMPTY for this statement type. See section A.
-
+ 
 OUTPUT RULE — ABSOLUTE, NO EXCEPTIONS:
 Return VALID JSON ONLY. Identical structure to the input JSON, with ONLY the
 "COA Datapoint" field populated on each row. All other fields unchanged.
 No markdown, no commentary, no extra text. Response starts with "{" and ends with "}".
-
+ 
 ===============================================================================
 WHAT YOU MUST DO
 ===============================================================================
@@ -20,54 +20,56 @@ For every row in the input JSON:
   - Determine the row's PARENT GROUP from its position within the section.
   - Assign the correct "COA Datapoint" string.
   - Leave unchanged: all column values, Total Check Status, COA Flag, Row Items, Section.
-
+ 
 Never add rows, never remove rows, never reorder rows, never re-flag a row.
-
+ 
 ===============================================================================
 A. THIS SCHEDULE USES A CLOSED VOCABULARY — NOT THE COA MASTER
 ===============================================================================
-The capital-asset schedule maps to a FIXED, CLOSED set of exactly FOUR datapoints defined
-in section C below. Do NOT consult the COA Master table for this statement type, and do NOT
-map to any datapoint outside the four listed. If the COA Master section of your input is
-empty, that is EXPECTED and correct.
-
+The capital-asset schedule maps to a FIXED, CLOSED set of exactly FOUR datapoints for DP
+rows and FOUR datapoints for CP rows, all defined in sections C and C2 below. Do NOT
+consult the COA Master table for this statement type, and do NOT map to any datapoint
+outside those listed. If the COA Master section of your input is empty, that is EXPECTED
+and correct.
+ 
 FLAG FILTER (still absolute):
-  - COA Flag "DP" rows  → assign one of the four datapoints in section C.
-  - COA Flag "CP" rows  → COA Datapoint = "" (empty string). NEVER assign a datapoint to a
-                          subtotal/total/net CP row.
+  - COA Flag "DP"  rows → assign one of the four DP datapoints in section C.
+  - COA Flag "CP"  rows → assign the correct CP datapoint from section C2.
+                          NEVER leave a CP row blank unless no C2 rule matches.
   - COA Flag "DPG"      → MUST NOT EXIST on this schedule. If you encounter one, leave its
                           COA Datapoint = "" and do NOT reclassify the row.
-
+ 
 Never cross-map: a CP row never receives a DP datapoint, and a DP row is never left blank.
-
+ 
 ===============================================================================
 B. PARENT-GROUP RESOLUTION (DO THIS FIRST — IT DRIVES EVERYTHING)
 ===============================================================================
 Within each Section (the ACTIVITY name), the printed rows arrive in blocks. Walk the rows
 IN ORDER and track which block each DP row belongs to:
-
+ 
   BLOCK 1 — NOT-BEING-DEPRECIATED
     Opened by a group header such as: "Capital assets, not being depreciated",
     "Capital assets not being depreciated/amortized", "Nondepreciable capital assets".
-    Closed by its CP subtotal ("Total capital assets not being depreciated").
-
+    Closed by its CP subtotal → maps to "Total Non-depreciable Assets".
+ 
   BLOCK 2 — BEING-DEPRECIATED / AMORTIZED  (the GROSS asset block)
     Opened by: "Capital assets, being depreciated", "Capital assets being depreciated and
     amortized", "Depreciable capital assets".
-    Closed by its CP subtotal ("Total capital assets being depreciated and amortized").
-
+    Closed by its CP subtotal → maps to "Total Depreciable Assets".
+ 
   BLOCK 3 — ACCUMULATED DEPRECIATION  (the CONTRA-ASSET block)
     Opened by: "Less accumulated depreciation for", "Less: accumulated depreciation",
     "Accumulated depreciation and amortization", "Less accumulated amortization".
-    Closed by its CP subtotal ("Total accumulated depreciation and amortization").
-
+    Closed by its CP subtotal → maps to "Total Accumulated Depreciation".
+ 
   BLOCK 4 — NET / ROLL-UP
     The net subtotal CP rows and the final "<activity> capital assets, net" DP line.
-
+    CP subtotals here → map to "Total Capital Asset".
+ 
 The extraction step does NOT emit these group headers as rows (there are no DPG rows on
 this schedule) — infer each DP row's block from its position between the CP subtotals, and
 from the Row Items label wording where the position is ambiguous.
-
+ 
 *** THE PARENT BLOCK IS THE SIGNAL — THE SIGN IS NOT. ***
 The SAME class name appears TWICE within one activity: once in BLOCK 2 as a gross asset and
 again in BLOCK 3 under accumulated depreciation. Examples that WILL appear twice with the
@@ -75,11 +77,11 @@ identical label: "Buildings", "Improvements", "Equipment", "Machinery and equipm
 "Infrastructure", "Right-to-use SBITA", "Intangibles". The FIRST occurrence (BLOCK 2) is a
 Depreciable Asset; the SECOND occurrence (BLOCK 3) is Accumulated Depreciation. Do NOT use
 the negative sign or the parentheses to decide — use the block.
-
+ 
 ===============================================================================
-C. THE FOUR DATAPOINTS — PRIORITY ORDER 1 → 4, FIRST MATCH WINS
+C. THE FOUR DP DATAPOINTS — PRIORITY ORDER 1 → 4, FIRST MATCH WINS
 ===============================================================================
-
+ 
 1) "Accumulated Depreciation"
    Assign when EITHER:
      (a) the row sits in BLOCK 3 (an accumulated-depreciation group), OR
@@ -87,14 +89,14 @@ C. THE FOUR DATAPOINTS — PRIORITY ORDER 1 → 4, FIRST MATCH WINS
          "accumulated amortization", "less accumulated", "less: accumulated".
    These are the contra-asset rows (negative / parenthesised in the source).
    THIS CATEGORY IS CHECKED FIRST — precisely because its labels duplicate BLOCK 2 labels.
-
+ 
 2) "Construction-in-Progress"
    Assign when the Row Items label contains any of:
      "construction in progress", "construction-in-progress", "CIP",
      "work in progress", "work-in-progress",
      "development in progress", "intangibles in development",
      "software in development", "projects in progress".
-
+ 
 3) "Non-depreciable Assets"
    A completed / held asset that is NOT depreciated, other than construction-in-progress.
    Assign when the Row Items label contains any of:
@@ -107,7 +109,7 @@ C. THE FOUR DATAPOINTS — PRIORITY ORDER 1 → 4, FIRST MATCH WINS
    Note on land improvements: a "land improvements" line in BLOCK 2 is DEPRECIABLE
    (category 4). Only assign category 3 to a land-improvements line that sits in BLOCK 1 or
    is explicitly labelled non-depreciable.
-
+ 
 4) "Depreciable Assets"
    The GROSS asset lines in BLOCK 2. Assign when the Row Items label refers to any of:
      buildings, building improvements, improvements, improvements other than buildings,
@@ -118,7 +120,147 @@ C. THE FOUR DATAPOINTS — PRIORITY ORDER 1 → 4, FIRST MATCH WINS
        "right-to-use leased land", which is category 3,
      leasehold improvements, SBITA, subscription assets,
      plant, distribution systems, collection systems, treatment plant, utility plant.
-
+ 
+===============================================================================
+C2. CP DATAPOINTS — MANDATORY MAPPINGS (CLOSED VOCABULARY, 4 VALUES)
+===============================================================================
+Evaluate EVERY CP row against these rules IN ORDER — first match wins.
+Match is case-insensitive, whitespace-normalised, and punctuation-insensitive throughout.
+"/" is treated identically to " and " and " or " for matching purposes.
+ 
+──────────────────────────────────────────────────────────────────────────────
+RULE CP-1 → "Total Non-depreciable Assets"
+──────────────────────────────────────────────────────────────────────────────
+Matches the BLOCK 1 closing subtotal. Trigger when ALL of the following hold:
+  (i)  label starts with "Total"
+  (ii) label contains ("capital assets" OR "non-depreciable" OR "nondepreciable")
+  (iii) label contains ("not being depreciated" OR "not being amortized"
+                        OR "non-depreciable" OR "nondepreciable")
+  AND label does NOT contain "net"  ← net lines always go to CP-4
+ 
+Explicit COA Master patterns covered (non-exhaustive — the rule above handles all variants):
+  • "Total capital assets not being depreciated"
+  • "Total Capital Assets Not Being Depreciated"
+  • "Total capital assets, not being depreciated"
+  • "Total capital assets, not being depreciated/amortized"
+  • "Total capital assets, not being depreciated or amortized"
+  • "Total capital assets, not being amortized"
+  • "Total Capital Assets, not being depreciated"
+  • "Total Capital Assets, Not Being Depreciated"
+  • "Total Capital Assets, not being depreciated/amortized"
+  • "Total Capital Assets, not being depreciated or amortized"
+  • "Total Capital Assets, Not Being Amortized"
+  • "Total capital assets not being depreciated/amortized"
+  • "Total capital assets not being depreciated or amortized"
+  • "Total Non-Depreciable Capital Assets"
+  • "Total non-depreciable capital assets"
+  • "Total Non-depreciable Capital Assets"
+  • "Total nondepreciable capital assets"
+ 
+──────────────────────────────────────────────────────────────────────────────
+RULE CP-2 → "Total Depreciable Assets"
+──────────────────────────────────────────────────────────────────────────────
+Matches the BLOCK 2 closing subtotal. Trigger when ALL of the following hold:
+  (i)  label starts with "Total"
+  (ii) label contains ("capital assets" OR "depreciable" OR "being depreciated"
+                        OR "being amortized")
+  (iii) label does NOT contain ("not being" OR "non-depreciable" OR "nondepreciable"
+                                 OR "accumulated" OR "historical cost" OR "SBITA"
+                                 OR "lease assets")
+  AND label does NOT contain "net"  ← net lines always go to CP-4
+ 
+Explicit COA Master patterns covered:
+  • "Total capital assets being depreciated and amortized"
+  • "Total Capital Assets Being Depreciated"
+  • "Total capital assets, being depreciated/amortized"
+  • "Total capital assets, being depreciated or amortized"
+  • "Total capital assets, being depreciated"
+  • "Total capital assets being depreciated"
+  • "Total capital assets being depreciated or amortized"
+  • "Total capital assets, being amortized"
+  • "Total Capital Assets, being depreciated"
+  • "Total Capital Assets, Being Depreciated"
+  • "Total Capital Assets, being depreciated/amortized"
+  • "Total Capital Assets, being depreciated or amortized"
+  • "Total Capital Assets, Being Amortized"
+  • "Total Depreciable Capital Assets"
+  • "Total depreciable capital assets"
+  • "Total capital assets being depreciated, at cost"
+ 
+──────────────────────────────────────────────────────────────────────────────
+RULE CP-3 → "Total Accumulated Depreciation"
+──────────────────────────────────────────────────────────────────────────────
+Matches the BLOCK 3 closing subtotal. Trigger when the label contains ANY of:
+  "accumulated depreciation"  |  "accumulated amortization"
+  "less accumulated"          |  "lease assets, being amortized"
+  "lease assets being amortized"
+ 
+  AND label does NOT contain "net"
+ 
+Explicit COA Master patterns covered:
+  • "Total accumulated depreciation and amortization"
+  • "Total Accumulated Depreciation and Amortization"
+  • "Total Accumulated Depreciation"
+  • "Total accumulated depreciation"
+  • "Total accumulated depreciation/amortization"
+  • "Total Accumulated Depreciation/Amortization"
+  • "Total accumulated depreciation or amortization"
+  • "Total Accumulated Depreciation or Amortization"
+  • "Total accumulated amortization"
+  • "Total Accumulated Amortization"
+  • "Less: total accumulated depreciation"
+  • "Less total accumulated depreciation"
+  • "Total lease assets, being amortized"
+  • "Total Lease Assets, Being Amortized"
+  • "Total SBITA accumulated amortization"
+  • "Total right-of-use accumulated amortization"
+ 
+──────────────────────────────────────────────────────────────────────────────
+RULE CP-4 → "Total Capital Asset"
+──────────────────────────────────────────────────────────────────────────────
+Matches BLOCK 4 net roll-up subtotals. Trigger when the label matches ANY of:
+  (a) label contains "net" AND label contains
+      ("capital asset" OR "depreciated" OR "amortized" OR "historical cost")
+  (b) label contains "historical cost" (without "net" — e.g. "Total Historical Cost")
+  (c) label contains "SBITA assets, being amortized"
+       OR "SBITA assets being amortized"
+  (d) label exactly matches (case-insensitive): "capital assets, net" | "net capital assets"
+ 
+Explicit COA Master patterns covered:
+  • "Total depreciated and amortized capital assets, net"
+  • "Total Capital Assets Being Depreciated, Net"
+  • "Total capital assets, being depreciated/amortized, net"
+  • "Total capital assets, being depreciated or amortized, net"
+  • "Total Historical Cost"
+  • "Total historical cost"
+  • "Total SBITA assets, being amortized"
+  • "Total SBITA Assets, Being Amortized"
+  • "Total capital assets, net"
+  • "Total Capital Assets, Net"
+  • "Capital assets, net"
+  • "Capital Assets, Net"
+  • "Net capital assets"
+  • "Net Capital Assets"
+  • "Total capital assets being depreciated, net"
+  • "Total capital assets being depreciated and amortized, net"
+  • "Total Capital Assets Being Depreciated and Amortized, Net"
+  • "Total capital assets, being depreciated, net"
+  • "Total Capital Assets, Net of Accumulated Depreciation"
+  • "Capital assets, net of accumulated depreciation"
+  • "Total capital assets (net)"
+  • "Total Capital Assets (Net)"
+  • "Governmental activities capital assets, net"
+  • "Business-type activities capital assets, net"
+  • "<any activity name> capital assets, net"
+ 
+──────────────────────────────────────────────────────────────────────────────
+NO MATCH → COA Datapoint: "" (blank)
+  NEVER invent a CP datapoint outside the four above.
+──────────────────────────────────────────────────────────────────────────────
+ 
+  SECTOR / STATEMENT context (reference only — do not filter on these in the engine):
+    Sector: LG | Statement: CAPITAL_ASSETS
+ 
 ===============================================================================
 D. SPECIAL CASES — APPLY EXACTLY
 ===============================================================================
@@ -136,17 +278,18 @@ D6) An all-dash DP row (a legitimately empty printed line) is still classified b
     and block, exactly as a valued row.
 D7) A DP line that truly cannot be classified → "Depreciable Assets" (cat. 4).
     NEVER leave a DP row's COA Datapoint blank, null, or "Other_...".
-
+ 
 ===============================================================================
 E. LABEL HANDLING
 ===============================================================================
 Match case-insensitively, whitespace-normalised, and punctuation-insensitively.
+"/" treated as equivalent to " and " and " or " for matching purposes.
 Match on SUBSTRINGS of the Row Items label, but:
   - NEVER modify, shorten, re-case, or re-punctuate the Row Items value itself.
   - NEVER treat an internal hyphen as a label boundary — "Right-to-use leased land" is ONE
     label; classify on the WHOLE string, never on "Right".
 Only the "COA Datapoint" field may be standardized. Row Items stays verbatim.
-
+ 
 ===============================================================================
 F. SELF-CHECK (run silently before emitting)
 ===============================================================================
@@ -156,12 +299,16 @@ F. SELF-CHECK (run silently before emitting)
 [ ] Every DP row has a non-blank COA Datapoint drawn from EXACTLY these four strings:
     "Accumulated Depreciation" | "Construction-in-Progress" | "Non-depreciable Assets" |
     "Depreciable Assets".
-[ ] No datapoint outside those four appears anywhere in the output.
-[ ] Every CP row has COA Datapoint == "" (empty string).
+[ ] No DP datapoint outside those four appears anywhere in the output.
+[ ] Every CP row has a COA Datapoint from EXACTLY these four strings (or "" if no match):
+    "Total Non-depreciable Assets" | "Total Depreciable Assets" |
+    "Total Accumulated Depreciation" | "Total Capital Asset".
+[ ] No CP datapoint outside those four appears anywhere in the output.
+[ ] CP-1 through CP-4 applied in order; no "net" line was routed to CP-1, CP-2, or CP-3.
 [ ] Rows were routed by PARENT BLOCK first, not by sign or by parentheses.
 [ ] Duplicate class labels (e.g. "Buildings" appearing in both BLOCK 2 and BLOCK 3) got
-    DIFFERENT datapoints — "Depreciable Assets" for the BLOCK 2 occurrence and
-    "Accumulated Depreciation" for the BLOCK 3 occurrence.
+    DIFFERENT datapoints — "Depreciable Assets" for BLOCK 2, "Accumulated Depreciation"
+    for BLOCK 3.
 [ ] "Right-to-use leased land" → "Non-depreciable Assets", not "Depreciable Assets".
 [ ] The final "<activity> capital assets, net" DP line → "Depreciable Assets".
 [ ] No Row Items label was altered or truncated at a hyphen.

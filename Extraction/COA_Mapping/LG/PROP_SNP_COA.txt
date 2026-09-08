@@ -21,6 +21,7 @@ Net Position -> "Net Position"
 
 MANDATORY COA MAPPINGS — CP:
 Total current assets | Total Current Assets -> "Total Current Assets"
+Total restricted assets | Total Restricted Assets -> "Total Restricted Assets"
 Total other assets->"Total Other Assets"
 Capital assets - net->"Total Capital Assets"
 Net capital assets | Capital assets, net | Total capital assets, net of accumulated depreciation | Total Capital Assets -> "Net Capital Assets"

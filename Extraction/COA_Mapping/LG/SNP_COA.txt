@@ -81,6 +81,7 @@ PRE-CHECK (run before any mapping below):
   Total restricted                                → "Total Restricted"
   Total unrestricted                              → "Total Unrestricted"
   Total net position / Total net position (deficit) → "Total Net Position"
+  Total restricted assets | Total Restricted Assets -> "Total Restricted Assets"
 
   COLLAPSED SECTION CP ROWS (no "Total" prefix printed in PDF):
   "Deferred Inflows of Resources"  (COA Flag = CP) → "Total Deferred Inflows of Resources"

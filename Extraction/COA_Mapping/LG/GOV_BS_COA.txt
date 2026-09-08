@@ -18,9 +18,12 @@ Fund Balances->"Fund Balances"
 
 
 MANDATORY COA MAPPINGS -- CP:
-Total assets->"Total Assets" | Total current assets->"Total current assets" | Total capital assets->"Total capital assets" | Total noncurrent assets->"Total noncurrent assets" | Total deferred outflows of resources->"Total Deferred Outflows of Resources" | Total assets and deferred outflows of resources->"Total Assets and Deferred Outflows of Resources" | Total current liabilities->"Total Current Liabilities" | Total noncurrent liabilities->"Total Noncurrent Liabilities" | Total liabilities->"Total Liabilities" | Total deferred inflows of resources->"Total Deferred Inflows of Resources" | Total liabilities and deferred inflows of resources->"Total Liabilities and Deferred Inflows of Resources" | Total restricted->"Total Restricted" | Total unrestricted->"Total Unrestricted" | Total net position / Total net position (deficit)->"Total Net Position" | Total liabilities, deferred inflows of resources, and net position->"Total Liabilities, Deferred inflows of resources, and Net position"
+Total assets->"Total Assets" | Total current assets->"Total current assets" | Total capital assets->"Total capital assets" | Total noncurrent assets->"Total noncurrent assets" | Total deferred outflows of resources->"Total Deferred Outflows of Resources" 
+| Total assets and deferred outflows of resources->"Total Assets and Deferred Outflows of Resources" | Total current liabilities->"Total Current Liabilities" | Total noncurrent liabilities->"Total Noncurrent Liabilities" | Total liabilities->"Total Liabilities" 
+| Total deferred inflows of resources->"Total Deferred Inflows of Resources" | Total liabilities and deferred inflows of resources->"Total Liabilities and Deferred Inflows of Resources" | Total restricted->"Total Restricted" | Total unrestricted->"Total Unrestricted"
+| Total net position / Total net position (deficit)->"Total Net Position" | Total liabilities, deferred inflows of resources, and net position->"Total Liabilities, Deferred inflows of resources, and Net position"
 Total fund balances / Total Fund Balances->"Total Fund Balances"|Total other assets->"Total Other Assets"
-|Capital assets - net->"Total Capital Assets"|
+|Capital assets - net->"Total Capital Assets"|Total restricted assets / Total Restricted Assets -> "Total Restricted Assets"
 Total liabilities, deferred inflows of resources and fund balances (any variant) / Total liabilities and fund balances->"Total Liabilities, Deferred Inflows of Resources, And Fund Balances"
 
 
