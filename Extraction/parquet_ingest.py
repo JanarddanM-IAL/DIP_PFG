@@ -19,9 +19,13 @@ RawData columns (see parquet-schema/RawData.xlsx):
                         THIS row's CategoryID (e.g. an SNP row whose CategoryID is
                         "Governmental Activities" gets "Governmental Activities_coord").
                         Null when the engine emitted no box for that cell.
-    ReportedInThousand  Metadata "Reported in Thousand" ("Yes"/"No") — the scale
-                        indicator, per STATEMENT, so every row from one JSON file
-                        shares it. Null for a pre-Update-2 JSON that omits the key.
+    ReportedInThousand  Metadata "Reported in Thousand", stored as 1/0 (Int64) —
+                        the JSON's "Yes"/"No" is matched CASE-INSENSITIVELY and
+                        encoded, so "Yes"/"yes"/"YES" -> 1 and "No"/"no" -> 0. The
+                        scale indicator is per STATEMENT, so every row from one
+                        JSON file shares it. Null when the key is absent (a
+                        pre-Update-2 JSON) or holds something other than yes/no —
+                        "unknown" stays distinct from an asserted 0.
     PageNo              Metadata "Page No"
     PdfDataPpointName   the sheet's raw item-column value (Row Items / SOA Items / ...)
     TemplateTypeId      -> TemplateType, but ONLY for rows with no COA mapping
@@ -118,7 +122,7 @@ _STMT_RE = re.compile(r"_(" + "|".join(_STMT_CODES) + r")(?:_Comp)?_p[\d\-]+$", 
 RAWDATA_SCHEMA = {
     "DataId": pl.Int64, "CategoryID": pl.Int64, "COAHeaderID": pl.Int64,
     "MetaDataID": pl.Int64, "ProcessingId": pl.Int64, "Quardinate": pl.Utf8,
-    "ReportedInThousand": pl.Utf8,
+    "ReportedInThousand": pl.Int64,   # 1 = Yes, 0 = No, null = absent/unrecognised
     "PageNo": pl.Utf8, "PdfDataPpointName": pl.Utf8,
     "TemplateTypeId": pl.Int64, "GroupName": pl.Utf8,
     "Value": pl.Utf8,
@@ -146,6 +150,29 @@ def _norm(s) -> str:
     if s is None:
         return ""
     return re.sub(r"\s+", " ", str(s).replace("_", " ")).strip().lower()
+
+
+# Metadata "Reported in Thousand" arrives as a word; RawData stores it as 1/0.
+_YES_TOKENS = {"yes", "y", "true", "1"}
+_NO_TOKENS  = {"no", "n", "false", "0"}
+
+
+def _yes_no_to_int(v):
+    """Encode a yes/no metadata word as 1/0, matched CASE-INSENSITIVELY.
+
+    Returns None for an absent/blank value AND for anything not recognised as
+    yes or no. That keeps "unknown" (a pre-Update-2 JSON with no key, or a
+    surprise value) distinct from an asserted "No" — silently folding either
+    into 0 would claim the statement is in units when nothing said so.
+    """
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in _YES_TOKENS:
+        return 1
+    if s in _NO_TOKENS:
+        return 0
+    return None
 
 
 # Suffix the engine appends to a Reporting Column name to carry that cell's bounding
@@ -326,10 +353,9 @@ class ParquetStore:
             unit_name = currency if currency not in (None, "") else None
             # Scale indicator, per STATEMENT — stamped on every row from this file,
             # like PageNo/FYE/Currency. Left NULL when the key is absent rather than
-            # defaulting to "No", so a pre-Update-2 JSON is recorded as "unknown"
+            # defaulting to 0, so a pre-Update-2 JSON is recorded as "unknown"
             # instead of being asserted to be in units.
-            rit = meta.get("Reported in Thousand")
-            rit = str(rit).strip() if rit not in (None, "") else None
+            rit = _yes_no_to_int(meta.get("Reported in Thousand"))
             excl = set(rc) | {"COA Flag", "COA Datapoint", "Total Check Status"}
 
             cur_dpg = None

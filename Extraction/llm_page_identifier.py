@@ -976,8 +976,48 @@ def _trim_prompt_for_sector(prompt_text: str,
 # PAGE TEXT HELPERS
 # ════════════════════════════════════════════════════════════════════════
 
+
+# ── Per-PDF page-text cache ───────────────────────────────────────────────────
+# Keyed by (pdf_path, page_no). Populated on first read; subsequent calls for the
+# same page return instantly without re-opening the file.
+_page_text_cache: dict[tuple[str, int], str] = {}
+_page_text_cache_lock = threading.Lock()
+
+
+def _preload_page_text_cache(pdf_path: str) -> int:
+    """
+    Open pdf_path ONCE and populate _page_text_cache for every page.
+    Returns total page count.  Call this once per PDF before any per-page work.
+    """
+    try:
+        import pdfplumber
+        from pypdf import PdfReader
+        with pdfplumber.open(pdf_path) as pdf:
+            total = len(pdf.pages)
+            texts: list[tuple[int, str]] = []
+            for i, page in enumerate(pdf.pages):
+                raw = _collapse_char_spacing((page.extract_text() or "").strip())
+                if not raw:
+                    try:
+                        raw = (PdfReader(pdf_path).pages[i].extract_text() or "").strip()
+                    except Exception:
+                        pass
+                texts.append((i + 1, raw))
+        with _page_text_cache_lock:
+            for page_no, text in texts:
+                _page_text_cache[(pdf_path, page_no)] = text
+        return total
+    except Exception:
+        return 0
+
+
 def _get_page_text(pdf_path: str, page_no: int) -> str:
-    """Get page text with character-spacing collapse applied."""
+    """Get page text with character-spacing collapse applied (cached)."""
+    with _page_text_cache_lock:
+        if (pdf_path, page_no) in _page_text_cache:
+            return _page_text_cache[(pdf_path, page_no)]
+
+    # Cache miss — read just this page (fallback for callers that don't preload)
     raw = ""
     try:
         import pdfplumber
@@ -998,7 +1038,10 @@ def _get_page_text(pdf_path: str, page_no: int) -> str:
         except Exception:
             return ""
 
-    return _collapse_char_spacing(raw)
+    result = _collapse_char_spacing(raw)
+    with _page_text_cache_lock:
+        _page_text_cache[(pdf_path, page_no)] = result
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1579,11 +1622,9 @@ def _full_scan_notes_tables(pdf_path: str, keys: list[str] | None = None) -> dic
     any notes key the LLM returned empty.
     """
     keys = keys or _NOTES_TABLE_KEYS
-    try:
-        import pdfplumber
-        with pdfplumber.open(pdf_path) as pdf:
-            total = len(pdf.pages)
-    except Exception:
+    # Ensure the whole document is in the cache with one open (no-op if already loaded).
+    total = _preload_page_text_cache(pdf_path)
+    if total == 0:
         try:
             from pypdf import PdfReader
             total = len(PdfReader(pdf_path).pages)
@@ -2253,11 +2294,9 @@ def _identify_notes_tables(gemini_client, pdf_bytes: bytes, model: str,
 
 
 def _full_scan_dsr_debt(pdf_path: str):
-    try:
-        import pdfplumber
-        with pdfplumber.open(pdf_path) as pdf:
-            total = len(pdf.pages)
-    except Exception:
+    # Ensure the whole document is in the cache with one open (no-op if already loaded).
+    total = _preload_page_text_cache(pdf_path)
+    if total == 0:
         try:
             from pypdf import PdfReader
             total = len(PdfReader(pdf_path).pages)
@@ -2321,39 +2360,44 @@ def identify_pages_gemini(
     # pdf_bytes always read — Gemini/OpenAI use binary; Claude ignores it
     pdf_bytes = Path(pdf_path).read_bytes()
 
-    # ── CALL 1: DSR + DEBT ────────────────────────────────────────────
+    # ── Preload page-text cache (one PDF open for ALL subsequent per-page work) ──
+    _preload_page_text_cache(pdf_path)
+
+    # ── CALLS 1, 2, 3 — run concurrently (all are I/O-bound API calls) ──
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
     dsr_debt_keys  = {"_DSR", "_DEBT"}
     needs_dsr_debt = (allowed_suffixes is None) or bool(dsr_debt_keys & allowed_suffixes)
-
-    if needs_dsr_debt:
-        dsr_debt_result = _identify_dsr_debt_only(
-            gemini_client, pdf_bytes, model,
-            pdf_path=pdf_path,
-        )
-    else:
-        print("  [ID] Skipping DSR/DEBT call — not needed for this sector")
-        dsr_debt_result = {"DSR": [], "DEBT": []}
-
-    # ── CALL 2: Main tables ───────────────────────────────────────────
-    main_result = _identify_main_tables(
-        gemini_client, pdf_bytes, model,
-        pdf_path=pdf_path,
-        allowed_suffixes=allowed_suffixes,
-    )
-
-    # ── CALL 3: Notes / RSI / Statistical tables ──────────────────────
     notes_suffixes = set(_NOTES_TABLE_KEY_TO_SUFFIX.values())
     needs_notes    = (allowed_suffixes is None) or bool(notes_suffixes & allowed_suffixes)
 
-    if needs_notes:
-        notes_result = _identify_notes_tables(
-            gemini_client, pdf_bytes, model,
-            pdf_path=pdf_path,
-            allowed_suffixes=allowed_suffixes,
+    futures_map = {}
+    with ThreadPoolExecutor(max_workers=3) as _ex:
+        if needs_dsr_debt:
+            futures_map["dsr_debt"] = _ex.submit(
+                _identify_dsr_debt_only,
+                gemini_client, pdf_bytes, model, None, pdf_path,
+            )
+        else:
+            print("  [ID] Skipping DSR/DEBT call — not needed for this sector")
+
+        futures_map["main"] = _ex.submit(
+            _identify_main_tables,
+            gemini_client, pdf_bytes, model, None, pdf_path, allowed_suffixes,
         )
-    else:
-        print("  [ID] Skipping Notes-tables call — not needed for this sector")
-        notes_result = {}
+
+        if needs_notes:
+            futures_map["notes"] = _ex.submit(
+                _identify_notes_tables,
+                gemini_client, pdf_bytes, model, None, pdf_path, allowed_suffixes,
+            )
+        else:
+            print("  [ID] Skipping Notes-tables call — not needed for this sector")
+
+    dsr_debt_result = futures_map["dsr_debt"].result() if "dsr_debt" in futures_map \
+                      else {"DSR": [], "DEBT": []}
+    main_result     = futures_map["main"].result()
+    notes_result    = futures_map["notes"].result() if "notes" in futures_map else {}
 
     # ── Merge ─────────────────────────────────────────────────────────
     normalized = {**main_result, **dsr_debt_result, **notes_result}

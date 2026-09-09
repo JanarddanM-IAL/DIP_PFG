@@ -44,21 +44,14 @@ _CACHE_REGISTRY: dict[str, str] = {}
 _REGISTRY_LOCK = Lock()
 _CACHE_TTL_SECONDS = 21_600   # 6 hours — survives a full batch run
 
-# Cached input ≈ 25% of normal input rate for Gemini
-GEMINI_CACHED_RATES = {
-    "gemini-3.5-flash":              (0.375,  9.00),
-    "gemini-3.1-flash-lite-preview": (0.0625, 1.50),
-    "gemini-2.5-flash":              (0.0375, 0.60),
-    "gemini-2.5-pro":                (0.3125, 10.00),
-}
-
-# Normal input rates (for fresh-token cost component)
-GEMINI_NORMAL_RATES = {
-    "gemini-3.5-flash":              (1.50,  9.00),
-    "gemini-3.1-flash-lite-preview": (0.25,  1.50),
-    "gemini-2.5-flash":              (0.15,  0.60),
-    "gemini-2.5-pro":                (1.25, 10.00),
-}
+# ── All rate data comes from the single registry ──────────────────────────────
+from gemini_model_registry import (
+    calculate_cached_cost as _calc_cost_from_registry,
+    cached_rates,
+    standard_rates,
+    GEMINI_CACHED_RATES,  # backwards-compat alias (read-only)
+    GEMINI_NORMAL_RATES,  # backwards-compat alias (read-only)
+)
 
 
 class CacheUnavailableError(RuntimeError):
@@ -166,24 +159,8 @@ def _calc_cost(model: str,
                prompt_tokens: int,
                cached_tokens: int,
                completion_tokens: int) -> tuple[float, str]:
-    """Returns (cost_usd, breakdown_string)."""
-    in_rate, out_rate = GEMINI_NORMAL_RATES.get(model, (1.50, 9.00))
-    c_in_rate, _      = GEMINI_CACHED_RATES.get(model, (in_rate * 0.25, out_rate))
-
-    fresh = max(0, prompt_tokens - cached_tokens)
-
-    fresh_cost  = (fresh             / 1_000_000) * in_rate
-    cached_cost = (cached_tokens     / 1_000_000) * c_in_rate
-    output_cost = (completion_tokens / 1_000_000) * out_rate
-    total       = fresh_cost + cached_cost + output_cost
-
-    ratio = (cached_tokens / prompt_tokens * 100) if prompt_tokens else 0
-    breakdown = (
-        f"cached={cached_tokens:,}({ratio:.0f}%) "
-        f"fresh={fresh:,} out={completion_tokens:,} → "
-        f"${total:.4f}"
-    )
-    return total, breakdown
+    """Returns (cost_usd, breakdown_string) — delegates to central registry."""
+    return _calc_cost_from_registry(model, prompt_tokens, cached_tokens, completion_tokens)
 
 
 # ─────────────────────────────────────────────────────────────────────────

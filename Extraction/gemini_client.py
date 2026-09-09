@@ -14,49 +14,14 @@ from google.genai.errors import APIError
 # compact_schema.py existed with those names) fed broken data through.
 from compact_schema import build_short_key_instruction, expand_compact_json
 
-# ── Cost table ($ per 1 M tokens) ───────────────────────────────────────────
-
-GEMINI_COST_TABLE: dict[str, tuple[float, float]] = {
-    "gemini-2.0-flash":                    (0.075,  0.30),
-    "gemini-2.0-flash-lite":               (0.075,  0.30),
-    "gemini-1.5-flash":                    (0.075,  0.30),
-    "gemini-1.5-pro":                      (1.25,   5.00),
-    "gemini-2.5-flash":                    (0.15,   0.60),
-    "gemini-2.5-pro":                      (1.25,  10.00),
-    "gemini-3.1-flash-lite-preview":       (0.25,   1.50),
-    "gemini-3.5-flash":                    (1.50,   9.00),
-    "gemini-3.6-flash":                    (1.50,   7.50),
-}
-
-DEFAULT_COST = (0.075, 0.30)
-
-
-# Max output tokens per model family
-MODEL_MAX_OUTPUT: dict[str, int] = {
-    "gemini-3.6-flash":                  65536,
-    "gemini-3.5-flash":                  65536,
-    "gemini-3.1-flash-lite-preview":     65536,
-    "gemini-2.5-pro":                    65536,
-    "gemini-2.5-flash":                  65536,
-    "gemini-1.5-pro":                    8192,
-    "gemini-1.5-flash":                  8192,
-    "gemini-2.0-flash":                  8192,
-}
-
-
-def _model_max_tokens(model: str) -> int:
-    for prefix, limit in MODEL_MAX_OUTPUT.items():
-        if model.startswith(prefix):
-            return limit
-    if model.startswith("gemini-3."):
-        return 65536
-    return 8192
-
-
-def calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    input_rate, output_rate = GEMINI_COST_TABLE.get(model, DEFAULT_COST)
-    return (prompt_tokens / 1_000_000) * input_rate + \
-           (completion_tokens / 1_000_000) * output_rate
+# ── Model registry (single source of truth for all rates + token caps) ──────
+from gemini_model_registry import (
+    calculate_cost,
+    max_output_tokens as _model_max_tokens,
+    standard_rates,
+    GEMINI_COST_TABLE,   # kept for any external callers that reference it
+    MODEL_MAX_OUTPUT,    # kept for any external callers that reference it
+)
 
 
 # ── JSON parsing ─────────────────────────────────────────────────────────────
@@ -359,7 +324,7 @@ def normalize_one_gemini(
         completion_tokens = getattr(usage_meta, "candidates_token_count", 0) or 0
         total_tokens      = getattr(usage_meta, "total_token_count",      0) or 0
 
-        in_rate, out_rate = GEMINI_COST_TABLE.get(use_model, DEFAULT_COST)
+        in_rate, out_rate = standard_rates(use_model)
         cost = calculate_cost(use_model, prompt_tokens, completion_tokens)
 
         #print(f"  Tokens        : prompt={prompt_tokens:,}  completion={completion_tokens:,}  total={total_tokens:,}")

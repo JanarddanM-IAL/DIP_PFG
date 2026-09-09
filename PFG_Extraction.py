@@ -34,6 +34,7 @@ Sector rule: TProcessStatus.COAID -> TCOAMaster.SegmentId; SegmentId 1 = LG,
 SegmentId 2 = NON-LG (default LG when unknown) — same rule PFG_Validation.py uses.
 """
 
+import os
 import sys
 import shutil
 import tempfile
@@ -184,6 +185,15 @@ REPORTING_COLUMNS = None
 #   Gemini ID_MODEL above, page ID stays synchronous and only normalization is
 #   batched. Set ID_MODEL to a Claude model to batch page ID as well.
 USE_BATCH         = True
+
+# Update 3 made pipeline.run_extraction slice PDFs through a ThreadPoolExecutor
+# (default 4 workers, env EXTRACT_WORKERS). That is a win for the standalone CLI,
+# which processes a whole folder in one process, but it is wrong here: this stage
+# handles ONE document per invocation, so there is nothing to fan out, and
+# pipeline._next_log_pid() mutates a module-level log context that Dagster's
+# already-concurrent single-id invocations would then interleave. Pin it to 1 so
+# the DB path stays serial and its logs stay attributable.
+os.environ.setdefault("EXTRACT_WORKERS", "1")
 
 # --- engine resource folders (verified to exist inside Extraction/) ---
 PROMPTS_FOLDER     = _ENGINE_DIR / "prompts"

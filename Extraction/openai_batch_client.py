@@ -10,38 +10,21 @@ from compact_schema import build_short_key_instruction
 _POLL_SECONDS = 60
 _TERMINAL = {"completed", "failed", "expired", "cancelled"}
 
-# 50% of standard rates
-OPENAI_BATCH_RATES = {
-    # Standard $0.15/$0.60  →  batch $0.075/$0.30
-    "gpt-4o-mini":  (0.075,  0.30),   # unchanged, correct
-
-    # Standard $0.40/$1.60  →  batch $0.20/$0.80
-    "gpt-4.1-mini": (0.20,   0.80),   # unchanged, correct
-
-    # Standard $2.50/$10.00 →  batch $1.25/$5.00
-    "gpt-4o":       (1.25,   5.00),   # unchanged, correct
-
-    # Standard $2.00/$8.00  →  batch $1.00/$4.00
-    "gpt-4.1":      (1.00,   4.00),   # unchanged, correct
-
-    # Standard $5.00/$30.00 →  batch $2.50/$15.00
-    "gpt-5.5":      (2.50,  15.00),   # unchanged, correct
-}
-
-# FIX (mirrors bug #2 in gemini_batch_client): unknown models now log a loud
-# warning instead of silently using a fallback rate that happens to match
-# gpt-4o-mini today but could be wrong for any other model.
-_DEFAULT_FALLBACK_RATE = (0.075, 0.30)
+# ─────────────────────────────────────────────────────────────────────────────
+# All batch rates come from openai_model_registry.py (50% of standard by
+# default). To add a new model, edit openai_model_registry.py ONLY.
+# ─────────────────────────────────────────────────────────────────────────────
+from openai_model_registry import calculate_batch_cost as _registry_batch_cost
 
 
 def _rate_for_model(model: str) -> tuple[float, float]:
-    if model in OPENAI_BATCH_RATES:
-        return OPENAI_BATCH_RATES[model]
-    print(f"[OPENAI BATCH] [WARN] No rate entry for model='{model}' — "
-          f"falling back to {_DEFAULT_FALLBACK_RATE} ($/1M in,out). "
-          f"Cost figures below may be WRONG. Add this model to "
-          f"OPENAI_BATCH_RATES.")
-    return _DEFAULT_FALLBACK_RATE
+    """
+    Kept for any legacy callers; returns (batch_in, batch_out) per 1M tokens.
+    Prefer calling _calc_cost() directly.
+    """
+    from openai_model_registry import get_spec
+    spec = get_spec(model)
+    return spec.effective_batch_in(), spec.effective_batch_out()
 
 
 def _client():
@@ -254,8 +237,6 @@ def wait_and_download_openai(batch_id: str, model: str) -> dict[str, dict]:
     if b.status != "completed":
         raise RuntimeError(f"OpenAI batch ended in {b.status}")
 
-    in_rate, out_rate = _rate_for_model(model)
-
     results: dict[str, dict] = {}
     total_in = total_out = 0
     parse_failures = 0
@@ -378,8 +359,10 @@ def wait_and_download_openai(batch_id: str, model: str) -> dict[str, dict]:
             total_in  += prompt_tokens
             total_out += completion_tokens
 
-            job_cost = (prompt_tokens / 1e6 * in_rate) + \
-                       (completion_tokens / 1e6 * out_rate)
+            job_cost = _registry_batch_cost(
+                model, prompt_tokens, cached_tokens=0,
+                completion_tokens=completion_tokens,
+            )
 
             # ── Debug print AFTER assignment (safe) ───────────────────────
             prompt_tokens     = usage.get("prompt_tokens", 0)
@@ -403,7 +386,7 @@ def wait_and_download_openai(batch_id: str, model: str) -> dict[str, dict]:
                 "error": f"{type(e).__name__}: {e}",
             }
 
-    total_cost = total_in/1e6 * in_rate + total_out/1e6 * out_rate
+    total_cost = _registry_batch_cost(model, total_in, cached_tokens=0, completion_tokens=total_out)
     print(f"[OPENAI BATCH] tokens in={total_in}  out={total_out}  "
           f"cost≈ ${total_cost:.4f}  "
           f"(results: {len(results)} ok-or-failed, {parse_failures} line-level "

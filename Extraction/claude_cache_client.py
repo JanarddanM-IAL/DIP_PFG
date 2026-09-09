@@ -40,55 +40,15 @@ except ImportError as e:
 
 from compact_schema import build_short_key_instruction, expand_compact_json
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Claude model display-name aliasing
+# All model specs, aliases, and cost helpers come from the registry.
+# To add a new Claude model, edit claude_model_registry.py ONLY.
 # ─────────────────────────────────────────────────────────────────────────────
-# UI can pass friendly names or API IDs. This normalizes them.
-CLAUDE_MODEL_ALIASES = {
-    "Claude Sonnet 4.6": "claude-sonnet-4-6",
-    "Claude Sonnet 4.5": "claude-sonnet-4-5",
-    "Claude Opus 4.5":   "claude-opus-4-5",
-    "Claude Opus 4.8":   "claude-opus-4-8",
-
-    "claude-sonnet-4.6": "claude-sonnet-4-6",
-    "claude-sonnet-4.5": "claude-sonnet-4-5",
-    "claude-opus-4.5":   "claude-opus-4-5",
-    "claude-opus-4.8":   "claude-opus-4-8",
-}
-
-
-def resolve_claude_model(model: str | None) -> str:
-    if not model:
-        return "claude-sonnet-4-6"
-    return CLAUDE_MODEL_ALIASES.get(model, model)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Cost table ($ per 1M tokens)
-# ─────────────────────────────────────────────────────────────────────────────
-# Current practical pricing family:
-# Sonnet: $3 input / $15 output
-# Opus:   $5 input / $25 output
-#
-# Prompt caching:
-# - cache write is typically higher than normal input
-# - cache read is heavily discounted
-# This table uses 5-minute ephemeral cache approximation:
-# write = 1.25x normal input
-# read  = 0.10x normal input
-CLAUDE_NORMAL_RATES = {
-    "claude-sonnet-4-6": (3.00, 15.00),
-    "claude-sonnet-4-5": (3.00, 15.00),
-    "claude-opus-4-8":   (5.00, 25.00),
-    "claude-opus-4-5":   (5.00, 25.00),
-}
-
-DEFAULT_RATE = (3.00, 15.00)
-
-
-def _rate_for_model(model: str) -> tuple[float, float]:
-    return CLAUDE_NORMAL_RATES.get(model, DEFAULT_RATE)
+from claude_model_registry import (
+    resolve_claude_model,       # display-name / dot-style → canonical API ID
+    calculate_cached_cost as _registry_cached_cost,
+    get_spec as _get_spec,
+)
 
 
 def _calc_cost(
@@ -98,21 +58,18 @@ def _calc_cost(
     cache_creation_tokens: int,
     cache_read_tokens: int,
 ) -> float:
-    in_rate, out_rate = _rate_for_model(model)
-
-    # Anthropic usage generally separates:
-    # input_tokens                 = fresh normal input
-    # cache_creation_input_tokens  = cache write (costs more than normal)
-    # cache_read_input_tokens      = cache hit/read (heavily discounted)
-    cache_write_rate = in_rate * 1.25
-    cache_read_rate  = in_rate * 0.10
-
-    return (
-        (input_tokens          / 1_000_000) * in_rate
-        + (cache_creation_tokens / 1_000_000) * cache_write_rate
-        + (cache_read_tokens     / 1_000_000) * cache_read_rate
-        + (output_tokens         / 1_000_000) * out_rate
+    """
+    Delegates to claude_model_registry.calculate_cached_cost so there is
+    exactly ONE place where Claude pricing lives.
+    """
+    cost, _ = _registry_cached_cost(
+        model               = resolve_claude_model(model),
+        prompt_tokens       = input_tokens,
+        cache_read_tokens   = cache_read_tokens,
+        cache_write_tokens  = cache_creation_tokens,
+        completion_tokens   = output_tokens,
     )
+    return cost
 
 
 def _client() -> Anthropic:

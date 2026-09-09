@@ -13,47 +13,19 @@ _POLL_SECONDS = 60
 _TERMINAL = {"JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED",
              "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"}
 
-# Batch = 50% of standard rates  (input, output) per 1M tokens
-# Source: ai.google.dev/gemini-api/docs/pricing (verified July 2026)
-GEMINI_BATCH_RATES = {
-        # Standard: $1.50 / $9.00  →  batch: $0.75 / $4.50
-    "gemini-3.6-flash":              (0.75,  3.75),
-
-    # Standard: $1.50 / $9.00  →  batch: $0.75 / $4.50
-    "gemini-3.5-flash":              (0.75,  4.50),
-
-    # Standard: $0.25 / $1.50  →  batch: $0.125 / $0.75
-    "gemini-3.1-flash-lite-preview": (0.125, 0.75),
-
-    # Standard: $0.30 / $2.50  →  batch: $0.15 / $1.25
-    "gemini-2.5-flash":              (0.15,  1.25),   # FIX: was (0.075, 0.30)
-
-    # Standard: $1.25 / $10.00 →  batch: $0.625 / $5.00
-    "gemini-2.5-pro":                (0.625, 5.00),
-}
-
-# Standard (non-batch) rates for the page-ID step in page_extractor.py.
-# That step is always a live sync call — no batch discount applies.
-# Referenced by pipeline.py when logging ID-step cost.
-GEMINI_STANDARD_RATES = {
-    "gemini-2.5-flash":              (0.30,  2.50),
-    "gemini-2.5-pro":                (1.25, 10.00),
-    "gemini-3.5-flash":              (1.50,  9.00),
-    "gemini-3.6-flash":              (1.50,  7.50),
-    "gemini-3.1-flash-lite-preview": (0.25,  1.50),
-}
-
-_DEFAULT_FALLBACK_RATE = (0.75, 4.50)
+# ── All rate data comes from the single registry ──────────────────────────────
+from gemini_model_registry import (
+    batch_rates,
+    standard_rates,
+    calculate_batch_cost,
+    GEMINI_BATCH_RATES,    # backwards-compat alias (read-only)
+    GEMINI_STANDARD_RATES, # backwards-compat alias (read-only)
+)
 
 
 def _rate_for_model(model: str) -> tuple[float, float]:
-    if model in GEMINI_BATCH_RATES:
-        return GEMINI_BATCH_RATES[model]
-    print(f"[GEMINI BATCH] [WARN] No rate entry for model='{model}' — "
-          f"falling back to {_DEFAULT_FALLBACK_RATE} ($/1M in,out). "
-          f"Cost figures below may be WRONG. Add this model to "
-          f"GEMINI_BATCH_RATES.")
-    return _DEFAULT_FALLBACK_RATE
+    """Return batch (in, out) rates for *model* via the central registry."""
+    return batch_rates(model)
 
 
 def _client():
@@ -219,8 +191,7 @@ def wait_and_download_gemini(batch_name: str, model: str) -> dict[str, dict]:
             total_in  += prompt_tokens
             total_out += completion_tokens
 
-            job_cost = (prompt_tokens / 1e6 * in_rate +
-                        completion_tokens / 1e6 * out_rate)
+            job_cost = calculate_batch_cost(model, prompt_tokens, completion_tokens)
 
             results[cid] = {
                 "ok":        True,
@@ -247,7 +218,7 @@ def wait_and_download_gemini(batch_name: str, model: str) -> dict[str, dict]:
               f"model/region. Cost will show as $0.0000. Check the Google "
               f"Cloud console for actual billing.")
 
-    total_cost = total_in / 1e6 * in_rate + total_out / 1e6 * out_rate
+    total_cost = calculate_batch_cost(model, total_in, total_out)
     # print(f"[GEMINI BATCH] tokens in={total_in:,}  out={total_out:,}  "
     #       f"cost≈ ${total_cost:.4f}  "
     #       f"(results: {len(results)} ok-or-failed, "

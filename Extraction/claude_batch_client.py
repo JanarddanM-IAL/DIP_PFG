@@ -21,24 +21,20 @@ except ImportError as e:
 from compact_schema import build_short_key_instruction, expand_compact_json
 
 from claude_cache_client import (
-    resolve_claude_model,
     _calc_cost,
     _MULTI_TABLE_DELIMITERS,
     _parse_json,
     _extract_text_from_message,
 )
+# resolve_claude_model and batch cost helpers come from the registry directly.
+# To add a new model, edit claude_model_registry.py ONLY.
+from claude_model_registry import (
+    resolve_claude_model,
+    calculate_batch_cost as _registry_batch_cost,
+)
 
 
 _POLL_SECONDS = 60
-
-CLAUDE_BATCH_RATES = {
-    "claude-sonnet-4-6": (1.50,  7.50),
-    "claude-sonnet-4-5": (1.50,  7.50),
-    "claude-opus-4-8":   (2.50, 12.50),
-    "claude-opus-4-5":   (2.50, 12.50),
-}
-
-_DEFAULT_BATCH_RATE = (1.50, 7.50)
 
 # ★ FIX 1: _safe_custom_id defined here, before submit_claude_batch uses it
 _MAX_CUSTOM_ID_LEN = 64
@@ -56,17 +52,6 @@ def _safe_custom_id(raw_id: str) -> str:
     return raw_id[:32] + suffix
 
 
-def _batch_rate_for_model(model: str) -> tuple[float, float]:
-    model = resolve_claude_model(model)
-    if model in CLAUDE_BATCH_RATES:
-        return CLAUDE_BATCH_RATES[model]
-    print(
-        f"[CLAUDE BATCH] [WARN] No rate entry for model={model!r}. "
-        f"Using fallback rate {_DEFAULT_BATCH_RATE} ($/1M in,out)."
-    )
-    return _DEFAULT_BATCH_RATE
-
-
 def _calc_batch_cost(
     model: str,
     input_tokens: int,
@@ -74,14 +59,13 @@ def _calc_batch_cost(
     cache_creation_tokens: int,
     cache_read_tokens: int,
 ) -> float:
-    in_rate, out_rate = _batch_rate_for_model(model)
-    cache_write_rate  = in_rate * 1.25
-    cache_read_rate   = in_rate * 0.10
-    return (
-        (input_tokens            / 1_000_000) * in_rate
-        + (cache_creation_tokens / 1_000_000) * cache_write_rate
-        + (cache_read_tokens     / 1_000_000) * cache_read_rate
-        + (output_tokens         / 1_000_000) * out_rate
+    """Delegates to the registry — no local rate table needed."""
+    return _registry_batch_cost(
+        model                = resolve_claude_model(model),
+        input_tokens         = input_tokens,
+        output_tokens        = output_tokens,
+        cache_creation_tokens= cache_creation_tokens,
+        cache_read_tokens    = cache_read_tokens,
     )
 
 

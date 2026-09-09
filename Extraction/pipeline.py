@@ -316,37 +316,22 @@ _PAGE_TAG_RE = re.compile(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPENAI COST TABLE  ($ per 1M tokens)
+# COST TABLES — imported from registries (single source of truth).
+# To add a new model for any provider, edit only its *_model_registry.py file.
 # ─────────────────────────────────────────────────────────────────────────────
-
-OPENAI_COST_TABLE: dict[str, tuple[float, float]] = {
-    "gpt-4o-mini":      (0.15,   0.60),
-    "gpt-4.1-mini":     (0.40,   1.60),
-    "gpt-4o":           (2.50,  10.00),
-    "gpt-4.1":          (2.00,   8.00),
-    "gpt-5.4-mini":     (0.40,   1.60),
-    "gpt-5.5":          (5.00,  30.00),
-}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE COST TABLE  ($ per 1M tokens)
-# ─────────────────────────────────────────────────────────────────────────────
-
-CLAUDE_COST_TABLE: dict[str, tuple[float, float]] = {
-    "claude-sonnet-4-6": (3.00, 15.00),
-    "claude-sonnet-4-5": (3.00, 15.00),
-    "claude-opus-4-8":   (5.00, 25.00),
-    "claude-opus-4-5":   (5.00, 25.00),
-}
+from openai_model_registry import (
+    OPENAI_COST_TABLE,          # backwards-compat dict still used below
+    calculate_cost as _openai_calc_cost,
+)
+from claude_model_registry import (
+    CLAUDE_COST_TABLE,          # backwards-compat dict still used below
+    calculate_cost as _claude_calc_cost,
+    resolve_claude_model,
+)
 
 
 def calc_claude_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    input_rate, output_rate = CLAUDE_COST_TABLE.get(model, (3.00, 15.00))
-    return (
-        (prompt_tokens / 1_000_000) * input_rate
-        + (completion_tokens / 1_000_000) * output_rate
-    )
+    return _claude_calc_cost(resolve_claude_model(model), prompt_tokens, completion_tokens)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -538,9 +523,7 @@ def parse_json_response(raw: str) -> dict:
 
 
 def calc_openai_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    input_rate, output_rate = OPENAI_COST_TABLE.get(model, (0.0, 0.0))
-    return (prompt_tokens / 1_000_000) * input_rate + \
-           (completion_tokens / 1_000_000) * output_rate
+    return _openai_calc_cost(model, prompt_tokens, completion_tokens)
 
 
 def extract_page_info_from_filename(pdf_path: str) -> dict | None:
@@ -659,11 +642,23 @@ def run_extraction(
     all_extracted: list[str] = []
     total_files = len(raw_pdfs)
 
-    for file_idx, pdf_path in enumerate(raw_pdfs, start=1):
+    # ── How many PDFs to process in parallel ──────────────────────────
+    # LLM calls are I/O-bound, so threads scale well up to the API rate limit.
+    # Default 4; override with env var EXTRACT_WORKERS=N.
+    #
+    # DB/Dagster NOTE: the DB workflow pins EXTRACT_WORKERS=1 (see
+    # PFG_Extraction.py). _next_log_pid() below mutates the module-level log
+    # context, and Dagster already runs several single-id invocations
+    # concurrently, so threads here would interleave log lines across
+    # documents. Serial is the safe default for that path; the standalone CLI
+    # keeps the parallel speedup.
+    max_workers = int(os.environ.get("EXTRACT_WORKERS", min(4, total_files)))
+
+    def _extract_one(file_idx: int, pdf_path: str) -> list[str]:
         fname  = os.path.basename(pdf_path)
         _next_log_pid(Path(fname).stem)
         sector = detect_sector(fname)
-        sector_allowed  = set(SECTOR_TABLE_SUFFIXES.get(sector, SECTOR_TABLE_SUFFIXES["LG"]))
+        sector_allowed    = set(SECTOR_TABLE_SUFFIXES.get(sector, SECTOR_TABLE_SUFFIXES["LG"]))
         effective_allowed = sector_allowed & available_prompts
         skipped_no_prompt = sector_allowed - available_prompts
 
@@ -672,7 +667,7 @@ def run_extraction(
 
         if not effective_allowed:
             print(f"  [WARN] No allowed tables for {fname} — skipping extraction entirely.")
-            continue
+            return []
 
         try:
             if use_llm_id:
@@ -697,7 +692,7 @@ def run_extraction(
 
         if not produced:
             print(f"  [WARN] No extracted PDFs produced for {fname}")
-            continue
+            return []
 
         filtered      = []
         removed_count = 0
@@ -725,9 +720,21 @@ def run_extraction(
                 continue
             filtered.append(p)
 
-        all_extracted.extend(filtered)
         print(f"  → {sector}: kept {len(filtered)} table(s), removed {removed_count}")
         print("")
+        return filtered
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_path = {
+            executor.submit(_extract_one, idx, path): path
+            for idx, path in enumerate(raw_pdfs, start=1)
+        }
+        for future in as_completed(future_to_path):
+            try:
+                all_extracted.extend(future.result())
+            except Exception as exc:
+                pdf_path = future_to_path[future]
+                print(f"  [ERROR] {os.path.basename(pdf_path)}: {exc}")
 
     return all_extracted
 
@@ -1271,23 +1278,22 @@ SUFFIX_TO_COA_KEYWORD: dict[str, str] = {
     "_PROP_SNP": "PROP_SNP",
     "_PROP_IS":  "PROP_IS",
     "_PROP_CFS": "PROP_CFS",
-    # DSR and DEBT intentionally have no COA keyword — these statement types
+    "_DEBT":     "DEBT",
+    # DSR intentionally have no COA keyword — these statement types
     # do not require COA master mapping, so filter_coa_for_type() returns ""
     # for them and the LLM prompt receives an empty COA section.
     "_DSR":      "",
-    "_DEBT":     "",
-    # The six notes/RSI/statistical tabs likewise have NO COA-master keyword:
+    # The four notes/RSI tabs likewise have NO COA-master keyword:
     #   OVERVIEW / PEN / OPEB / FAQs  → COA Flag and COA Datapoint are "n/a";
     #                                   there is no mapping to perform.
-    #   TAX_BASE                      → its 7 COA Datapoints are fixed constants
-    #                                   baked into TAX_BASE_Prompt.txt.
-    #   CAPITAL_ASSETS                → maps to a CLOSED 4-value vocabulary that
-    #                                   is not in standard_coa_master.xlsx; the
-    #                                   rules live in CAPITAL_ASSETS_COA.txt and
-    #                                   are loaded by load_coa_mapping().
+    # DEBT / CAPITAL_ASSETS / TAX_BASE now DO carry a keyword (Update 3): the
+    # prompt receives the COA section, so the model emits standardized COA
+    # Datapoints instead of the issuer's verbatim line-item wording. This is
+    # what lifted DEBT 2/17 → 17/17, CAPITAL_ASSETS 34/42 → 42/42 and
+    # TAX_BASE 1/7 → 7/7 against CoaDetails.
     "_OVERVIEW":       "",
-    "_CAPITAL_ASSETS": "",
-    "_TAX_BASE":       "",
+    "_CAPITAL_ASSETS": "CAPITAL_ASSETS",
+    "_TAX_BASE":       "TAX_BASE",
     "_PEN":            "",
     "_OPEB":           "",
     "_FAQS":           "",
@@ -1296,7 +1302,7 @@ SUFFIX_TO_COA_KEYWORD: dict[str, str] = {
 # Statement types that legitimately have NO <TYPE>_COA.txt mapping file, so
 # load_coa_mapping() must stay silent instead of warning on every run.
 _NO_COA_MAPPING_FILE: set[str] = {
-    "DEBT", "DSR", "OVERVIEW", "TAX_BASE", "PEN", "OPEB", "FAQS",
+    "DSR", "OVERVIEW", "TAX_BASE", "PEN", "OPEB", "FAQS",
 }
 
 def load_coa_mapping(coa_mapping_folder: str, sector: str, stmt_type: str, silent: bool = False) -> str:
@@ -2970,7 +2976,7 @@ def main() -> None:
             id_model   = getattr(args, "id_model", "claude-sonnet-4-6")
             use_batch  = args.tier == "paid" and getattr(args, "batch", False)
 
-            if use_llm_id and use_batch and getattr(args, "skip_normalization", False):
+            if use_llm_id and use_batch:
                 # Batch page-extraction mode: submit all page-ID LLM calls as one
                 # Claude batch job, wait for results, then slice PDFs.
                 print(f"\n[INFO] Mode: BATCH PAGE EXTRACTION (id_model={id_model})")

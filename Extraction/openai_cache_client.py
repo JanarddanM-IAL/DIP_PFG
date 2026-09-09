@@ -37,27 +37,13 @@ from openai import OpenAI, APIError, APITimeoutError, RateLimitError, BadRequest
 # shadow file if one existed elsewhere on the path).
 from compact_schema import build_short_key_instruction, expand_compact_json
 
-# Cached input rate is 50% of normal input rate (OpenAI standard discount).
-# IMPORTANT: these rates must be kept in sync with OPENAI_COST_TABLE in
-# pipeline.py — the normal-rate side in particular.
-OPENAI_CACHED_RATES = {
-    "gpt-4o-mini":  (0.075,  0.60),
-    "gpt-4.1-mini": (0.20,   1.60),
-    "gpt-4o":       (1.25,  10.00),
-    "gpt-4.1":      (1.00,   8.00),
-    "gpt-5.4-mini": (0.20,   1.60),
-    "gpt-5.5":      (2.50,  30.00),   # 50% of corrected normal input rate (5.00)
-}
-
-# Must match OPENAI_COST_TABLE in pipeline.py.
-OPENAI_NORMAL_RATES = {
-    "gpt-4o-mini":  (0.15,   0.60),
-    "gpt-4.1-mini": (0.40,   1.60),
-    "gpt-4o":       (2.50,  10.00),
-    "gpt-4.1":      (2.00,   8.00),
-    "gpt-5.4-mini": (0.40,   1.60),
-    "gpt-5.5":      (5.00,  30.00),
-}
+# ─────────────────────────────────────────────────────────────────────────────
+# All model specs and cost helpers come from the registry.
+# To add a new OpenAI model, edit openai_model_registry.py ONLY.
+# ─────────────────────────────────────────────────────────────────────────────
+from openai_model_registry import (
+    calculate_cached_cost as _registry_cached_cost,
+)
 
 
 def _client():
@@ -69,14 +55,8 @@ def _client():
 
 def _calc_cost(model: str, prompt_tokens: int, cached_tokens: int,
                completion_tokens: int) -> float:
-    in_rate, out_rate = OPENAI_NORMAL_RATES.get(model, (0.0, 0.0))
-    c_in_rate, _      = OPENAI_CACHED_RATES.get(model, (in_rate * 0.5, out_rate))
-    fresh = max(0, prompt_tokens - cached_tokens)
-    return (
-        (fresh             / 1_000_000) * in_rate +
-        (cached_tokens     / 1_000_000) * c_in_rate +
-        (completion_tokens / 1_000_000) * out_rate
-    )
+    """Delegates to openai_model_registry — single source of truth for pricing."""
+    return _registry_cached_cost(model, prompt_tokens, cached_tokens, completion_tokens)
 
 
 def normalize_one_openai_cached(
