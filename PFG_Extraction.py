@@ -195,6 +195,28 @@ USE_BATCH         = True
 # the DB path stays serial and its logs stay attributable.
 os.environ.setdefault("EXTRACT_WORKERS", "1")
 
+# --- debug artifacts in the deal output folder (OutputPath) --------------------
+# Per deal the engine leaves four kinds of file behind. Two are load-bearing and
+# two are review material:
+#
+#   *.json                      REQUIRED — ParquetStore.ingest_deal() reads these
+#   *.csv                       REQUIRED to produce — run_json_to_csv_pipeline() is
+#                               where Total Check is computed, and its verdict can
+#                               re-route a deal to Manual Validation
+#   <deal>_All_Statements.xlsx  debug only — the merged review workbook
+#   <deal>.pdf                  debug only — a copy of the source PDF
+#
+# KEEP_DEBUG_ARTIFACTS = True  (default) keeps everything, as the non-DB CLI does.
+# KEEP_DEBUG_ARTIFACTS = False skips the workbook and the PDF copy, deletes the
+# CSVs once their Total Check verdict has been taken, and — only for a deal that
+# both PASSED and ingested cleanly — deletes the JSON afterwards too. A failed or
+# manually-routed deal always keeps its full evidence, because that is exactly
+# when it is needed.
+#
+# The flag changes what is KEPT, never what is CHECKED: pass/fail and the RawData
+# rows are identical either way.
+KEEP_DEBUG_ARTIFACTS = True
+
 # --- engine resource folders (verified to exist inside Extraction/) ---
 PROMPTS_FOLDER     = _ENGINE_DIR / "prompts"
 XLSX_PATH          = _ENGINE_DIR / "Master" / "standard_coa_master.xlsx"
@@ -431,6 +453,7 @@ def process_one_row(db, db_row, coa_text, store=None):
             client             = _make_client(),
             sector             = sector,
             batch              = USE_BATCH,
+            keep_debug_artifacts = KEEP_DEBUG_ARTIFACTS,
         )
 
         # Unexpected engine failure with nothing produced -> hard fail.
@@ -483,10 +506,12 @@ def process_one_row(db, db_row, coa_text, store=None):
             udl.failure("Extraction", "extraction produced no JSON output")
 
         # ---- RawData parquet ingestion (in addition to JSON + Excel) ----
+        ingested_ok = False
         if store is not None and outcome.get("json_files"):
             try:
                 st = store.ingest_deal(processing_id, outcome["json_files"])
                 store.flush()
+                ingested_ok = True
                 # 'unmapped'/'ambiguous' items are STORED (COAHeaderID blank +
                 # TemplateTypeId + GroupName); only 'dropped' produced no rows.
                 print(f"[PARQUET] Id={row_id} pid={processing_id}: {st['rows']} RawData row(s) "
@@ -495,6 +520,22 @@ def process_one_row(db, db_row, coa_text, store=None):
             except Exception as e:
                 print(f"[PARQUET] Id={row_id}: ingestion failed (non-fatal): "
                       f"{type(e).__name__}: {e}")
+
+        # ---- optional: drop the JSON once it has been consumed ----
+        # Deliberately conditional on ALL THREE of: the flag being off, the deal
+        # having PASSED, and ingestion having actually succeeded. A failed deal, or
+        # one whose ingestion raised, keeps its JSON — that is the case you need to
+        # debug, and it is also the only copy of the extracted data.
+        if not KEEP_DEBUG_ARTIFACTS and ingested_ok and outcome.get("passed"):
+            removed = 0
+            for jf in outcome.get("json_files") or []:
+                try:
+                    os.remove(jf)
+                    removed += 1
+                except OSError:
+                    pass
+            print(f"[DEBUG-ARTIFACTS OFF] Id={row_id}: removed {removed} ingested "
+                  f".json file(s) from {outcome.get('output_folder')}")
 
     except Exception as e:
         msg = f"Extraction exception: {type(e).__name__}: {e}"[:500]

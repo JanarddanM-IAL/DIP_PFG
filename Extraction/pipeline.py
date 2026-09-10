@@ -1351,7 +1351,7 @@ def compress_coa_text(coa_text: str) -> str:
         if not line.strip():
             continue
         parts = line.split(" | ")
-        if len(parts) < 2:
+        if len(parts) < 5:
             continue
         body.append(f"{parts[1]} | {parts[2]}")
     return "\n".join(body)
@@ -2385,11 +2385,27 @@ def process_one_deal(
     deal_idx: int | None = None,
     total_deals: int | None = None,
     batch: bool = False,
+    keep_debug_artifacts: bool = True,
 ) -> dict:
     """Normalize ONE deal end to end and RETURN its verdict.
 
     `sector` overrides filename-based detection — the DB stage supplies it from
     TCOAMaster.SegmentId. `batch` selects the Batch API over the sync thread pool.
+
+    `keep_debug_artifacts` controls the review material left in the output folder.
+    Only two of the four artifacts are optional, so the flag is deliberately narrow:
+
+        *.json                      REQUIRED  — parquet ingestion reads these
+        *.csv                       REQUIRED to PRODUCE — run_json_to_csv_pipeline()
+                                    is where Total Check is computed; its verdict
+                                    re-routes a deal to Manual Validation. With the
+                                    flag off the files are deleted AFTER that verdict
+                                    is taken, never skipped.
+        <deal>_All_Statements.xlsx  optional  — merged review workbook
+        <deal>.pdf                  optional  — copy of the source PDF
+
+    Turning it off therefore changes what is KEPT, never what is CHECKED: the
+    pass/fail outcome is bit-for-bit the same either way.
 
     Returns:
         {
@@ -2565,22 +2581,38 @@ def process_one_deal(
             dest_folder = new_dest
             deal_passed = False
 
-        try:
-            merge_deal_csvs_to_excel(dest_folder, deal_name)
-        except Exception as e:
-            print(f"    [WARN] CSV→Excel merge failed for {deal_name}: {e}")
+        # ── Debug artifacts: merged workbook + source PDF ─────────────────────
+        # Both are review material only — nothing downstream reads them. The CSVs
+        # above are already written and their Total Check verdict already taken, so
+        # dropping them here cannot change the outcome.
+        if keep_debug_artifacts:
+            try:
+                merge_deal_csvs_to_excel(dest_folder, deal_name)
+            except Exception as e:
+                print(f"    [WARN] CSV→Excel merge failed for {deal_name}: {e}")
 
-        # ── Keep the source PDF beside its output ─────────────────────────────
-        for raw_pdf in [
-            os.path.join(raw_folder, f)
-            for f in os.listdir(raw_folder)
-            if f.lower().endswith(".pdf")
-            and not _PRODUCED_RE.search(f)
-            and get_base_pdf_name(Path(f).stem) == deal_name
-        ]:
-            dest = _safe_join(dest_folder, os.path.basename(raw_pdf))
-            if not _safe_exists(dest):
-                _safe_copy2(raw_pdf, dest)
+            # Keep the source PDF beside its output
+            for raw_pdf in [
+                os.path.join(raw_folder, f)
+                for f in os.listdir(raw_folder)
+                if f.lower().endswith(".pdf")
+                and not _PRODUCED_RE.search(f)
+                and get_base_pdf_name(Path(f).stem) == deal_name
+            ]:
+                dest = _safe_join(dest_folder, os.path.basename(raw_pdf))
+                if not _safe_exists(dest):
+                    _safe_copy2(raw_pdf, dest)
+        else:
+            removed = 0
+            for f in _safe_listdir(dest_folder):
+                if f.endswith(".csv"):
+                    try:
+                        os.remove(_win_safe(_safe_join(dest_folder, f)))
+                        removed += 1
+                    except OSError:
+                        pass
+            print(f"    [DEBUG-ARTIFACTS OFF] no merged xlsx / PDF copy; "
+                  f"removed {removed} intermediate .csv file(s)")
 
         outcome["passed"]             = deal_passed
         outcome["output_folder"]      = dest_folder

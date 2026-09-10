@@ -160,11 +160,11 @@ A9: (interest|fiscal|receivable)->"Interest Receivable"
 A10: (due from other government|due from other commonwealth|intergovernmental)->"Due from Other Governments"
 A11: (internal balances|inter fund|interfund|due from fund|due from component unit)->"Due from Other Funds"
 A11.5: (noncurrent|long-term)+(loan|note|lease receivable|other receivable)->"Other Noncurrent Assets"
-A12: (receivable|due from)->"Other Receivables"
+A12: (receivable|due from)->"Other Receivable"
 A13: (inventor|suppli|stock|material)->"Inventories"
 A14: (prepaid)->"Prepaid Items"
 A15: (capital assets|land|plant|equipment|infrastructure|construction in progress)->"Capital Assets"
-A16: (other assets|bond issuance|long-term|misc|other|for resale|pension|postemployment|post-employment|OPEB)->"Other Assets - Noncurrent"
+A16: (other assets|bond issuance|long-term|misc|other|for resale|pension|postemployment|post-employment|OPEB)->"Other Noncurrent Assets"
 
 DEFERRED OUTFLOWS: D1: (deferred outflows)->"Deferred Outflows of Resources"
 

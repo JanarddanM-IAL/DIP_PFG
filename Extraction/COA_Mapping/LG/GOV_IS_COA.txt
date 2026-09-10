@@ -39,13 +39,13 @@ Total expenditures | Total Expenditures
   -> "Total Operating Expenses"
 Excess (deficiency) of revenues over expenditures | Revenues over (under)
 expenditures | Excess of revenues over (under) expenditures
-  -> "Excess Of Revenues Over/Under Expenditures"
+  -> "Excess of Revenues Over/Under Expenditures"
 Total other financing sources (uses) | Total Other Financing Sources (Uses)
   -> "Total Other Financing Sources"
 Net change in fund balances | Net Change in Fund Balances
   -> "Net Change In Fund Balances"
-Excess of revenues over (under) expenditures | Excess Of Revenues Over/Under Expenditures|Excess Of Revenue|Excess Of Expenditure
-  -> "Excess Of Revenues Over/Under Expenditures"
+Excess of revenues over (under) expenditures | Excess of Revenues Over/Under Expenditures|Excess Of Revenue|Excess Of Expenditure
+  -> "Excess of Revenues Over/Under Expenditures"
 ===============================================================================
 H3. MANDATORY COA MAPPINGS -- DP (REVENUES SECTION)
 ===============================================================================
