@@ -136,7 +136,6 @@ FORBIDDEN for restricted-prefix rows (override blocked):
   ✗ Due from Other Governments  
   ✗ Other Receivable
   ✗ Other Noncurrent Assets      ← blocks A11.5
-  ✗ Other Assets - Noncurrent    ← blocks A16
   ✗ Interest Receivable
   ✗ Any other COA Datapoint not in the three options above
 -----------------------------------------------------------------------------------

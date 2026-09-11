@@ -251,7 +251,7 @@ When triggered, IGNORE ALL OTHER RULES. COA Datapoint MUST be exactly one of:
 
 FORBIDDEN for restricted-prefix rows:
   ✗ Accounts Receivable  ✗ Due from Other Governments  ✗ Other Receivable
-  ✗ Other Noncurrent Assets  ✗ Other Assets - Noncurrent  ✗ Interest Receivable
+  ✗ Other Noncurrent Assets   ✗ Interest Receivable
 
 ===============================================================================
 D. SEMANTIC FALLBACK RULES (only if no mandatory match found in Section C)

@@ -1,13 +1,3 @@
-===============================================================================
-TODO -- NON-LG COA MAPPING FOR PROP_CFS
-===============================================================================
-This file is seeded from the LG version below as a starting point ONLY.
-Replace/adjust the MANDATORY COA MAPPINGS lines to match NON-LG account
-naming conventions (e.g. standalone utility/authority terminology) before
-using this in production. Keep the same file format: one mapping rule
-per line, 'Raw label pattern -> "COA Datapoint"'.
-===============================================================================
-
 H. COA DATAPOINT MAPPING (AUTHORITATIVE)
 ===============================================================================
 Every row must have "COA Datapoint". Map using PROP_CFS Items (post hierarchy
